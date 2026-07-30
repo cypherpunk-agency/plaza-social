@@ -33,19 +33,40 @@ like a missing deployment.
 
 | Parameter | View Mode | Description |
 |-----------|-----------|-------------|
-| `?channel=0x...` | channels | Shows specific channel |
 | `?profile=0x...` | profile | Shows user profile (inline overlay) |
+| `?thread=N` | forum | ⚠️ POSITIONAL — `N` is a slot in the loaded page, not a thread. Retargets when anyone posts. Moving to `?cid=`. |
 
-### Profile URL Behavior
+`?channel=0x...` is **dead** — `ViewMode` has no `'channels'` member; such a link falls back to the
+forum.
 
-When clicking a user in chat or user list:
-1. URL updates to `?profile=0x...` via `pushState`
-2. Previous state saved (viewMode, channel address)
-3. Profile overlay appears over main content (not full screen)
-4. Browser back button returns to previous view
-5. Closing profile (x button) restores previous URL
+### How navigation actually works — state is the source of truth
 
-**Implementation:** `App.tsx` - `openProfile()` callback handles URL updates and `previousViewState` tracking.
+⚠️ **This section previously described a mechanism that does not exist.** It claimed `openProfile()`
+"handles URL updates and `previousViewState` tracking" and that clicking pushes the URL directly.
+Neither is true, and `previousViewState` is not in the file at all. Someone hooking a new control
+into navigation will go looking for a `pushState` inside `openProfile` and find nothing.
+
+The real shape:
+
+1. `openProfile()` sets **React state only** — it never touches the URL.
+2. A separate `useEffect` derives the whole URL and the document title *from* state, diffs it against
+   a `lastUrlRef`, and `pushState`s only on a real change. One place builds URLs; nothing else does.
+3. Back works through a `popstate` listener that **re-derives state from the URL**. There is no saved
+   snapshot to restore, which is why there is no `previousViewState`.
+
+So: **state is the source of truth, the URL is a projection of it, and Back reverses it by re-reading
+the URL.** Add a new deep-linkable thing by teaching the effect to project it and the popstate handler
+to parse it — never by calling `pushState` from a click handler.
+
+⚠️ **`viewMode` and `selectedProfile` are persisted to `localStorage`.** A "cold load" therefore lands
+where you left off, not on the forum, and that looks exactly like a routing regression when you have
+just been clicking around. Clear both before judging default-route behaviour.
+
+⚠️ **Inside the host container the address bar is the SHELL's, not Plaza's.** Plaza runs in an iframe
+(`plaza-social.app.dev-dot.li`) under `plaza-social.dev-dot.li`, so `pushState` updates a URL nobody
+can see or copy. The shell **does** forward query and hash inbound (measured), so deep links work on
+the way IN; sharing one OUT needs an explicit copy affordance. TruAPI offers `navigateTo(url)` for
+following a link, and nothing at all for publishing the current URL.
 
 ### URL Persistence Config
 

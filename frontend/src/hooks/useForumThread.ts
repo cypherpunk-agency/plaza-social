@@ -216,8 +216,17 @@ export function useForumThread({
       setError(null);
 
       // Sorted newest-first. Cost grows with the writer set, not the post count — one head per writer.
-      const [refs, total] = await contract.getHeadsPaged(FORUM_REGISTRY, 0, 50);
-      setThreadCount(Number(total));
+      //
+      // ⚠️ `total` IS THE WRITER COUNT, NOT THE THREAD COUNT, and it was being reported as the
+      // latter. `getHeadsPaged` returns `(refs, total)` where `total = _writers[registry].length` —
+      // one entry per person who has ever posted here, NOT one per thread. With a single author and
+      // two threads it reads 1; with ten authors and one thread each it reads 10. It happens to be
+      // invisible today because exactly one account has posted.
+      //
+      // There is no cheap on-chain thread count and there should not be: the model stores one head
+      // per writer and the threads hang off it in a Bulletin chain, so counting them means walking.
+      // `threads.length` is what we actually walked and is the honest number to show.
+      const [refs] = await contract.getHeadsPaged(FORUM_REGISTRY, 0, 50);
 
       const heads = (refs as OnChainHead[])
         // A writer banned after the fact keeps their row; moderation is a write gate plus a hide
@@ -234,6 +243,7 @@ export function useForumThread({
 
       if (heads.length === 0) {
         setThreads([]);
+        setThreadCount(0);
         return;
       }
 
@@ -247,6 +257,7 @@ export function useForumThread({
       );
 
       setThreads(formatted);
+      setThreadCount(formatted.length);
     } catch (err) {
       console.error("Failed to load threads:", err);
       setError(err instanceof Error ? err.message : "Failed to load threads");
