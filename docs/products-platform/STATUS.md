@@ -8,7 +8,8 @@ Short by design. The long reasoning is in [`architecture.md`](architecture.md); 
 | What | Where |
 |---|---|
 | App | **https://plaza-social.dev-dot.li** — `plaza-social.dot` (`.dot.li` serves it too) |
-| Bundle CID | `bafybeid4p3kquzrr57yuycuplhokmcbuuunrxbjcxbuja6vhllbfvzkz3e` — a **CAR file**, fetchable whole, NOT pathable (2026-07-30). |
+| Bundle CID | `bafybeih6yfyxl6vrc2nrilgktnpm3hj4ka4dsoktylvwxozh7vxfti35di` — a **CAR file**, fetchable whole, NOT pathable (2026-07-30). |
+| Source | `github.com/Tomen/plaza`, branch `claude/polkadot-products-sdk-review-b2cff4` |
 | Deploy | `npx @polkadot-community-foundation/polkadot-app-deploy@latest frontend/dist plaza-social.dot --env devnet --mnemonic "$MNEMONIC"` |
 | `UserRegistry` | `0xfD00289e765414C0281EFC35335b6453F055FBD7` = `@plaza-social/user-registry` v0 |
 | `PostRegistry` | `0xF6daC4BC4e721c5C84504A5Bfe033AE63722f8c9` |
