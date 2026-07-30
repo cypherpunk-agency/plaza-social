@@ -448,7 +448,10 @@ export function SettingsView({
               <div className="border border-primary-700 p-4 space-y-2 font-mono">
                 {FAKE_SCENARIOS.map((scenario) => (
                   <div key={scenario.query} className="text-[11px]">
-                    <a href={scenario.query} className="text-accent-400 underline break-all">
+                    <a
+                      href={scenario.query}
+                      className="text-accent-400 hover:text-accent-300 transition-colors underline break-all"
+                    >
                       {scenario.query}
                     </a>
                     <div className="text-primary-700">{scenario.what}</div>

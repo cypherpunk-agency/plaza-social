@@ -21,8 +21,16 @@ interface ForumViewProps {
   onSelectUser?: (address: string) => void;
   disabled?: boolean;
   // URL param support
-  selectedThreadFromUrl?: number | null;
-  onThreadChange?: (threadIndex: number | null) => void;
+  /** The selected thread's announcement CID, projected to `?cid=`. The canonical selection. */
+  selectedThreadCid?: string | null;
+  /**
+   * ⚠️ DEPRECATED, INBOUND ONLY. A position parsed out of an already-published `?thread=N` link.
+   * This view is the only place that can resolve it, because it is the only place that has the
+   * loaded page, so it maps position → CID and hands the CID back through `onThreadChange`. Nothing
+   * ever mints a new one. See `lib/threadLink.ts`.
+   */
+  legacyThreadIndex?: number | null;
+  onThreadChange?: (threadCid: string | null) => void;
   onThreadTitleChange?: (title: string | null) => void;
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
@@ -44,7 +52,8 @@ export function ForumView({
   getDisplayName,
   onSelectUser,
   disabled = false,
-  selectedThreadFromUrl,
+  selectedThreadCid = null,
+  legacyThreadIndex = null,
   onThreadChange,
   onThreadTitleChange,
   // Tooltip props
@@ -70,13 +79,11 @@ export function ForumView({
    */
   const canCreateThread = !!usePublisher();
 
-  // Use URL param if provided, otherwise use internal state
-  const selectedThreadIndex = selectedThreadFromUrl ?? null;
-
   const {
     threads,
     isLoading,
     error,
+    replyCounts,
     refresh,
     createThread,
     editThread,
@@ -145,11 +152,36 @@ export function ForumView({
     await deleteThread(threadIndex);
   };
 
-  // Find the selected thread
+  // Find the selected thread — by CID, which is the thread's identity. Never by position.
   const selectedThread = useMemo(() => {
-    if (selectedThreadIndex === null) return null;
-    return threads.find(t => t.index === selectedThreadIndex) || null;
-  }, [threads, selectedThreadIndex]);
+    if (!selectedThreadCid) return null;
+    return threads.find(t => t.cid === selectedThreadCid) || null;
+  }, [threads, selectedThreadCid]);
+
+  /**
+   * Resolve a deprecated `?thread=N` link to a CID, once and only once.
+   *
+   * This is the ONLY place a position can be turned into an identity, because it is the only place
+   * that holds the loaded page. Handing the CID back through `onThreadChange` puts it into the same
+   * state the URL effect projects, so the address bar swaps `?thread=N` for `?cid=…` by itself —
+   * nothing here calls `pushState`, and nothing should.
+   *
+   * An index with no thread behind it resolves to `null` rather than being left pending forever.
+   */
+  useEffect(() => {
+    if (selectedThreadCid || legacyThreadIndex === null) return;
+    if (isLoading || threads.length === 0) return;
+    const match = threads.find(t => t.index === legacyThreadIndex);
+    onThreadChange?.(match?.cid ?? null);
+  }, [selectedThreadCid, legacyThreadIndex, threads, isLoading, onThreadChange]);
+
+  /**
+   * A `?cid=` that is not in the loaded page. Real and expected: the page is capped at 50 chains,
+   * and a body that has not resolved yet has no CID to match. Saying "not in this page" beats
+   * silently dropping the selection, which would make a correct shared link look broken.
+   */
+  const selectionMissing =
+    !!selectedThreadCid && !selectedThread && !isLoading && threads.length > 0;
 
   // Notify parent of thread title for page title
   useEffect(() => {
@@ -160,9 +192,9 @@ export function ForumView({
     }
   }, [selectedThread, onThreadTitleChange]);
 
-  // Handle thread selection
-  const handleSelectThread = (threadIndex: number) => {
-    onThreadChange?.(threadIndex);
+  // Handle thread selection. Takes the CID; see `ThreadCard.onSelectThread`.
+  const handleSelectThread = (threadCid: string) => {
+    onThreadChange?.(threadCid);
   };
 
   // Handle going back to list
@@ -181,39 +213,78 @@ export function ForumView({
     );
   }
 
-  // Show thread detail view when a thread is selected
-  if (selectedThread) {
-    return (
-      <ThreadDetailView
-        thread={selectedThread}
-        repliesAddress={repliesAddress}
-        votingAddress={votingAddress}
-        provider={provider}
-        signer={signer}
-        currentAddress={currentAddress}
-        getVoteTally={getVoteTally}
-        getUserVote={getUserVote}
-        vote={vote}
-        removeVote={removeVote}
-        isVoting={isVoting}
-        onEdit={handleEditThread}
-        onDelete={handleDeleteThread}
-        onSelectUser={onSelectUser}
-        onBack={handleBackToList}
-        getDisplayName={getDisplayName}
-        disabled={disabled}
-        getProfile={getProfile}
-        onFollow={onFollow}
-        onUnfollow={onUnfollow}
-        isFollowing={isFollowing}
-        onTip={onTip}
-        canTip={canTip}
-      />
-    );
-  }
+  /**
+   * ⚠️ MOBILE FIRST, AND THAT IS A LAYOUT DECISION, NOT A STYLE ONE.
+   *
+   * Plaza's primary surface is the Polkadot host container, which is a phone app. So the BASE state
+   * of this markup is the phone behaviour that already existed — one column; tapping a thread
+   * replaces the list; BACK returns — and the two-pane split is layered on at `xl` (1280px), the
+   * width at which a 24rem list plus a 70ch detail measure both fit next to the sidebar. Below that
+   * the split is simply absent, not squeezed.
+   *
+   * `hidden` / `flex` do the switching so that the detail pane is MOUNTED ONCE and only once: the
+   * alternative (a JS media query picking between two subtrees) remounts `ReplyThread` on every
+   * resize across the breakpoint, throwing away its loaded replies.
+   */
+  const paneOpen = !!selectedThreadCid;
+
+  const detailPane = selectedThread ? (
+    <ThreadDetailView
+      thread={selectedThread}
+      repliesAddress={repliesAddress}
+      votingAddress={votingAddress}
+      provider={provider}
+      signer={signer}
+      currentAddress={currentAddress}
+      getVoteTally={getVoteTally}
+      getUserVote={getUserVote}
+      vote={vote}
+      removeVote={removeVote}
+      isVoting={isVoting}
+      onEdit={handleEditThread}
+      onDelete={handleDeleteThread}
+      onSelectUser={onSelectUser}
+      onBack={handleBackToList}
+      getDisplayName={getDisplayName}
+      disabled={disabled}
+      getProfile={getProfile}
+      onFollow={onFollow}
+      onUnfollow={onUnfollow}
+      isFollowing={isFollowing}
+      onTip={onTip}
+      canTip={canTip}
+    />
+  ) : selectionMissing ? (
+    <div className="flex flex-col items-center justify-center h-full text-center p-8 font-mono">
+      <div className="text-primary-500 mb-2">THREAD NOT IN THIS PAGE</div>
+      <p className="text-primary-600 text-xs max-w-[60ch]">
+        The link points at a thread the forum has not loaded — the board reads the 50 most recent
+        chains, and a body that has not resolved yet has no CID to match. Try REFRESH.
+      </p>
+      <button
+        onClick={handleBackToList}
+        className="mt-4 px-3 py-1 text-xs text-primary-500 border border-primary-600 hover:border-primary-400"
+      >
+        BACK TO FORUM
+      </button>
+    </div>
+  ) : paneOpen ? (
+    <div className="flex items-center justify-center h-full text-primary-600 font-mono text-sm">
+      LOADING THREAD...
+    </div>
+  ) : (
+    // Only ever visible in the two-pane layout: below `xl` an unselected pane is `hidden`.
+    <div className="flex items-center justify-center h-full text-primary-700 font-mono text-sm p-8 text-center">
+      Select a thread to read it here.
+    </div>
+  );
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex h-full min-w-0 overflow-hidden">
+      {/* ── LIST COLUMN ───────────────────────────────────────────────────────────────────────── */}
+      <div
+        className={`${paneOpen ? 'hidden xl:flex' : 'flex'} flex-col h-full min-w-0 flex-1 xl:flex-none xl:w-[24rem] 2xl:w-[28rem] xl:border-r xl:border-primary-800`}
+      >
       {/* Header */}
       <div className="px-4 py-3 border-b border-primary-700">
         <div className="flex items-center justify-between">
@@ -371,17 +442,22 @@ export function ForumView({
 
       {/* Threads List */}
       {!error && (
-        <div className="flex-1 overflow-y-auto p-4">
+        <div className="flex-1 overflow-y-auto p-4 min-w-0">
           {threads.length === 0 && !isLoading ? (
             <div className="text-center text-primary-600 font-mono py-8">
               No threads yet. Be the first to start a discussion!
             </div>
           ) : (
-            <div className="space-y-4">
+            <div className="space-y-4 min-w-0">
               {threads.map((thread) => (
                 <ThreadCard
-                  key={thread.index}
+                  // ⚠️ Keyed on the CID, not the index. `index` is a slot in the loaded page, so
+                  // keying on it makes React reuse thread A's card state — expanded replies, a
+                  // half-typed edit — for thread B the moment somebody else posts.
+                  key={thread.cid || `idx-${thread.index}`}
                   thread={thread}
+                  isSelected={!!thread.cid && thread.cid === selectedThreadCid}
+                  replyCount={thread.cid ? replyCounts[thread.cid] : undefined}
                   repliesAddress={repliesAddress}
                   votingAddress={votingAddress}
                   provider={provider}
@@ -410,6 +486,14 @@ export function ForumView({
           )}
         </div>
       )}
+      </div>
+
+      {/* ── DETAIL PANE ───────────────────────────────────────────────────────────────────────── */}
+      <div
+        className={`${paneOpen ? 'flex' : 'hidden xl:flex'} flex-col h-full min-w-0 flex-1 bg-black`}
+      >
+        {detailPane}
+      </div>
     </div>
   );
 }

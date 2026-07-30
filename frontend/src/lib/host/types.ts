@@ -111,6 +111,89 @@ export interface DelegationState {
 
 export type AllocationOutcome = 'Allocated' | 'Rejected' | 'NotAvailable'
 
+/* ================================================================== CASH === */
+
+/**
+ * Paying another user in CASH.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * ⭐ WHY THIS USES `payment.*` (RFC-0006) AND NOT `coinPayment.*` (RFC-0017).
+ *
+ * A future reader WILL find `coinPayment` in `@parity/truapi`, see the word Coinage in its type
+ * names, and conclude we used the wrong API. We did not. Four reasons, in order of how hard they
+ * are to argue with:
+ *
+ *  1. **The host does not implement it.** Every `coin_payment_*` handler is absent from the
+ *     reference host bundle (`@parity/host-api-test-sdk`: zero occurrences of `coinPayment`,
+ *     `receivable`, `cheque`, `Purse`) and from the public iOS host's product bridge, which
+ *     carries only the four RFC-0006 handlers. In the RFC's own Rust trait every method defaults
+ *     to `Err(unavailable())`. `@parity/product-sdk-host` wraps NONE of it.
+ *  2. **A tip cannot be addressed in that model.** RFC-0017 pays to a `CoinPaymentReceivable` — an
+ *     ephemeral public key that only the PAYEE's own running product can mint, bound to a
+ *     product-scoped purse. There is no way to derive one from an address, a username or a
+ *     profile. The recipient of a tip is, by definition, not here.
+ *  3. **Delivery rides the statement store.** `CoinPaymentTransmissionChannel` has exactly one
+ *     variant, `Standard { sssTopic }`. Our own `canPushLive` is false for most accounts, so the
+ *     handoff channel is unavailable precisely when we would need it.
+ *  4. **The payee would have to come back and claim.** `deposit(cheque)` is a second act by the
+ *     recipient. A tip that requires the recipient to run Plaza again is not a tip.
+ *
+ * ⛔ AND `payment.*` IS NOT A DIFFERENT CURRENCY. `HostPaymentRequest.from` and
+ * `HostPaymentBalanceSubscribeRequest.purse` are both `CoinPaymentPurseId` — the account-addressed
+ * API spends the very same CASH purse the bearer API does. RFC-0017 says so itself: it "does not
+ * replace that surface… it extends the relevant RFC 0006 request types with optional CoinPayment
+ * purse selectors." See `lib/cash.ts` for the amount scale and the rest of the layering.
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ */
+
+/**
+ * Why a tip cannot be sent to a particular person. Each value gets its OWN sentence in the UI —
+ * "unmapped" and "no-payments" have completely different causes and completely different advice,
+ * and collapsing them into "tipping unavailable" is what makes a feature feel broken.
+ */
+export type TipBlocker =
+  /** Not in a host container, or the host exposes no payment manager. */
+  | 'no-payments'
+  /** The host refused to disclose the balance, so we cannot know if a tip would succeed. */
+  | 'balance-unknown'
+  /** No `Revive.OriginalAccount` entry — this H160 cannot be resolved to a payable account. */
+  | 'unrecipient'
+
+export type TipOutcome =
+  | { status: 'sent' }
+  /** The user declined the host's confirmation sheet. Not an error; do not shout about it. */
+  | { status: 'rejected' }
+  | { status: 'insufficient' }
+  | { status: 'failed'; reason: string }
+
+export interface PaymentsSeam {
+  /**
+   * Push subscription of the spendable CASH balance, in base units (see `lib/cash.ts`).
+   *
+   * ⚠️ `null` MEANS UNKNOWN AND IS NOT ZERO. `subscribeBalance` can be refused per call
+   * (`HostPaymentBalanceSubscribeError.PermissionDenied`), and "we may not look" must not render as
+   * "you have nothing" — that would tell a funded user they are broke and disable a control that
+   * would in fact have worked.
+   *
+   * This is a SUBSCRIPTION, not a getter. Callers must invoke the returned unsubscribe.
+   */
+  subscribeBalance: (listener: (available: bigint | null) => void) => () => void
+
+  /**
+   * Resolve an H160 to the 32-byte account `requestPayment` needs, via `Revive.OriginalAccount`.
+   *
+   * ⛔ RETURNS `null` WHEN THERE IS NO MAPPING, AND THE CALLER MUST REFUSE. Never fall back to
+   * `h160ToSs58()` or any other derivation: those build the 0xEE-suffixed *fallback* account, which
+   * is a DIFFERENT account that nobody holds a key for. Verified on chain — for the one real Plaza
+   * writer, `OriginalAccount` gives `5EJ3VTQ…` while the derivation gives `5CcnRhQ…`. Paying the
+   * second destroys the money. The mapping is a lookup, never a computation.
+   */
+  resolveRecipient: (h160Address: string) => Promise<string | null>
+
+  /** Ask the host to debit the USER and pay `destination`. Prompts; never silent. */
+  sendTip: (destination: string, amount: bigint) => Promise<TipOutcome>
+}
+
 /* ================================================================ backend == */
 
 export interface PutBlobOptions {
@@ -202,6 +285,15 @@ export interface HostBackend {
   writeContract:
     | ((address: string, abi: Record<string, unknown>[], method: string, args: unknown[], label: string) => Promise<{ txHash: string }>)
     | null
+
+  /**
+   * Paying another user in CASH. `null` when this session cannot pay at all — outside a container,
+   * or on a host with no payment manager.
+   *
+   * ⚠️ Non-null does NOT mean a tip will succeed: the balance may be unknown, the recipient may be
+   * unresolvable, and the user may decline. See `PaymentsSeam`.
+   */
+  payments: PaymentsSeam | null
 
   /** Anonymous reads. Always available, never gated, never needs a wallet. */
   readProvider: () => ethers.Provider | null

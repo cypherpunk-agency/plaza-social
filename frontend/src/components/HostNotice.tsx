@@ -93,7 +93,7 @@ export function HostNotice({
         )}
 
         <details className="mb-4">
-          <summary className="text-xs text-accent-400 cursor-pointer">DIAGNOSTICS</summary>
+          <summary className="text-xs text-accent-400 hover:text-accent-300 transition-colors cursor-pointer">DIAGNOSTICS</summary>
           {/* The only debugger available on a phone. Rendered raw, in execution order, with the
               detail text unabridged — a summarised failure is a failure nobody can act on. */}
           <div className="mt-2 border border-primary-800 p-3 space-y-1">
@@ -113,7 +113,7 @@ export function HostNotice({
 
         {showScenarios && (
           <details className="mb-4">
-            <summary className="text-xs text-accent-400 cursor-pointer">
+            <summary className="text-xs text-accent-400 hover:text-accent-300 transition-colors cursor-pointer">
               FAKE BACKEND (local development)
             </summary>
             <div className="mt-2 border border-primary-800 p-3 space-y-2">

@@ -37,8 +37,8 @@ import { insideContainer, productIdentifier } from './container'
 import { createHostContractWriter } from './contracts'
 import { createDelegate } from './delegate'
 import { createDiagnostics } from './diagnostics'
-import { loadCloudStorage, loadHost, loadStatementStore, loadTx, loadWallet, sdkAvailable } from './sdk'
-import type { HostAccount, HostBackend, PutBlobOptions, SignerSeam } from './types'
+import { loadAssetHubDescriptor, loadChainClient, loadCloudStorage, loadHost, loadStatementStore, loadTx, loadWallet, sdkAvailable } from './sdk'
+import type { HostAccount, HostBackend, PaymentsSeam, PutBlobOptions, SignerSeam, TipOutcome } from './types'
 import { describe, TIMEOUTS, unwrapParity, withTimeout, type ParityResult } from './util'
 
 export interface HostSessionOptions {
@@ -530,6 +530,10 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
             contractWriter.write(address, abi, method, args, label)
         : null,
 
+      // Only inside a container: `getPaymentManager()` returns null outside one, and a seam that
+      // exists but can only fail is worse than an honest null.
+      payments: inside ? createPayments() : null,
+
       readProvider: () => provider,
       signer: () => ({ ...seam, delegateSigner: delegate.signer() }),
 
@@ -565,6 +569,193 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
             /* ignore */
           }
         }
+      },
+    }
+  }
+
+  /**
+   * The CASH seam. See `types.ts` `PaymentsSeam` for why this is RFC-0006 `payment.*` and not
+   * RFC-0017 `coinPayment.*`, and `lib/cash.ts` for the amount scale.
+   */
+  function createPayments(): PaymentsSeam {
+    /** One manager for the session, fetched on first use — a reader never needs it. */
+    let managerPromise: Promise<{
+      subscribeBalance: (cb: (b: { available: bigint }) => void) => { unsubscribe: () => void }
+      requestPayment: (amount: bigint, destination: string) => Promise<{ id: string }>
+      subscribePaymentStatus: (
+        id: string,
+        cb: (s: { tag: string; value?: { reason?: string } }) => void,
+      ) => { unsubscribe: () => void }
+    } | null> | null = null
+
+    const payments = () =>
+      (managerPromise ??= (async () => {
+        const host = await loadHost()
+        return (await host.getPaymentManager()) ?? null
+      })().catch((error) => {
+        diag.step('payments', 'fail', describe(error))
+        return null
+      }))
+
+    return {
+      subscribeBalance(listener) {
+        let live = true
+        let handle: { unsubscribe: () => void } | null = null
+
+        void (async () => {
+          const manager = await payments()
+          // ⚠️ `null`, not `0n`. "We could not read it" and "you have nothing" are different facts
+          // and the UI renders them differently — see `PaymentsSeam`.
+          if (!manager || !live) {
+            if (live) listener(null)
+            return
+          }
+          try {
+            // Annotated explicitly: `loadHost()` is `any` (see `sdk.ts`), so an unannotated
+            // parameter here is an implicit `any` and `noImplicitAny` rejects it.
+            handle = manager.subscribeBalance((balance: { available?: unknown } | null) => {
+              if (!live) return
+              const available = balance?.available
+              listener(typeof available === 'bigint' ? available : null)
+            })
+          } catch (error) {
+            // `PermissionDenied` lands here: the user declined to disclose their balance. That is a
+            // legitimate answer, not a fault, so it is a `skip` rather than a `fail`.
+            diag.step('payments', 'skip', `balance unavailable · ${describe(error)}`)
+            if (live) listener(null)
+          }
+          if (!live) handle?.unsubscribe?.()
+        })()
+
+        return () => {
+          live = false
+          try {
+            handle?.unsubscribe?.()
+          } catch {
+            /* ignore — tearing down a dead subscription must never throw at a caller */
+          }
+        }
+      },
+
+      async resolveRecipient(h160Address) {
+        // ⛔ A LOOKUP, NEVER A COMPUTATION. See `PaymentsSeam.resolveRecipient`.
+        const h160 = h160Address?.trim().toLowerCase()
+        if (!h160 || !/^0x[0-9a-f]{40}$/.test(h160)) return null
+        try {
+          const [mod, descriptor] = await Promise.all([
+            loadChainClient(),
+            loadAssetHubDescriptor(options.bulletinNetwork === 'paseo' ? 'paseo' : 'devnet'),
+          ])
+          const client = await mod.createChainClient({ chains: { assetHub: descriptor } })
+
+          /**
+           * A RAW storage read, on purpose, for two reasons:
+           *  · the typed path needs papi's `Binary` wrapper, and passing a bare hex string throws
+           *    `value.asBytes is not a function` — which names nothing useful;
+           *  · `Revive.OriginalAccount` is keyed with the IDENTITY hasher, so the key is simply the
+           *    constant pallet+item prefix followed by the 20 address bytes. No hasher is needed at
+           *    runtime, so this costs no dependency.
+           *
+           * The value is 32 raw bytes — exactly the `S.Hex(32)` that `requestPayment.destination`
+           * takes — so there is deliberately no SS58 round trip to get it wrong.
+           * Prefix = twox128("Revive") ++ twox128("OriginalAccount"); verified against live chain.
+           */
+          const PREFIX = '0x735f040a5d490f1107ad9c56f5ca00d2c56ab6c1f203b345fe5879f819627723'
+          const raw = await withTimeout(
+            Promise.resolve(client.raw.assetHub._request('state_getStorage', [PREFIX + h160.slice(2)])),
+            TIMEOUTS.connect,
+            'OriginalAccount lookup',
+          )
+          if (typeof raw !== 'string' || raw.length !== 66) {
+            diag.step('payments', 'skip', `${h160} has no Revive.OriginalAccount entry`)
+            return null
+          }
+          return raw
+        } catch (error) {
+          // Refuse rather than guess. An unresolved recipient is a "we will not send" state.
+          diag.step('payments', 'fail', `recipient lookup failed · ${describe(error)}`)
+          return null
+        }
+      },
+
+      async sendTip(destination, amount): Promise<TipOutcome> {
+        const manager = await payments()
+        if (!manager) return { status: 'failed', reason: 'This Polkadot app build offers no payment service.' }
+
+        let id: string
+        try {
+          diag.step('payments', 'running', `requesting ${amount} base units`)
+          const response = await manager.requestPayment(amount, destination)
+          id = response?.id
+          if (!id) throw new Error('the host returned no payment id')
+        } catch (error) {
+          // The host surfaces the user's own decision as an error. Read it back apart from a real
+          // failure, because "you cancelled" must never be reported as "something broke".
+          const text = describe(error)
+          if (/reject/i.test(text)) {
+            diag.step('payments', 'skip', 'the user declined the payment')
+            return { status: 'rejected' }
+          }
+          if (/insufficient/i.test(text)) {
+            diag.step('payments', 'skip', 'insufficient balance')
+            return { status: 'insufficient' }
+          }
+          // ⚠️ FIRST SUSPECT IF THIS EVER FAILS ON A REAL DEVICE, and it is NOT a malformed call:
+          // pUSD (asset 50000413) is the only PROTECTED asset on this chain — every value method on
+          // its ERC-20 precompile reverts with "Protected asset access requires value-transfer
+          // authorization", and what grants that authorization is unknown to us. Reproduce with
+          // `node contracts/scripts/probe-tipping.mjs`. Do not start by rewriting this call.
+          diag.step('payments', 'fail', text)
+          return { status: 'failed', reason: text }
+        }
+
+        /**
+         * `requestPayment` returning means AUTHORIZED, NOT SETTLED — RFC-0006 says so, and Parity's
+         * own app notes the native host returns before the extrinsic is even broadcast. So watch the
+         * status to a terminal state rather than claiming success here.
+         */
+        return await new Promise<TipOutcome>((resolve) => {
+          let done = false
+          let handle: { unsubscribe: () => void } | null = null
+          const finish = (outcome: TipOutcome) => {
+            if (done) return
+            done = true
+            try {
+              handle?.unsubscribe?.()
+            } catch {
+              /* ignore */
+            }
+            resolve(outcome)
+          }
+          // A status stream that never speaks must not hang the UI for ever. Reported as sent-but-
+          // unconfirmed rather than failed: double-charging by retrying is the worse error.
+          const timer = setTimeout(() => {
+            diag.step('payments', 'skip', `${id} · no terminal status; treating as sent unconfirmed`)
+            finish({ status: 'sent' })
+          }, TIMEOUTS.write)
+
+          try {
+            handle = manager.subscribePaymentStatus(id, (status: { tag?: string; value?: { reason?: string } } | null) => {
+              if (status?.tag === 'Completed') {
+                clearTimeout(timer)
+                diag.step('payments', 'ok', `${id} completed`)
+                finish({ status: 'sent' })
+              } else if (status?.tag === 'Failed') {
+                clearTimeout(timer)
+                const reason = status.value?.reason ?? 'the host reported a failure'
+                diag.step('payments', 'fail', `${id} failed · ${reason}`)
+                finish({ status: 'failed', reason })
+              }
+              // 'Processing' — keep waiting.
+            })
+          } catch (error) {
+            clearTimeout(timer)
+            // The payment was accepted; only the WATCHING failed. Saying "failed" here would be a
+            // lie that invites a retry, i.e. a second charge.
+            diag.step('payments', 'skip', `${id} accepted but status unavailable · ${describe(error)}`)
+            finish({ status: 'sent' })
+          }
+        })
       },
     }
   }

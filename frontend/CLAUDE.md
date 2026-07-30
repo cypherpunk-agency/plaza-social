@@ -34,10 +34,22 @@ like a missing deployment.
 | Parameter | View Mode | Description |
 |-----------|-----------|-------------|
 | `?profile=0x...` | profile | Shows user profile (inline overlay) |
-| `?thread=N` | forum | ⚠️ POSITIONAL — `N` is a slot in the loaded page, not a thread. Retargets when anyone posts. Moving to `?cid=`. |
+| `?post=N` | profile | ⚠️ POSITIONAL, still unmigrated. Same bug `?thread=N` had; `UserPost` already carries `cid`. |
+| `?cid=<threadCid>` | forum | **[V]** The thread deep link. The announcement CID — the same identity the vote tally is keyed on. Round-trips (2026-07-31, fake backend). |
+| `?thread=N` | forum | ⚠️ **DEPRECATED, READ-ONLY.** Parsed so already-published links keep working; **never written**. `ForumView` maps the position to a CID as soon as the list loads and the URL rewrites itself to `?cid=`. **[V]** `?thread=1` → `?cid=bafk2bza…` on the fake backend. |
+
+`cid` **wins** whenever both are present, and a malformed `?thread=` (`3abc`, `-1`, `0x2`) selects
+*nothing* rather than the plausible-looking thing `parseInt` would return. Both rules are pinned by
+tests in `src/lib/threadLink.test.ts`; the parse/project pair lives in `src/lib/threadLink.ts` and
+nothing else may touch those two keys.
 
 `?channel=0x...` is **dead** — `ViewMode` has no `'channels'` member; such a link falls back to the
 forum.
+
+⚠️ **`?cid=` can point at a thread that is not in the loaded page**, because the board reads the 50
+most recent chains and a body that has not resolved has no CID to match. `ForumView` says so
+("THREAD NOT IN THIS PAGE") and keeps the param. Do not "fix" this by clearing the selection — that
+makes a correct shared link look broken.
 
 ### How navigation actually works — state is the source of truth
 
@@ -61,6 +73,8 @@ to parse it — never by calling `pushState` from a click handler.
 ⚠️ **`viewMode` and `selectedProfile` are persisted to `localStorage`.** A "cold load" therefore lands
 where you left off, not on the forum, and that looks exactly like a routing regression when you have
 just been clicking around. Clear both before judging default-route behaviour.
+**The thread selection is deliberately NOT persisted** — restoring it would make a plain visit
+indistinguishable from following a link.
 
 ⚠️ **Inside the host container the address bar is the SHELL's, not Plaza's.** Plaza runs in an iframe
 (`plaza-social.app.dev-dot.li`) under `plaza-social.dev-dot.li`, so `pushState` updates a URL nobody
@@ -68,11 +82,53 @@ can see or copy. The shell **does** forward query and hash inbound (measured), s
 the way IN; sharing one OUT needs an explicit copy affordance. TruAPI offers `navigateTo(url)` for
 following a link, and nothing at all for publishing the current URL.
 
+**That affordance is COPY LINK, in `ThreadDetailView`.** It is not a workaround to be optimised away
+once "the URL bar works" — the URL bar is never going to be ours.
+
+| Fact | Where | Consequence |
+|---|---|---|
+| A shared link must be `https://plaza-social.dot/?cid=…`, **not** `.dev-dot.li` | `lib/threadLink.ts` | **[V]** from `navigateTo`'s contract in `@parity/product-sdk-host/src/navigation.ts`: a `.dot`-suffixed deep link "routes to another app/route inside the container, an `https://` URL opens externally". The gateway host would open a browser *next to* Plaza. |
+| **`Clipboard` is a host DEVICE permission** | `@parity/truapi` `HostDevicePermissionRequest` = `"Notifications" \| "Camera" \| "Microphone" \| "Bluetooth" \| "NFC" \| "Location" \| "Clipboard" \| "OpenUrl" \| "Biometrics"` | A missing one fails **silently**, so a resolved `writeText()` promise is not evidence. `lib/clipboard.ts` writes, then reads back, and returns `copied` / `unverified` / `failed`. |
+| Reading the clipboard back **prompts the user** | `lib/clipboard.ts` `canReadBack` | `navigator.clipboard.readText()` pops Chrome's paste-permission bubble, so a COPY button would interrogate the user about PASTING. We query `clipboard-read` first and read back only when it is *already* `granted`. **`unverified` is therefore the normal desktop outcome** — word it calmly. |
+| **[?] `requestDevicePermission("Clipboard")` is NOT called** | would belong in `lib/host/sdk.ts` | The SDK exposes it (`@parity/product-sdk-host`), but `sdk.ts` is the only module allowed to import `@parity/*` and the seam does not surface it yet. Until it does, the read-back is the only thing standing between us and an optimistic "Copied!". |
+
 ### URL Persistence Config
 
 By default, registry addresses are hidden from URL unless:
 - User provided them in initial URL, OR
 - `VITE_SHOW_REGISTRY_IN_URL=true` is set
+
+## The forum is master–detail, and it is MOBILE FIRST
+
+`ForumView` renders a list column and a detail pane side by side. The **base** state of the markup is
+the phone: one column, tap a thread and the detail replaces the list, BACK returns. The split is
+layered on at **`xl` (1280px)** — the width at which a 24rem list plus a 70ch measure both fit next to
+the sidebar. Below that the split is *absent*, not squeezed. Do not invert this and design the desktop
+first; the primary surface is the host container, which is a phone app.
+
+- Switching is done with `hidden` / `flex`, **not** a JS media query picking between two subtrees.
+  The detail pane is mounted **once**; the alternative remounts `ReplyThread` on every resize across
+  the breakpoint and throws away its loaded replies.
+- **Body text is capped at `max-w-[70ch]`** in both the card and the detail pane. Before the cap a
+  thread card spanned the viewport — measured ~1750px, three to four times a comfortable measure. A
+  wide pane is not licence for a 200-character line. `ch` tracks the type scale in `index.css`.
+- Long tokens need `break-words`. A title that is a bare CID is an unbreakable 60-character run and
+  will push a 375px page into horizontal scroll.
+- `VotingWidget` defaults to **`flex-col`** — the tall gutter arrangement. In a horizontal actions row
+  that reads as a broken control, so **pass `compact`**. `ThreadCard` always did; `ThreadDetailView`
+  did not, which is why the detail page's votes looked wrong.
+- ⚠️ **Key list rows on `thread.cid`, never `thread.index`.** Keying on the position makes React reuse
+  thread A's card state — expanded replies, a half-typed edit — for thread B as soon as anyone posts.
+
+⚠️ **Reply counts are not a cheap read** (`useForumThread.replyCounts`). `getHeadsPaged` on a thread's
+reply registry returns one head per **replier**, not per reply, so an accurate count means walking the
+chains, which means fetching bodies. It is bounded to the first 25 threads, runs *after* the list
+paints, and **a missing key means "not counted", never 0** — render nothing rather than a confident
+zero over a registry we failed to read.
+
+⛔ **The sidebar is `w-64` with no responsive behaviour.** Measured at 375×812: sidebar 176px, content
+area 210px, reading column ~162px. That is an app-wide mobile problem the forum cannot fix from
+inside; see `Sidebar.tsx`.
 
 ## Key Hooks
 
@@ -225,6 +281,124 @@ status chip would label a normal situation as a deficiency. The composer carries
 instead. It must never flash during `isInitializing`, when `canWrite` is briefly false for everyone.
 
 ⚠️ There is no "connect" control and must not be. See `SessionStatus.tsx`.
+
+## Interaction states: hover, focus, disabled
+
+⚠️ **Read this before adding any `text-*`/`bg-*`/`border-*` colour class.**
+
+### The palette is declared in `@theme`, and it has to stay there
+
+`src/index.css` declares `--color-primary-*` / `--color-accent-*` inside **`@theme static`**, not in a
+plain `:root` block. That is not a style preference — it is the difference between a hover class
+working and doing nothing at all.
+
+Until 2026-07-30 the palette lived in `:root`, with a **hand-written list of matching utilities**
+underneath it (`.text-primary-400 { color: var(--color-primary-400) }`, and so on). Tailwind
+therefore had no idea these colours existed, so it generated **no variants** — and the only classes
+that rendered were the exact strings somebody had remembered to type into that list. Everything else
+was a no-op that looked completely correct in the JSX:
+
+| Dead class | Uses | Dead class | Uses |
+|---|---|---|---|
+| `hover:text-primary-400` | 22 | `border-primary-800` | 20 |
+| `focus:border-primary-400` | 18 | `hover:bg-primary-900` | 17 |
+| `border-primary-600` | 16 | `hover:bg-primary-950` | 6 |
+| `focus:border-accent-400` | 6 | `hover:text-primary-500` | 5 |
+
+…plus the accent and light-orange hover shades, `placeholder-primary-800`, `accent-primary-500`,
+the `shadow-primary-500` alpha form, and every `focus-visible:` variant.
+
+(Written out longhand on purpose. **Tailwind scans this file too** — spelling a class name here is
+enough to make it real, and writing shorthand like `a/b` invents a class nobody meant.)
+
+**This is why the app looked like it had no hover states.** It had them everywhere in the source. The
+few that *did* work were the ones using stock Tailwind colours — which is exactly why the red DELETE
+button highlighted while every orange control next to it did not.
+
+**The tell:** a colour class that has no visible effect, in a file where a neighbouring class in the
+same string clearly does. Confirm it with
+`grep -o '\.[^{,]*your-class[^{,]*' frontend/dist/assets/*.css` after a build — if the selector is
+not in the output, Tailwind never generated it. Adding a shade to `@theme` brings **every** variant
+of it with no further work; adding one to a hand-written list brings exactly one.
+
+### Hover — the convention already existed; match it, do not redesign it
+
+These patterns were already in the code and are now what actually renders. Use the row that matches
+the control; do not invent a new treatment.
+
+| Control | Pattern |
+|---|---|
+| Text-only button | `text-primary-600 hover:text-primary-400` |
+| Bordered button | `border-primary-700 hover:border-primary-500` |
+| Filled button | `bg-primary-900 hover:bg-primary-800` |
+| Nav / list row | `hover:bg-primary-950` |
+| Card / container | `border-primary-700 hover:border-primary-500` |
+| Link, accent | `text-accent-400 hover:text-accent-300` |
+| Destructive | `text-red-600 hover:text-red-400` |
+
+Always with `transition-colors` (or `transition-all` where a border also moves).
+
+⚠️ **A ternary needs hover in BOTH branches.** The common miss is a selected/active branch —
+`isUpvoted ? 'text-accent-400 font-bold' : 'text-primary-600 hover:text-primary-400'` gave the
+*active* control no hover at all, so clicking something made it stop responding to the mouse.
+
+### Focus — `:focus-visible`, set globally, in cyan
+
+Keyboard focus genuinely had no convention (the repo had zero `focus-visible` rules), so one was
+chosen. It lives in **one unlayered block in `index.css`** and covers `a[href]`, `button`, form
+controls, `summary`, the ARIA widget roles and anything with a non-negative `tabindex`:
+
+```css
+outline: 2px solid var(--color-accent-400);
+outline-offset: 2px;   /* -2px for .w-full / .block controls, see below */
+```
+
+Four decisions worth not re-litigating:
+
+- **`:focus-visible`, never bare `:focus`.** A ring on every mouse click is visual noise, and noise
+  is why people delete focus styles — which is how the app got to zero in the first place.
+- **Unlayered, not `@layer base`.** About twenty inputs carry `focus:outline-none`, which lands in
+  Tailwind's `utilities` layer. A base-layer rule loses to it and those fields would still have
+  nothing. An unlayered rule outranks every cascade layer without `!important`, and `:where()` keeps
+  its specificity at 0 so a deliberate override still wins. **You do not need to strip
+  `focus:outline-none` from a component to get a ring.**
+- **Cyan, and an outline rather than a colour change.** Hover in this app always means "the orange
+  gets brighter". If focus did the same thing in the same colour, a control that is both hovered and
+  focused would show one state. `#00ffff` on black is ≈16.7:1; the grayscale theme's `#5b9fc7` is
+  ≈7.2:1. WCAG asks 3:1 for a non-text indicator.
+- **`outline-offset` flips to `-2px` for `.w-full` / `.block` controls.** Sidebar rows and list items
+  live inside `overflow-y-auto` columns that clip an outward ring against the container edge — the
+  focused row would show a ring on three sides.
+
+**Never write `focus:outline-none` without a replacement.** With the global rule in place you rarely
+need it at all.
+
+⚠️ **The ring FADES IN on any control carrying `transition-all` or `transition-colors`**, because
+Tailwind's property list for both includes `outline-color`, `outline-width` and `outline-offset`. It
+settles on the values above after ~150ms, and `prefers-reduced-motion` makes it instant. This matters
+when you go to verify it: `getComputedStyle` sampled inside a `focusin` handler, or in a browser pane
+that is not compositing frames, reads the transition's **start** value — `outline-color: currentColor`
+(so an orange ring) at `3px @0px` — and looks exactly like the rule failing to apply. Read
+`el.getAnimations()[i].effect.getKeyframes()` instead: the `offset: 1` entry is the real target.
+
+### Disabled must not look like hovered
+
+`:hover` still fires over a disabled `<button>` in every browser, so `hover:text-primary-400` would
+brighten a control that cannot be clicked. `index.css` drains the colour instead:
+
+```css
+button:disabled, input:disabled, … { cursor: not-allowed; filter: grayscale(0.85); }
+```
+
+Deliberately **no opacity** there: components already apply `disabled:opacity-50`, and two halves of
+50% is 25%, which reads as a rendering bug rather than a disabled control.
+
+### Clickable non-buttons
+
+A `<div>`/`<span>`/`<h3>` with `onClick` gets no focus, no Enter/Space, and announces as static text
+— the global focus rule cannot reach it because there is nothing focusable to style. **Use a real
+`<button type="button">`.** Modal backdrop `<div onClick={onClose}>` overlays are the one accepted
+exception: they duplicate a real close control, so they stay unfocusable on purpose.
 
 ## Key Components
 

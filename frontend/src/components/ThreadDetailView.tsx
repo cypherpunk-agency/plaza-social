@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef, useEffect } from 'react';
 import type { ForumThread, VoteType, VoteTally, Profile } from '../types/contracts';
 import { VotingWidget } from './VotingWidget';
 import { ReplyThread } from './ReplyThread';
@@ -7,6 +7,9 @@ import { formatTimestamp } from '../utils/formatters';
 import type { Provider, Signer } from '../utils/contracts';
 import { entityIdOfCid } from '../lib/entity';
 import { FORUM_REGISTRY } from '../lib/registry';
+import { threadShareUrl } from '../lib/threadLink';
+import { copyTextVerified, type CopyOutcome } from '../lib/clipboard';
+import { reportError } from '../lib/reportError';
 import toast from 'react-hot-toast';
 
 interface ThreadDetailViewProps {
@@ -69,7 +72,55 @@ export function ThreadDetailView({
   const [isSaving, setIsSaving] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
+  /**
+   * The share panel.
+   *
+   * ⚠️ IT IS ALWAYS SHOWN ONCE COPY LINK IS PRESSED, whatever the clipboard did. Inside the host the
+   * address bar belongs to the dot.li shell — `pushState` updates an invisible iframe URL — so this
+   * panel is the ONLY place a user can see or select the link to a thread. That is also why the
+   * outcome is reported honestly instead of with an optimistic toast: `Clipboard` is a host device
+   * permission and a missing one fails silently.
+   */
+  const [shareOutcome, setShareOutcome] = useState<CopyOutcome | null>(null);
+  const shareInputRef = useRef<HTMLInputElement | null>(null);
+
   const isOwner = currentAddress?.toLowerCase() === thread.author.toLowerCase();
+
+  const shareUrl = useMemo(() => threadShareUrl(thread.cid), [thread.cid]);
+
+  // Close the panel when the pane switches to a different thread — a stale link under a new title
+  // is worse than no link.
+  useEffect(() => {
+    setShareOutcome(null);
+  }, [thread.cid]);
+
+  // Pre-select the text so the manual path is one gesture, not three.
+  useEffect(() => {
+    if (shareOutcome && shareInputRef.current) {
+      shareInputRef.current.focus();
+      shareInputRef.current.select();
+    }
+  }, [shareOutcome]);
+
+  const handleCopyLink = async () => {
+    if (!shareUrl) return;
+    const outcome = await copyTextVerified(shareUrl);
+    setShareOutcome(outcome);
+    if (outcome === 'copied') {
+      toast.success('Link copied');
+    } else if (outcome === 'failed') {
+      // A real failure, reported the way every other failure in this app is: short toast,
+      // tap-to-copy detail, durable entry under Settings → RECENT ERRORS.
+      reportError(
+        'copy thread link',
+        new Error(
+          'The clipboard rejected the write, or accepted it and kept something else. Inside the ' +
+            'Polkadot host container this usually means the Clipboard device permission was not ' +
+            'granted. The link is shown below and can be selected manually.',
+        ),
+      );
+    }
+  };
 
   // A vote is cast on the BYTES, so the tally is keyed on the CID. Pure keccak — no round trip, no
   // failure mode, and the count is right on the first paint. See `lib/entity.ts`.
@@ -125,28 +176,92 @@ export function ThreadDetailView({
   }
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Header with back button */}
-      <div className="px-4 py-3 border-b border-primary-700 flex items-center justify-between">
+    <div className="flex flex-col h-full min-w-0">
+      {/* Header: back, share, identity. */}
+      <div className="px-4 py-3 border-b border-primary-700 flex items-center flex-wrap gap-3">
         <button
           onClick={onBack}
-          className="text-sm font-mono text-primary-500 hover:text-primary-400"
+          className="text-sm font-mono text-primary-500 hover:text-primary-400 whitespace-nowrap"
         >
-          &larr; BACK TO FORUM
+          {/* On a phone this button IS the navigation — the detail replaced the list. In the
+              two-pane layout it just clears the pane, which is why the wording differs. */}
+          <span className="xl:hidden">&larr; BACK TO FORUM</span>
+          <span className="hidden xl:inline">&larr; CLOSE</span>
         </button>
-        <span className="text-primary-700 font-mono text-xs">#{thread.index}</span>
+
+        {shareUrl && (
+          <button
+            onClick={handleCopyLink}
+            className="text-sm font-mono text-primary-500 border border-primary-700 hover:border-primary-500 px-2 py-0.5 whitespace-nowrap"
+            title="Copy a link that opens this thread inside Plaza"
+          >
+            COPY LINK
+          </button>
+        )}
+
+        {thread.cid && (
+          <span className="text-primary-700 font-mono text-xs ml-auto" title={thread.cid}>
+            {thread.cid.slice(0, 10)}…
+          </span>
+        )}
       </div>
 
+      {/* Share panel. Shown after COPY LINK regardless of outcome — see `shareOutcome` above. */}
+      {shareUrl && shareOutcome && (
+        <div className="px-4 py-3 border-b border-primary-800 bg-primary-950 font-mono text-xs min-w-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <input
+              ref={shareInputRef}
+              readOnly
+              value={shareUrl}
+              onFocus={(e) => e.currentTarget.select()}
+              className="flex-1 min-w-0 px-2 py-1 bg-black border border-primary-700 text-primary-300 font-mono text-xs focus:outline-none focus:border-primary-400"
+            />
+            <button
+              onClick={() => setShareOutcome(null)}
+              className="text-primary-600 hover:text-primary-400 px-1"
+              title="Hide"
+            >
+              ×
+            </button>
+          </div>
+          <p
+            className={`mt-2 max-w-[70ch] ${
+              shareOutcome === 'copied'
+                ? 'text-primary-500'
+                : shareOutcome === 'unverified'
+                  ? 'text-accent-400'
+                  : 'text-red-400'
+            }`}
+          >
+            {shareOutcome === 'copied'
+              ? 'Copied — read back from the clipboard to confirm.'
+              : shareOutcome === 'unverified'
+                ? 'Copied. Reading the clipboard back would have prompted you, so this is not ' +
+                  'confirmed — if the paste comes out wrong, the link is right here.'
+                : 'NOT copied. The clipboard refused, or accepted and kept something else — inside ' +
+                  'the Polkadot host that usually means the Clipboard permission was not granted. ' +
+                  'Select the link above and copy it manually.'}
+          </p>
+          <p className="mt-1 text-primary-700 max-w-[70ch]">
+            A <code>.dot</code> link opens the thread inside Plaza; the <code>.dev-dot.li</code>{' '}
+            address would open a browser next to it.
+          </p>
+        </div>
+      )}
+
       {/* Thread content */}
-      <div className="flex-1 overflow-y-auto">
-        <div className="p-6 max-w-4xl mx-auto">
+      <div className="flex-1 overflow-y-auto min-w-0">
+        {/* `p-4` on a phone, `p-6` once there is room. 24px of padding on each side of a 210px
+            column is 23% of the readable width. */}
+        <div className="p-4 xl:p-6 max-w-[80ch] min-w-0">
           {/* Title */}
-          <h1 className="text-2xl font-mono text-primary-300 mb-4">
+          <h1 className="text-2xl font-mono text-primary-300 mb-4 break-words max-w-[70ch]">
             {thread.title}
           </h1>
 
           {/* Meta info */}
-          <div className="flex items-center gap-3 font-mono text-sm mb-6 pb-4 border-b border-primary-800">
+          <div className="flex items-center flex-wrap gap-3 font-mono text-sm mb-6 pb-4 border-b border-primary-800">
             {onSelectUser && (
               <UserLink
                 address={thread.author}
@@ -220,15 +335,23 @@ export function ThreadDetailView({
               </div>
             </div>
           ) : (
-            <div className="text-sm text-primary-300 font-mono whitespace-pre-wrap mb-6 leading-relaxed">
+            /* ⚠️ THE CAP APPLIES HERE TOO. A wide detail pane is not licence for a 200-character
+               line; 60–80 characters is the comfortable measure regardless of how much room there
+               is. `ch` units track the font size set in `index.css`. */
+            <div className="text-sm text-primary-300 font-mono whitespace-pre-wrap break-words mb-6 leading-relaxed max-w-[70ch]">
               {thread.content}
             </div>
           )}
 
           {/* Actions Row */}
           {!isEditing && (
-            <div className="flex items-center gap-4 py-4 border-t border-primary-800 border-b border-primary-800 mb-6">
-              {/* Voting */}
+            <div className="flex items-center flex-wrap gap-4 py-4 border-t border-primary-800 border-b border-primary-800 mb-6">
+              {/* Voting.
+                  ⚠️ `compact` — WITHOUT IT THIS RENDERS STACKED. `VotingWidget`'s default is
+                  `flex-col`, i.e. the tall Reddit-style gutter arrangement, which only reads as
+                  deliberate when it sits in a gutter. Dropped into a horizontal actions row it
+                  looks like a broken control. `ThreadCard` has always passed `compact`; this was
+                  the one call site that did not. */}
               {entityId && (
                 <VotingWidget
                   entityId={entityId}
@@ -238,6 +361,7 @@ export function ThreadDetailView({
                   removeVote={removeVote}
                   isVoting={isVoting}
                   disabled={disabled}
+                  compact
                 />
               )}
 

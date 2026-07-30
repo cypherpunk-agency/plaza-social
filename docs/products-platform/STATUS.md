@@ -85,10 +85,23 @@ Bulletin authorization error. Cost an hour. See gotchas.
 
 ## Next actions, in order
 
-1. **Deep links are POSITIONAL and therefore wrong.** `?thread=0` means "the newest thread", not a
-   particular one, so a shared link silently retargets the moment anyone posts. Every item now carries
-   its `cid` (see `types/contracts.ts`), so this is a small change to `?cid=` — and it is the last
-   place the deleted contracts' positional identity is still load-bearing.
+1. ~~**Forum deep links are POSITIONAL and therefore wrong.**~~ **[V] Done for THREADS, 2026-07-31.**
+   `?cid=<threadCid>` is the thread deep link; `?thread=N` is still parsed so published links keep
+   working but is **never written** — `ForumView` resolves the position against the loaded page and
+   the URL rewrites itself to `?cid=`. `cid` wins when both are present; a malformed `?thread=`
+   selects nothing rather than what `parseInt` would guess. Parse/project pair and its tests:
+   `frontend/src/lib/threadLink.ts`. Verified in the fake backend at 375px and 1280px+: `?cid=`
+   round-trips, `?thread=1` upgrades itself, browser Back re-derives from the URL.
+   Shipped with it: the forum is now **master–detail** (list only below `xl`, two panes at/above it)
+   with body text capped at `max-w-[70ch]`, and a **COPY LINK** control that emits
+   `https://plaza-social.dot/?cid=…` — `.dot`, so the link routes *inside* the container.
+   ⚠️ **[?] Never exercised inside a real host.** `Clipboard` is a host device permission and a
+   missing one fails silently, so `lib/clipboard.ts` writes and reads back and can report
+   `copied` / `unverified` / `failed`. On a desktop browser the write **[V]** resolves under a real
+   click but the read-back is skipped (querying it would prompt the user), so the honest outcome
+   there is `unverified`. **Nobody has yet pressed COPY LINK on a phone.**
+   ⛔ **`?post=N` on the profile feed is STILL POSITIONAL.** Same bug, same fix, not done —
+   `UserPost` already carries `cid`, but `PostDetailView`/`useUserPosts` belong to another change.
 2. **Move the remaining owner-only calls to `writeContract`** — start with `authorizeDelegate`, since
    "SET UP POSTING KEY" is offered in the UI and would fail today. That is also what removes the
    per-post signing prompt: with a live delegation, `usePublisher`'s `writeHead` switches to

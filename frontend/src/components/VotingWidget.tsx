@@ -114,11 +114,11 @@ export function VotingWidget({
         className={`
           px-1 py-0.5 text-sm transition-colors
           ${isUpvoted
-            ? 'text-accent-400 font-bold'
+            ? 'text-accent-400 font-bold hover:text-accent-300'
             : 'text-primary-600 hover:text-primary-400'}
           ${disabled || isVoting ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
         `}
-        title="Upvote"
+        title={isUpvoted ? 'Remove upvote' : 'Upvote'}
       >
         ▲
       </button>
@@ -136,11 +136,11 @@ export function VotingWidget({
         className={`
           px-1 py-0.5 text-sm transition-colors
           ${isDownvoted
-            ? 'text-red-400 font-bold'
+            ? 'text-red-400 font-bold hover:text-red-300'
             : 'text-primary-600 hover:text-primary-400'}
           ${disabled || isVoting ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
         `}
-        title="Downvote"
+        title={isDownvoted ? 'Remove downvote' : 'Downvote'}
       >
         ▼
       </button>

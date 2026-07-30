@@ -260,6 +260,74 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
         }
       : null,
 
+    /**
+     * CASH payments — present, and every path refuses honestly.
+     *
+     * ⚠️ NOT `null`, for the same reason `writeContract` is not null: a null seam makes `canTip`
+     * false everywhere, the tip control disappears, and the modal this scenario exists to exercise
+     * can never be opened. Present-and-refusing keeps the whole UI reachable.
+     *
+     * ⛔ AND IT MUST NOT PRETEND TO SUCCEED. There is no host to prompt and no chain to settle on, so
+     * a stub returning `{status:'sent'}` would show a success toast for money that never moved —
+     * the single most dangerous lie this file could tell. Each method therefore reports the honest
+     * unavailable state, and each reports a DIFFERENT one, so all three UI branches can be seen:
+     *
+     *   · balance      → `null`, i.e. "unknown" (NOT `0n` — see `PaymentsSeam.subscribeBalance`)
+     *   · recipient    → resolves for a stable pretend subset, `null` otherwise, so the
+     *                    "cannot be paid" copy is reachable without a real unmapped account
+     *   · sendTip      → `failed`, naming the fake backend
+     */
+    payments: {
+      subscribeBalance(listener) {
+        let live = true
+        // Asynchronous on purpose: a synchronous callback would hide the "balance unknown" first
+        // paint that the real push subscription always goes through.
+        void sleep(jitter(latencyMs)).then(() => {
+          if (live) listener(null)
+        })
+        return () => {
+          live = false
+        }
+      },
+
+      async resolveRecipient(h160Address) {
+        await sleep(jitter(latencyMs))
+        const h160 = h160Address?.trim().toLowerCase()
+        if (!h160 || !/^0x[0-9a-f]{40}$/.test(h160)) return null
+        /**
+         * ⭐ THE FAKE MIRRORS THE REAL CHAIN RATHER THAN INVENTING A RULE.
+         *
+         * `REAL_MAPPING` below is a genuine, measured `Revive.OriginalAccount` row from Paseo Asset
+         * Hub — the H160 of the one account that has actually posted to Plaza, and the 32-byte
+         * account it really resolves to (`5EJ3VTQLFVGHh2nrwpD9VyAFhYhhKnHxRTfGsGifFS4sx2rz`).
+         * Reproduce with `node contracts/scripts/probe-tipping.mjs`.
+         *
+         * Everything else resolves to `null`, which is also true to life: the map holds 4236 entries
+         * chain-wide but only accounts that have transacted appear in it. So the fake exercises BOTH
+         * branches, and the payable one uses a destination that is not a fiction.
+         *
+         * ⛔ It is still never sent anywhere — `sendTip` below refuses unconditionally.
+         */
+        const REAL_MAPPING: Record<string, string> = {
+          '0x18773c30d65de35027ac8cd19e98c0ddb9c44ef9':
+            '0x62a4c0821686da4fe20ba29ceaf2a21aa404f0deddbafbb79dcd1c0b09903d2f',
+        }
+        return REAL_MAPPING[h160] ?? null
+      },
+
+      async sendTip(_destination, amount) {
+        assertLive()
+        await sleep(jitter(latencyMs * 2))
+        return {
+          status: 'failed',
+          reason:
+            `The fake backend has no host to authorise a payment and no chain to settle it, so ${amount} ` +
+            'base units of CASH were NOT sent. Amount parsing, the recipient lookup and the ' +
+            'confirmation flow all ran. Open Plaza inside the Polkadot app to tip for real.',
+        }
+      },
+    },
+
     readProvider: () => provider,
 
     signer: () => ({

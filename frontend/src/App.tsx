@@ -12,6 +12,7 @@ import { HostNotice } from './components/HostNotice';
 import { SettingsView } from './components/SettingsView';
 import { ForumView } from './components/ForumView';
 import { TipModal } from './components/TipModal';
+import { readThreadSelection, writeThreadSelection } from './lib/threadLink';
 
 /**
  * ⛔ CHAT IS UNWIRED FROM THE UI, AND NOT DELETED FROM THE REPO.
@@ -54,8 +55,18 @@ function App() {
   const votingAddress = deployments?.voting || null;
   const forumThreadAddress = postRegistryAddress;
   const directProfileAddress = urlParams.get('profile');
-  const directThreadIndex = urlParams.get('thread');
   const directPostIndex = urlParams.get('post');
+
+  /**
+   * The inbound thread deep link.
+   *
+   * ⚠️ `?cid=` IS THE LINK; `?thread=N` IS A POSITION AND ONLY SURVIVES BECAUSE IT WAS PUBLISHED.
+   * `N` indexed the page `useForumThread` happened to have walked, so a shared `?thread=` retargeted
+   * itself whenever anybody posted. `readThreadSelection` lets `cid` win when both are present and
+   * refuses to guess at a malformed `thread`; `ForumView` converts a surviving position into a CID
+   * as soon as the list arrives, after which the param is gone for good. See `lib/threadLink.ts`.
+   */
+  const initialThreadSelection = readThreadSelection(window.location.search);
 
   // Only show registry in URL if user provided non-default registry addresses
   const showRegistryInUrl = useMemo(() => {
@@ -155,7 +166,7 @@ function App() {
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
     // URL params imply view mode
     if (directProfileAddress) return 'profile';
-    if (directThreadIndex) return 'forum';
+    if (initialThreadSelection.cid || initialThreadSelection.legacyIndex !== null) return 'forum';
     const stored = localStorage.getItem('viewMode');
     if (stored === 'profile' || stored === 'forum') return stored;
     // Default to forum for new visitors, and for anyone arriving with a chat view persisted.
@@ -168,14 +179,32 @@ function App() {
     return localStorage.getItem('selectedProfile');
   });
 
-  // Forum thread view state
-  const [selectedThread, setSelectedThread] = useState<number | null>(() => {
-    if (directThreadIndex) {
-      const parsed = parseInt(directThreadIndex, 10);
-      return isNaN(parsed) ? null : parsed;
-    }
-    return null;
-  });
+  /**
+   * Forum thread selection — the CID, which is the thread's identity.
+   *
+   * ⚠️ NOT PERSISTED TO `localStorage`, unlike `viewMode` and `selectedProfile`. A cold load lands on
+   * the board, not on whatever thread you last read; restoring it would make a plain visit
+   * indistinguishable from following a link.
+   */
+  const [selectedThreadCid, setSelectedThreadCid] = useState<string | null>(
+    () => initialThreadSelection.cid,
+  );
+
+  /**
+   * ⚠️ TRANSIENT, AND ONLY EVER SET FROM AN INBOUND `?thread=N`. `ForumView` is the only component
+   * that holds the loaded page, so it is the only thing that can turn this position into a CID; it
+   * calls `onThreadChange` with the answer, which lands in `selectedThreadCid` and clears this.
+   * Nothing writes a new value here.
+   */
+  const [legacyThreadIndex, setLegacyThreadIndex] = useState<number | null>(
+    () => initialThreadSelection.legacyIndex,
+  );
+
+  /** The one place a thread selection changes. Setting a CID always retires the legacy position. */
+  const selectThread = useCallback((cid: string | null) => {
+    setSelectedThreadCid(cid);
+    setLegacyThreadIndex(null);
+  }, []);
 
   // User post view state (within profile view)
   const [selectedPost, setSelectedPost] = useState<number | null>(() => {
@@ -246,16 +275,19 @@ function App() {
     const handlePopState = () => {
       const urlParams = new URLSearchParams(window.location.search);
       const profile = urlParams.get('profile');
-      const thread = urlParams.get('thread');
       const post = urlParams.get('post');
+      // ⚠️ Parsed through the same function the projection writes with, so Back can never disagree
+      // with Forward about what a URL means. `cid` wins over a legacy `thread`.
+      const thread = readThreadSelection(urlParams);
 
       // Update lastUrlRef to current URL to prevent re-pushing
       lastUrlRef.current = window.location.href;
 
       // Determine view mode and selections from URL
-      if (thread !== null) {
+      if (thread.cid || thread.legacyIndex !== null) {
         setViewMode('forum');
-        setSelectedThread(parseInt(thread, 10));
+        setSelectedThreadCid(thread.cid);
+        setLegacyThreadIndex(thread.legacyIndex);
       } else if (profile) {
         setViewMode('profile');
         setSelectedProfile(profile);
@@ -264,7 +296,8 @@ function App() {
         // Default to forum when no specific view. A `?channel=` param in the history entry is
         // deliberately not honoured — chat has no view to return to.
         setViewMode('forum');
-        setSelectedThread(null);
+        setSelectedThreadCid(null);
+        setLegacyThreadIndex(null);
       }
     };
 
@@ -323,13 +356,15 @@ function App() {
         url.searchParams.delete('post');
       }
       url.searchParams.delete('channel');
-      url.searchParams.delete('thread');
+      writeThreadSelection(url.searchParams, { cid: null, legacyIndex: null });
     } else if (viewMode === 'forum') {
-      if (selectedThread !== null) {
-        url.searchParams.set('thread', String(selectedThread));
-      } else {
-        url.searchParams.delete('thread');
-      }
+      // One function owns the `cid`/`thread` pair, and it is the same one `readThreadSelection`
+      // reverses. It only ever WRITES `cid`; `thread` survives just long enough for `ForumView` to
+      // resolve an inbound legacy link.
+      writeThreadSelection(url.searchParams, {
+        cid: selectedThreadCid,
+        legacyIndex: legacyThreadIndex,
+      });
       url.searchParams.delete('channel');
       url.searchParams.delete('profile');
       url.searchParams.delete('post');
@@ -338,12 +373,12 @@ function App() {
       url.searchParams.delete('channel');
       url.searchParams.delete('profile');
       url.searchParams.delete('post');
-      url.searchParams.delete('thread');
+      writeThreadSelection(url.searchParams, { cid: null, legacyIndex: null });
     }
 
     // Determine page title
     let title = 'Plaza';
-    if (viewMode === 'forum' && selectedThread !== null && currentThreadTitle) {
+    if (viewMode === 'forum' && selectedThreadCid !== null && currentThreadTitle) {
       title = `${currentThreadTitle} - Plaza`;
     } else if (viewMode === 'profile' && selectedProfile) {
       title = currentProfileName
@@ -362,7 +397,7 @@ function App() {
       window.history.pushState({}, title, newUrl);
       lastUrlRef.current = newUrl;
     }
-  }, [viewMode, selectedProfile, selectedPost, selectedThread, currentThreadTitle, currentProfileName, showRegistryInUrl, registryAddress]);
+  }, [viewMode, selectedProfile, selectedPost, selectedThreadCid, legacyThreadIndex, currentThreadTitle, currentProfileName, showRegistryInUrl, registryAddress]);
 
   // Modals
   const [showHostNotice, setShowHostNotice] = useState(false);
@@ -475,8 +510,11 @@ function App() {
         <div className="flex items-center justify-between p-4">
           <button
             onClick={() => {
+              // ⚠️ WAS `setSelectedThread(0)`. The home button selected the FIRST THREAD in the
+              // loaded page rather than clearing the selection — clicking PLAZA opened a thread,
+              // and which one depended on who had posted most recently.
               setViewMode('forum');
-              setSelectedThread(0);
+              selectThread(null);
             }}
             className="flex items-baseline gap-4 hover:opacity-80 transition-opacity"
           >
@@ -632,7 +670,10 @@ function App() {
               sessionWalletBalance={host.delegation?.balance ?? 0n}
               isFollowingUser={followRegistry.isFollowingSync}
               onTip={setTipTargetAddress}
-              canTip={host.canWrite}
+              // ⚠️ NOT `host.canWrite`. That is POSTING ability and says nothing about funds — it
+              // showed a tip control to everyone who could post, including sessions with no way to
+              // pay at all. What makes a tip possible is a CASH payment seam.
+              canTip={!!host.backend?.payments}
               onConnectWallet={() => setShowHostNotice(true)}
               selectedPostFromUrl={selectedPost}
               onPostChange={setSelectedPost}
@@ -650,15 +691,19 @@ function App() {
               getDisplayName={getDisplayName}
               onSelectUser={openProfile}
               disabled={!walletConfig.canWrite}
-              selectedThreadFromUrl={selectedThread}
-              onThreadChange={setSelectedThread}
+              selectedThreadCid={selectedThreadCid}
+              legacyThreadIndex={legacyThreadIndex}
+              onThreadChange={selectThread}
               onThreadTitleChange={setCurrentThreadTitle}
               getProfile={userRegistry.getProfile}
               onFollow={followRegistry.follow}
               onUnfollow={followRegistry.unfollow}
               isFollowing={followRegistry.isFollowingSync}
               onTip={setTipTargetAddress}
-              canTip={host.canWrite}
+              // ⚠️ NOT `host.canWrite`. That is POSTING ability and says nothing about funds — it
+              // showed a tip control to everyone who could post, including sessions with no way to
+              // pay at all. What makes a tip possible is a CASH payment seam.
+              canTip={!!host.backend?.payments}
             />
           ) : viewMode === 'settings' ? (
             // Settings view
@@ -703,9 +748,10 @@ function App() {
           isOpen={true}
           onClose={() => setTipTargetAddress(null)}
           recipientAddress={tipTargetAddress}
-          sessionWallet={walletConfig.signer}
-          sessionWalletAddress={host.delegation?.address ?? null}
-          sessionWalletBalance={host.delegation?.balance ?? 0n}
+          // Tips are paid in CASH by the host, from the USER's balance. The delegate key is not on
+          // this path — it is never funded, which is why every tip used to fail with "Insufficient
+          // balance in selected wallet". The `sessionWallet*` props are gone with it.
+          payments={host.backend?.payments ?? null}
           onConnectWallet={() => setShowHostNotice(true)}
         />
       )}

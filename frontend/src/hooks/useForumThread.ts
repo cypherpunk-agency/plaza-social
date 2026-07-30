@@ -11,7 +11,7 @@ import {
   validateThreadDraft,
   type DecodedObject,
 } from "../lib/wire";
-import { FORUM_REGISTRY } from "../lib/registry";
+import { FORUM_REGISTRY, threadRegistryId } from "../lib/registry";
 import { NO_WRITE_SESSION } from "../lib/publish";
 import { usePublisher } from "./usePublisher";
 import { gatewayFetcher } from "../lib/gateways";
@@ -76,11 +76,31 @@ interface UseForumThreadProps {
   enabled?: boolean;
 }
 
+/**
+ * How many threads get a reply count, and how deep each count walks.
+ *
+ * ⚠️ A reply count is NOT a cheap read. `getHeadsPaged` on the thread's reply registry gives one head
+ * per REPLIER, not one per reply — the replies themselves hang off those heads in Bulletin chains, so
+ * an accurate number means walking, which means fetching bodies. That is bounded here rather than
+ * left open, because the primary surface is a phone: 50 threads × every reply body is not a load.
+ */
+const REPLY_COUNT_THREADS = 25;
+const REPLY_COUNT_DEPTH = 50;
+
 interface UseForumThreadReturn {
   threads: ForumThread[];
   isLoading: boolean;
   error: string | null;
   threadCount: number;
+  /**
+   * Replies per thread announcement CID, best effort.
+   *
+   * ⚠️ ABSENT MEANS "NOT COUNTED YET OR NOT COUNTABLE", NEVER "ZERO". It fills in after the list
+   * paints, is capped to the first {@link REPLY_COUNT_THREADS} threads, and a failed read leaves the
+   * key missing rather than inventing a 0. Render nothing for a missing key; a confident "0 replies"
+   * over an unread registry is the same class of lie as an optimistic "Copied!".
+   */
+  replyCounts: Record<string, number>;
 
   createThread: (title: string, content: string, tags: string[]) => Promise<number>;
   editThread: (threadIndex: number, newContent: string) => Promise<void>;
@@ -101,6 +121,7 @@ export function useForumThread({
   const publisher = usePublisher();
   const [threads, setThreads] = useState<ForumThread[]>([]);
   const [threadCount, setThreadCount] = useState(0);
+  const [replyCounts, setReplyCounts] = useState<Record<string, number>>({});
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -267,9 +288,60 @@ export function useForumThread({
   }, [getReadContract, toForumThread, cache]);
 
   /**
+   * Count the replies under each loaded thread, in the background, best effort.
+   *
+   * A thread's replies are their OWN open registry — `keccak256("thread:" + cid)`, derived only in
+   * `lib/registry.ts` — so this is the same two-step every other read is: heads on chain, then walk
+   * the chains off chain. It runs after the list has already painted, because a board that waits for
+   * its reply counts is a board that shows nothing for several seconds on a phone.
+   *
+   * A thread whose count cannot be read is simply LEFT OUT of the map. See the return type.
+   */
+  const loadReplyCounts = useCallback(
+    async (list: ForumThread[]): Promise<Record<string, number>> => {
+      const contract = getReadContract();
+      if (!contract) return {};
+
+      const targets = list
+        .filter((t) => !!t.cid && !t.isDeleted)
+        .slice(0, REPLY_COUNT_THREADS);
+
+      const results = await Promise.all(
+        targets.map(async (thread): Promise<[string, number] | null> => {
+          const registry = threadRegistryId(thread.cid);
+          if (!registry) return null;
+          try {
+            const [refs] = await contract.getHeadsPaged(registry, 0, REPLY_COUNT_DEPTH);
+            const heads = (refs as OnChainHead[])
+              .filter((ref) => ref.allowed && ref.cid)
+              .map((ref) => ({
+                cid: ref.cid,
+                prev: ref.prev || null,
+                at: ref.movedAt > 0n ? Number(ref.movedAt) * 1000 : null,
+                by: ref.by,
+                block: ref.storeBlock > 0n ? Number(ref.storeBlock) : null,
+                index: null,
+              }));
+            if (heads.length === 0) return [thread.cid, 0];
+            const page = await walkChain({ heads, cache, limit: REPLY_COUNT_DEPTH });
+            // Holes count: the pointer is on chain, so the reply exists — it is the BODY that is gone.
+            return [thread.cid, page.entries.length];
+          } catch {
+            // Deliberately silent, and deliberately absent from the map rather than 0.
+            return null;
+          }
+        })
+      );
+
+      return Object.fromEntries(results.filter((r): r is [string, number] => r !== null));
+    },
+    [getReadContract, cache]
+  );
+
+  /**
    * ⚠️ Selection is by POSITION in the loaded page, not by a stable on-chain index — there is no
    * index any more, only CIDs. A thread's position can therefore change when someone else posts.
-   * Deep links should move to `?cid=` when the detail view is migrated.
+   * Deep links use `?cid=`; see `lib/threadLink.ts`.
    */
   const getThread = useCallback(
     async (threadIndex: number): Promise<ForumThread | null> => threads[threadIndex] ?? null,
@@ -363,6 +435,29 @@ export function useForumThread({
     hasAttemptedDisplayNameFetch.current = false;
   }, [userRegistryAddress]);
 
+  /**
+   * Reply counts, keyed on the SET of threads rather than on the array identity.
+   *
+   * The 30-second poll replaces `threads` with a fresh array every time, so depending on the array
+   * would re-walk every reply chain twice a minute for no new information. The joined CID list only
+   * changes when the board actually changes.
+   */
+  const threadCidKey = useMemo(() => threads.map((t) => t.cid).join(","), [threads]);
+  useEffect(() => {
+    if (!forumThreadAddress || !provider || threads.length === 0) {
+      setReplyCounts({});
+      return;
+    }
+    let cancelled = false;
+    void loadReplyCounts(threads).then((counts) => {
+      if (!cancelled) setReplyCounts(counts);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forumThreadAddress, provider, threadCidKey]);
+
   useEffect(() => {
     if (!forumThreadAddress || !provider || !getDisplayName) return;
     if (threads.length === 0) return;
@@ -389,6 +484,7 @@ export function useForumThread({
     isLoading,
     error,
     threadCount,
+    replyCounts,
     createThread,
     editThread,
     deleteThread,

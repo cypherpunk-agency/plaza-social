@@ -26,10 +26,21 @@ interface ThreadCardProps {
   onEdit?: (threadIndex: number, newContent: string) => Promise<void>;
   onDelete?: (threadIndex: number) => Promise<void>;
   onSelectUser?: (address: string) => void;
-  onSelectThread?: (threadIndex: number) => void;
+  /**
+   * ⚠️ TAKES THE CID, NOT THE INDEX. `index` is a position in the loaded page and changes whenever
+   * anybody else posts; the announcement CID is the thread's identity and is what `?cid=` carries.
+   */
+  onSelectThread?: (threadCid: string) => void;
   getDisplayName?: (address: string) => Promise<string>;
   disabled?: boolean;
   expanded?: boolean;
+  /** Highlighted because it is the thread open in the detail pane. Two-pane layouts only. */
+  isSelected?: boolean;
+  /**
+   * Replies under this thread. `undefined` means NOT COUNTED — render nothing, never "0".
+   * See `useForumThread`'s `replyCounts`.
+   */
+  replyCount?: number;
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
   onFollow?: (address: string) => Promise<void>;
@@ -58,6 +69,8 @@ export function ThreadCard({
   getDisplayName,
   disabled = false,
   expanded = false,
+  isSelected = false,
+  replyCount,
   // Tooltip props
   getProfile,
   onFollow,
@@ -116,18 +129,27 @@ export function ThreadCard({
     );
   }
 
+  const canOpen = !!onSelectThread && !!thread.cid;
+
   return (
-    <div className="border border-primary-700 bg-black p-4 hover:border-primary-500 transition-colors">
-      {/* Title */}
+    <div
+      className={`border bg-black p-4 transition-colors min-w-0 ${
+        isSelected
+          ? 'border-primary-400 bg-primary-950'
+          : 'border-primary-700 hover:border-primary-500'
+      }`}
+    >
+      {/* Title. ⚠️ `break-words` is not cosmetic: a title can be a bare CID, and an unbreakable
+          64-character token in a 375px column pushes the whole page into horizontal scroll. */}
       <h3
-        className={`text-lg font-mono text-primary-300 mb-2 ${onSelectThread ? 'cursor-pointer hover:text-primary-200' : ''}`}
-        onClick={() => onSelectThread?.(thread.index)}
+        className={`text-lg font-mono text-primary-300 mb-2 break-words ${canOpen ? 'cursor-pointer hover:text-primary-200' : ''}`}
+        onClick={() => canOpen && onSelectThread!(thread.cid)}
       >
         {thread.title}
       </h3>
 
       {/* Header */}
-      <div className="flex items-center gap-2 font-mono text-xs mb-3">
+      <div className="flex items-center flex-wrap gap-2 font-mono text-xs mb-3">
         {onSelectUser && (
           <UserLink
             address={thread.author}
@@ -149,7 +171,14 @@ export function ThreadCard({
         {thread.editedAt && (
           <span className="text-primary-700 italic">(edited)</span>
         )}
-        <span className="text-primary-700 ml-auto">#{thread.index}</span>
+        {/* ⚠️ WAS `#{thread.index}`. That number is a POSITION in the loaded page — it changes when
+            anyone else posts — so showing it as an identifier taught the wrong thing about what
+            identifies a thread. The CID is the identity, and it is what a shared link carries. */}
+        {thread.cid && (
+          <span className="text-primary-700 ml-auto" title={thread.cid}>
+            {thread.cid.slice(0, 8)}…
+          </span>
+        )}
       </div>
 
       {/* Content or Edit Form */}
@@ -187,7 +216,17 @@ export function ThreadCard({
         </div>
       ) : (
         <>
-          <div className="text-sm text-primary-300 font-mono whitespace-pre-wrap mb-3">
+          {/* Excerpt.
+              ⚠️ `max-w-[70ch]` IS THE POINT OF THIS COMPONENT'S EXISTENCE AT DESKTOP WIDTH. Before
+              it, a card spanned the viewport — measured ~1750px, three or four times a comfortable
+              reading measure. A cap in `ch` tracks the font, so it stays right if the type scale in
+              `index.css` moves. */}
+          <div
+            className={`text-sm text-primary-300 font-mono whitespace-pre-wrap break-words mb-3 max-w-[70ch] ${
+              canOpen ? 'cursor-pointer' : ''
+            }`}
+            onClick={() => canOpen && onSelectThread!(thread.cid)}
+          >
             {expanded ? thread.content : (
               thread.content.length > 300
                 ? thread.content.slice(0, 300) + '...'
@@ -212,7 +251,7 @@ export function ThreadCard({
 
       {/* Actions Row */}
       {!isEditing && (
-        <div className="flex items-center gap-4 pt-3 border-t border-primary-800">
+        <div className="flex items-center flex-wrap gap-3 pt-3 border-t border-primary-800">
           {/* Voting */}
           {entityId && (
             <VotingWidget
@@ -227,21 +266,23 @@ export function ThreadCard({
             />
           )}
 
-          {/* Reply toggle */}
+          {/* Reply toggle. `replyCount === undefined` means NOT COUNTED, so no number is shown —
+              a confident "0" over a registry we failed to read would be a lie with a number on it. */}
           <button
             onClick={() => setShowReplies(!showReplies)}
-            className="text-xs font-mono text-primary-600 hover:text-primary-400"
+            className="text-xs font-mono text-primary-600 hover:text-primary-400 whitespace-nowrap"
           >
             {showReplies ? '[-] HIDE REPLIES' : '[+] REPLIES'}
+            {replyCount !== undefined ? ` (${replyCount})` : ''}
           </button>
 
           {/* Read more / expand */}
-          {!expanded && thread.content.length > 300 && onSelectThread && (
+          {!expanded && canOpen && (
             <button
-              onClick={() => onSelectThread(thread.index)}
-              className="text-xs font-mono text-primary-500 hover:text-primary-400"
+              onClick={() => onSelectThread!(thread.cid)}
+              className="text-xs font-mono text-primary-500 hover:text-primary-400 whitespace-nowrap"
             >
-              READ MORE
+              OPEN
             </button>
           )}
 

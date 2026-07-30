@@ -30,6 +30,8 @@ Plaza Gossip uses a **terminal/retro-futuristic aesthetic** with these core prin
 - **Binary theming** - Neon (orange/cyan) or Grayscale modes
 - **Clear visual hierarchy** - Size, color, and weight guide importance
 - **Consistent feedback** - Every interactive element has hover, disabled, and loading states
+  (⚠️ this was an aspiration stated as a fact. It was true of the JSX and false of the rendered page
+  until 2026-07-31 — see § Interactive States.)
 
 ---
 
@@ -791,6 +793,18 @@ import { AddressDisplay } from './UserAddress';
 
 ## Interactive States
 
+> ⚠️ **This section was wrong in three specific ways until 2026-07-31. The authoritative version is
+> now `frontend/CLAUDE.md` § *Interaction states: hover, focus, disabled*** — read that first; what
+> follows is kept only for the hover vocabulary.
+>
+> 1. The hover classes below were correct as *intent* and **did not render**. The palette lived in a
+>    plain `:root` block with a hand-written list of matching utilities, so Tailwind generated no
+>    variants: `hover:text-primary-400` (22 uses) produced no CSS at all. Fixed by moving the palette
+>    into `@theme`.
+> 2. The Focus recipe was an accessibility hole, not a convention — see below.
+> 3. The Disabled rationale explicitly blessed "hover states still technically apply". They should
+>    not; a disabled control must not appear to respond.
+
 ### Hover
 
 ```tsx
@@ -799,14 +813,34 @@ hover:border-primary-400    // Border brightens
 hover:text-primary-400      // Text brightens
 ```
 
+⚠️ Put hover in **both** branches of a conditional class string. The usual miss is the
+selected/active branch, which leaves an active control with no hover at all.
+
 ### Focus
+
+⛔ **Do NOT copy the old recipe from this file.** It was:
 
 ```tsx
 focus:outline-none          // Remove default outline
 focus:border-primary-400    // Border indicates focus
 ```
 
+That deletes the only focus indicator the browser gives you and replaces it with a border change —
+which does nothing on a control that has no border, and which did not render at all until the
+`@theme` fix. It is also `:focus`, so it fires on mouse clicks too.
+
+**There is now a global `:focus-visible` ring in `index.css`** covering buttons, links, form
+controls, `summary` and the ARIA widget roles. You get it for free; it survives `focus:outline-none`
+because the rule is unlayered. Do not add a per-component focus style unless you are replacing it
+with something at least as visible.
+
 ### Disabled
+
+⚠️ The rationale at the end of this subsection ("the hover states still technically apply but appear
+muted") is **no longer the rule**. `index.css` adds `filter: grayscale(0.85)` to every disabled
+control so that hovered-and-disabled cannot be mistaken for hovered-and-enabled. Keep using
+`disabled:opacity-70`; it composes with it.
+
 
 Use `opacity-70` instead of completely graying out elements. This allows the button to maintain its color identity while clearly indicating it's disabled:
 

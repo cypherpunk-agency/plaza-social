@@ -16,8 +16,17 @@ export function reportError(context: string, error: unknown) {
 
   toast.error(
     (t) => (
-      <span
-        className="block cursor-pointer font-mono"
+      // A real <button>, not a <span onClick>. The whole toast is one affordance, so it needs to be
+      // one focusable, Enter-activatable control — a span is unreachable by keyboard and announces
+      // as static text, which for "tap to copy details" means the detail is unreachable to exactly
+      // the people who cannot open a console either.
+      //
+      // `hover:text-primary-300`: the toast sets `color: var(--color-primary-500)` as an INLINE
+      // style on its own container, which no class could override — but this class lands on a
+      // CHILD, which merely inherits that colour, so brightening it works.
+      <button
+        type="button"
+        className="block w-full text-left cursor-pointer font-mono hover:text-primary-300 transition-colors"
         onClick={async () => {
           const ok = await copyText(formatEntry(entry));
           toast.dismiss(t.id);
@@ -32,7 +41,7 @@ export function reportError(context: string, error: unknown) {
         <span className="mt-1 block text-[11px] underline opacity-70">
           tap to copy details · also in Settings
         </span>
-      </span>
+      </button>
     ),
     { duration: 8000 },
   );
