@@ -74,8 +74,20 @@ reverts rather than anything legible. Migrate them the way `useForumThread`, `us
 `useReplies` were:
 heads from `PostRegistry` for a `bytes32` registry id, then `walkChain` over the Bulletin chain. Note
 that **creating a channel is no longer deploying anything** — an open room is `keccak256(name)`, a
-moderated one is `claimRegistry(salt, policy)` — so "+ New Channel" currently offers an impossible
-action.
+moderated one is `claimRegistry(salt, policy)`.
+
+⛔ **The chat UI is UNREACHABLE, and the files are still here.** The Channels nav, the channels view,
+and everything rendered only for it were removed from `Sidebar.tsx` and `App.tsx`. But no file was
+deleted: `useChannel`, `useChannelRegistry`, `ChatFeed`, `MessageInput`, `ChannelHeader`,
+`ChannelModerationModal`, `UserListPanel` and `CreateChannelModal` are all on disk with **zero
+importers**, waiting for the migration. "The contract is deleted" and "the UI still calls it" are
+different facts; both are true of different halves of this code.
+
+⚠️ **`ViewMode` no longer has a `'channels'` member, and that is the enforcement.** Deleting the
+render branches alone would have compiled fine and left a user with a persisted
+`viewMode: 'channels'` staring at a blank screen. Narrowing the union is what makes the removal safe;
+the branch deletions are cleanup. A stale `localStorage` value and a `?channel=0x…` link both fall
+back to the forum (verified).
 
 ⭐ **The tell for this whole class of bug:** a call naming a function the target does not have. It has
 appeared **four** times, in four disguises, and every time it was an un-migrated hook rather than a
@@ -198,9 +210,9 @@ instead. It must never flash during `isInitializing`, when `canWrite` is briefly
 | Component | Purpose |
 |-----------|---------|
 | `App.tsx` | Main component, wallet orchestration, view routing |
-| `Sidebar.tsx` | Channel/Following navigation |
-| `ChatFeed.tsx` | Message display |
-| `MessageInput.tsx` | Message composition |
+| `Sidebar.tsx` | Forum/Following navigation. The Channels section is **gone** |
+| `ChatFeed.tsx` | Message display — ⛔ parked, zero importers |
+| `MessageInput.tsx` | Message composition — ⛔ parked, zero importers |
 | `UserProfileModal.tsx` | Inline profile overlay |
 | `ProfileView.tsx` | Full profile view (from Following) |
 | `UserAddress/UserLink` | Clickable user profile opener (hover: tooltip, click: profile) |

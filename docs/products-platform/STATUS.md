@@ -60,11 +60,24 @@ Bulletin authorization error. Cost an hour. See gotchas.
   list; see above.
 - **Channels/chat are un-migrated** — `useChannelRegistry` and `useChannel` still call deleted
   contracts and produce `require(false)` reverts.
+  **[V] They are no longer reachable from the UI (2026-07-30).** The whole Channels surface was
+  unwired: the sidebar section, the chat view (`ChannelHeader`/`ChatFeed`/`MessageInput`), the
+  participant panel, the moderation modal, and "+ New Channel". `ViewMode` no longer has a
+  `'channels'` member, so nothing can route there — verified in the fake backend that a persisted
+  `viewMode: 'channels'` and a `?channel=0x…` deep link both land on the forum, with the stale param
+  dropped from the address bar. **No files were deleted**: `useChannel`, `useChannelRegistry`,
+  `ChatFeed`, `MessageInput`, `ChannelHeader`, `ChannelModerationModal`, `UserListPanel` and
+  `CreateChannelModal` all remain on disk, unreferenced, as the starting point for the migration.
 - **Editing is not wired.** A Bulletin object cannot change, so an edit publishes a replacement — and
   what that should do to the existing replies and vote tally is an undecided product question, not a
   missing function.
-- **"+ New Channel" offers an impossible action** — creating a room is no longer a deployment. An open
-  room is `keccak256(name)`; a moderated one is `PostRegistry.claimRegistry(salt, policy)`.
+- ~~**"+ New Channel" offers an impossible action**~~ **[V] Removed 2026-07-30, along with the rest of
+  the Channels UI.** It called `deployUnlistedChannel` on the deleted `ChannelRegistry`, but the
+  deeper problem was conceptual: creating a room is not a deployment. An open room is
+  `keccak256(name)`; a moderated one is `PostRegistry.claimRegistry(salt, policy)`. There is nothing
+  per-room to deploy, so there was no version of that button that could have worked. **[?] What
+  replaces it is undecided** — joining a room by name needs no transaction at all, so the affordance
+  may not be a "create" button in any form.
 - **Owner-only calls still on the delegate path** — `setDisplayName`, `setBio`,
   `transferProfileOwnership`, `authorizeDelegate`. They will hit the same unfunded-delegate failure
   `createProfile` did (`code 1012`); move each to `writeContract`.
@@ -81,8 +94,11 @@ Bulletin authorization error. Cost an hour. See gotchas.
    `setHeadFor(author, …)` and nothing else changes.
 3. **Migrate `useChannelRegistry` / `useChannel`** the way `useForumThread`, `useUserPosts` and
    `useReplies` were: heads from `PostRegistry` for a `bytes32` registry id, then `walkChain`.
-   Replace "+ New Channel" with claiming a registry id. A room id is `openRegistryId("room:<name>")`
-   from `frontend/src/lib/registry.ts` — do not compute one anywhere else.
+   A room id is `openRegistryId("room:<name>")` from `frontend/src/lib/registry.ts` — do not compute
+   one anywhere else. **This is now a re-wiring job, not a repair**: the hooks and components are
+   intact but no longer imported anywhere, so restoring chat means migrating them and putting the
+   nav entry back in `Sidebar.tsx` plus a `'channels'` member back on `ViewMode`. Note there is no
+   "create a room" step to restore — an open room needs no transaction.
    ⭐ **Publish one reply from a phone** while you are in there: the reply write path is wired and
    fake-tested but has never touched the chain, so it is the last **[I]** in the write column.
 4. **Adopt the app-side personhood check** — `PeopleLite.LitePeople[account]` on the Individuality

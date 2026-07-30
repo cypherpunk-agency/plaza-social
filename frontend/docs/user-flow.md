@@ -83,10 +83,13 @@ on-chain index any more, only CIDs, so a position shifts when someone else posts
 
 ## Not migrated — do not describe these as working
 
-- **Chat / channels.** `useChannelRegistry` and `useChannel` call deleted contracts; the sidebar shows
-  "No channels" because there is no `ChannelRegistry` to list. **"+ New Channel" offers an impossible
-  action** — creating a room is not a deployment any more: an open room is `keccak256(name)`, a
-  moderated one is `PostRegistry.claimRegistry(salt, policy)`.
+- **Chat / channels — REMOVED FROM THE UI (2026-07-30), code parked.** There is no Channels section,
+  no channels view, and no "+ New Channel". `ViewMode` has no `'channels'` member, so a stale
+  `localStorage` value or a `?channel=0x…` link falls back to the forum instead of a blank screen.
+  The eight modules (`useChannel`, `useChannelRegistry`, `ChatFeed`, `MessageInput`, `ChannelHeader`,
+  `ChannelModerationModal`, `UserListPanel`, `CreateChannelModal`) are still on disk with zero
+  importers, waiting for the migration. Note that creating a room is not a deployment any more: an
+  open room is `keccak256(name)`, a moderated one is `PostRegistry.claimRegistry(salt, policy)`.
 - **Replies, user posts, voting.** Same shape — old per-instance ABIs against deleted contracts, or
   (for `Voting`) simply not repointed at the deployed address yet.
 

@@ -302,18 +302,6 @@ function App() {
     }
   }, [userRegistry.getProfile]);
 
-  // Current channel - only load when viewing channels
-  const channel = useChannel({
-    channelAddress: selectedChannel,
-    provider: walletConfig.activeProvider,
-    appWallet: walletConfig.signer,
-    getDisplayName,
-    enabled: viewMode === 'channels' && !!selectedChannel,
-  });
-
-  // Derive current channel name for page title (from loaded channel info)
-  const currentChannelName = channel.channelInfo?.name || null;
-
   // Update URL and page title when navigation state changes
   useEffect(() => {
     const url = new URL(window.location.href);
@@ -325,13 +313,9 @@ function App() {
       url.searchParams.delete('registry');
     }
 
-    // Set channel, profile, or thread param based on view mode
-    if (viewMode === 'channels' && selectedChannel) {
-      url.searchParams.set('channel', selectedChannel);
-      url.searchParams.delete('profile');
-      url.searchParams.delete('post');
-      url.searchParams.delete('thread');
-    } else if (viewMode === 'profile' && selectedProfile) {
+    // Set profile or thread param based on view mode. Every branch deletes `channel`, which is how
+    // a stale chat deep link leaves the address bar on the first render after arrival.
+    if (viewMode === 'profile' && selectedProfile) {
       url.searchParams.set('profile', selectedProfile);
       if (selectedPost !== null) {
         url.searchParams.set('post', String(selectedPost));
@@ -365,10 +349,6 @@ function App() {
       title = currentProfileName
         ? `${currentProfileName} - Profile - Plaza`
         : 'Profile - Plaza';
-    } else if (viewMode === 'channels') {
-      title = currentChannelName
-        ? `${currentChannelName} - Chat - Plaza`
-        : 'Chat - Plaza';
     } else if (viewMode === 'forum') {
       title = 'Forum - Plaza';
     }
@@ -382,14 +362,11 @@ function App() {
       window.history.pushState({}, title, newUrl);
       lastUrlRef.current = newUrl;
     }
-  }, [viewMode, selectedChannel, selectedProfile, selectedPost, selectedThread, currentThreadTitle, currentProfileName, currentChannelName, showRegistryInUrl, registryAddress]);
+  }, [viewMode, selectedProfile, selectedPost, selectedThread, currentThreadTitle, currentProfileName, showRegistryInUrl, registryAddress]);
 
   // Modals
-  const [showModerationModal, setShowModerationModal] = useState(false);
-  const [canManageChannel, setCanManageChannel] = useState(false);
   const [showHostNotice, setShowHostNotice] = useState(false);
   const [tipTargetAddress, setTipTargetAddress] = useState<string | null>(null);
-  const [isSending, setIsSending] = useState(false);
 
   // Handler to navigate to profile (click navigates, tooltip shows on hover)
   const openProfile = useCallback((address: string | null) => {
@@ -401,45 +378,13 @@ function App() {
   }, []);
 
   /**
-   * Gate a write action on `canWrite` and explain the refusal if it fails.
-   *
-   * ⚠️ IT CHECKS `canWrite`, NEVER `canPushLive`. An account with a Bulletin authorization and no
-   * personhood proof has `canWrite && !canPushLive` — the common case — and must be able to post. The
-   * only thing it loses is instant propagation.
+   * ⛔ `requireWallet`, `handleSendMessage`, `canPost` and the channel-management permission check all lived
+   * here and went out with the chat view. The rule they encoded has NOT gone away and applies to
+   * every remaining composer: gate on `canWrite`, NEVER on `canPushLive`. An account with a Bulletin
+   * authorization and no personhood proof has `canWrite && !canPushLive` — the common case — and must
+   * be able to post; the only thing it loses is instant propagation. `ForumView` and `ProfileView`
+   * take `disabled={!walletConfig.canWrite}` for exactly this reason.
    */
-  const requireWallet = useCallback((): boolean => {
-    if (!host.canWrite) {
-      setShowHostNotice(true);
-      return false;
-    }
-    return true;
-  }, [host.canWrite]);
-
-  // Check if user can manage the current channel
-  useEffect(() => {
-    const checkManagePermission = async () => {
-      if (!channel.channelInfo || !walletConfig.activeAddress) {
-        setCanManageChannel(false);
-        return;
-      }
-
-      // Owner can always manage
-      if (channel.channelInfo.owner.toLowerCase() === walletConfig.activeAddress.toLowerCase()) {
-        setCanManageChannel(true);
-        return;
-      }
-
-      // Check if user is an admin
-      try {
-        const admin = await channel.isAdmin(walletConfig.activeAddress);
-        setCanManageChannel(admin);
-      } catch {
-        setCanManageChannel(false);
-      }
-    };
-
-    checkManagePermission();
-  }, [channel.channelInfo, walletConfig.activeAddress, channel.isAdmin]);
 
   // Note: the host notice is never forced on load. Users browse freely; it only appears when they
   // attempt a write and cannot.
@@ -470,45 +415,6 @@ function App() {
   // A missing bio is not a problem. The banner nagged permanently over a perfectly good profile that
   // simply had no bio, and it could only be silenced by writing one — i.e. the app demanded content
   // the user had chosen not to provide. If a profile has a display name, it is set up.
-
-  // Send message handler with auto-profile creation
-  const handleSendMessage = async (content: string): Promise<boolean> => {
-    if (!content.trim()) return false;
-    if (!requireWallet()) return false;
-
-    setIsSending(true);
-    try {
-      // Auto-create profile if user doesn't have one
-      if (!userRegistry.profile?.exists) {
-        const toastId = toast.loading('Creating profile...');
-        try {
-          await userRegistry.createDefaultProfile();
-          toast.success('Profile created!', { id: toastId });
-        } catch (err) {
-          toast.error('Failed to create profile', { id: toastId });
-          throw err;
-        }
-      }
-
-      await channel.postMessage(content);
-      return true;
-    } catch (err) {
-      console.error('Failed to send message:', err);
-      return false;
-    } finally {
-      setIsSending(false);
-    }
-  };
-
-  /**
-   * ⚠️ `canWrite`, NOT `canPushLive`, AND NOT `delegation.active`.
-   *
-   * The composer is enabled whenever the session can write at all. It is deliberately NOT gated on
-   * live-update capability (see `lib/host/types.ts`) and deliberately NOT gated on having a delegate:
-   * with no delegate a post costs an extra signing prompt, which is an inconvenience, not an
-   * inability. Gating on either would disable posting for the majority of real accounts.
-   */
-  const canPost = host.canWrite;
 
   return (
     /**
@@ -593,16 +499,9 @@ function App() {
 
       {/* Main Content */}
       <main className="flex-1 flex overflow-hidden">
-        {/* Sidebar with channels and following */}
+        {/* Sidebar: profile, forum and following. There is no channels section — see Sidebar.tsx. */}
         {registryAddress && (
           <Sidebar
-            channels={channelRegistry.channels}
-            selectedChannel={selectedChannel}
-            onSelectChannel={(addr) => {
-              setSelectedChannel(addr);
-              setViewMode('channels');
-            }}
-            provider={walletConfig.activeProvider}
             isConnected={!!walletConfig.activeAddress}
             viewMode={viewMode}
             onViewModeChange={setViewMode}
@@ -627,7 +526,7 @@ function App() {
               ?registry=0x… to URL", which asked the user to supply a ChannelRegistry — a contract
               that no longer exists. Addresses now come from deployments.json, so if we get here it is
               our configuration that is broken, not the user's URL, and the message should say so. */}
-          {!registryAddress && !directChannelAddress && (
+          {!registryAddress && (
             <div className="border-b-2 border-yellow-500 bg-yellow-950 bg-opacity-20 p-4">
               <div className="flex items-center font-mono">
                 <span className="text-yellow-500 mr-3 text-xl">!</span>
@@ -692,51 +591,19 @@ function App() {
               normal state of a visitor who is reading, and putting it in a red banner would tell every
               anonymous reader that something is broken. It belongs in the host notice and the settings
               screen, where it reads as an explanation. */}
-          {(channel.error || userRegistry.error) && (
+          {userRegistry.error && (
             <div className="border-b-2 border-red-500 bg-red-950 bg-opacity-20 p-4">
               <div className="flex items-center font-mono">
                 <span className="text-red-500 mr-3">X</span>
-                <p className="text-red-400 text-sm">{channel.error || userRegistry.error}</p>
+                <p className="text-red-400 text-sm">{userRegistry.error}</p>
               </div>
             </div>
           )}
 
-          {/* Conditional content based on view mode */}
-          {viewMode === 'channels' ? (
-            <>
-              {/* Channel header */}
-              <ChannelHeader
-                channelInfo={channel.channelInfo}
-                isLoading={channel.isLoading && !channel.channelInfo}
-                canManage={canManageChannel}
-                onManageClick={() => setShowModerationModal(true)}
-              />
-
-              {/* Chat feed */}
-              <ChatFeed
-                messages={channel.messages}
-                isLoading={channel.isLoading && channel.messages.length === 0}
-                currentAddress={walletConfig.activeAddress}
-                currentUserDisplayName={userRegistry.profile?.displayName}
-                onSelectUser={openProfile}
-                getProfile={userRegistry.getProfile}
-                provider={walletConfig.activeProvider}
-                onFollow={followRegistry.follow}
-                onUnfollow={followRegistry.unfollow}
-                isFollowing={followRegistry.isFollowingSync}
-                onTip={setTipTargetAddress}
-                canTip={host.canWrite}
-              />
-
-              {/* Message input */}
-              <MessageInput
-                onSend={handleSendMessage}
-                disabled={!canPost}
-                isSending={isSending}
-                onExplainDisabled={() => setShowHostNotice(true)}
-              />
-            </>
-          ) : viewMode === 'profile' ? (
+          {/* Conditional content based on view mode. The `'channels'` branch — ChannelHeader,
+              ChatFeed, MessageInput — was removed with the chat view; `ViewMode` no longer has that
+              member, so nothing can route here. */}
+          {viewMode === 'profile' ? (
             // Profile view
             <ProfileView
               userAddress={selectedProfile}
@@ -811,22 +678,8 @@ function App() {
           ) : null}
           </div>
 
-          {/* User list panel (only for channels) */}
-          {viewMode === 'channels' && selectedChannel && (
-            <UserListPanel
-              messages={channel.messages}
-              currentAddress={walletConfig.activeAddress}
-              currentUserDisplayName={userRegistry.profile?.displayName}
-              onSelectUser={openProfile}
-              getProfile={userRegistry.getProfile}
-              provider={walletConfig.activeProvider}
-              onFollow={followRegistry.follow}
-              onUnfollow={followRegistry.unfollow}
-              isFollowing={followRegistry.isFollowingSync}
-              onTip={setTipTargetAddress}
-              canTip={host.canWrite}
-            />
-          )}
+          {/* The `UserListPanel` rendered here for the chat view only. It listed the participants of
+              a room, derived from `channel.messages`, so it has nothing to show without chat. */}
         </div>
       </main>
 
@@ -843,18 +696,6 @@ function App() {
         diagnostics={host.diagnostics}
       />
 
-      <ChannelModerationModal
-        isOpen={showModerationModal}
-        onClose={() => setShowModerationModal(false)}
-        channelInfo={channel.channelInfo}
-        currentUserAddress={walletConfig.activeAddress}
-        addAllowedPoster={channel.addAllowedPoster}
-        removeAllowedPoster={channel.removeAllowedPoster}
-        promoteAdmin={channel.promoteAdmin}
-        demoteAdmin={channel.demoteAdmin}
-        transferOwnership={channel.transferOwnership}
-        setPostingMode={channel.setPostingMode}
-      />
 
       {/* Tip Modal (triggered from tooltip) */}
       {tipTargetAddress && (
