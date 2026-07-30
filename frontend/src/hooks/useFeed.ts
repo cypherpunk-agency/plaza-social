@@ -63,10 +63,16 @@ export function useFeed({
 
       return {
         index,
+        // ⛔ EMPTY, because this hook still reads the DELETED `UserPosts` contract — there is no
+        // Bulletin CID in that shape and no post can come back from it anyway. An empty cid means
+        // no vote control renders, which is correct for content that cannot exist. This becomes
+        // `entry.cid` when the feed migrates onto `PostRegistry.headsOf(FEED, following)`.
+        cid: "",
         profileOwner: raw.profileOwner,
         sender: raw.sender,
         content: raw.content,
-        timestamp: Number(raw.timestamp),
+        // `* 1000`: a Solidity seconds timestamp; `UserPost.timestamp` is epoch ms.
+        timestamp: Number(raw.timestamp) * 1000,
         editedAt: raw.editedAt > 0n ? Number(raw.editedAt) : null,
         isDeleted: raw.isDeleted,
         displayName,

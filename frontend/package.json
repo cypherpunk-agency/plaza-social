@@ -9,10 +9,16 @@
     "build:deploy": "node scripts/build-with-redirect.js",
     "lint": "eslint .",
     "preview": "vite preview",
-    "preview:dist": "npx serve dist"
+    "preview:dist": "npx serve dist",
+    "test:host": "playwright test --config playwright.config.ts",
+    "test:host:probe": "vite --config tests/fixture-app/vite.config.ts",
+    "test:lib": "node --experimental-strip-types --test src/lib/*.test.ts"
   },
   "dependencies": {
-    "@noble/secp256k1": "^3.0.0",
+    "@parity/product-sdk": "^0.19.1",
+    "@parity/product-sdk-cloud-storage": "^0.8.1",
+    "@parity/product-sdk-host": "^0.14.1",
+    "@parity/product-sdk-statement-store": "^0.6.2",
     "ethers": "^6.16.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
@@ -20,6 +26,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@parity/host-api-test-sdk": "^0.11.0",
+    "@playwright/test": "^1.62.0",
+    "@polkadot-api/substrate-bindings": "^0.12.0",
     "@tailwindcss/postcss": "^4.1.18",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.5",

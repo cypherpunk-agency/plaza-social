@@ -1,140 +1,138 @@
-import { useState, useCallback, useEffect, useRef } from "react";
-import { ethers } from "ethers";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { Reply } from "../types/contracts";
-import RepliesABI from "../contracts/Replies.json";
-import { createReadContract, createWriteContract, type Provider, type Signer } from "../utils/contracts";
+import PostRegistryABI from "../contracts/PostRegistry.json";
+import { createReadContract, type Provider, type Signer } from "../utils/contracts";
+import { createBlobCache, browserPersistence } from "../lib/blob-cache";
+import { walkChain } from "../lib/walk";
+import { encodePost, validatePostDraft } from "../lib/wire";
+import { threadRegistryId } from "../lib/registry";
+import { NO_WRITE_SESSION } from "../lib/publish";
+import { usePublisher } from "./usePublisher";
+import { gatewayFetcher } from "../lib/gateways";
 
-// Entity types for the shared Replies contract
-export const EntityType = {
-  UserPost: 0,
-  FeedItem: 1,
-  ForumThread: 2,
-  Reply: 3,
-} as const;
+/**
+ * Replies, on the migrated content model.
+ *
+ * ⚠️ `Replies.sol` IS DELETED. This hook used to call
+ * `addReply(parentContract, entityType, entityIndex, content, parentReplyIndex)` and a family of
+ * `getTopLevelReplyCount` / `getChildReplies` getters on a shared per-entity-type contract. Aliased
+ * onto `PostRegistry` during the migration those calls hit a contract with no such functions, and
+ * surfaced on every expanded post as:
+ *
+ *   execution reverted (no data present; likely require(false) occurred …
+ *   data="0x790aac2f000000000000000000000000f6dac4bc…"   ← Replies.addReply(...)
+ *
+ * That is the FOURTH appearance of one bug — after `getThreadCount`, `getUserPostCount` and
+ * `Voting.getEntityId`. A selector naming a function the target does not have is always an
+ * un-migrated hook, never a broken contract. The frontend CLAUDE.md keeps the table.
+ *
+ * THE MODEL NOW — a reply is a Post whose registry IS the thread (architecture §2).
+ *
+ *   registry = threadRegistryId(parentCid) = keccak256("thread:" + parentCid)   ← lib/registry.ts
+ *   read     = PostRegistry.getHeadsPaged(registry, 0, N)  +  walkChain
+ *   write    = publisher.publish({ registry, group: <the board>, build: encodePost })
+ *
+ * Several heads is NORMAL, not an error: there is one head per (registry, writer), so a thread with
+ * five repliers has five valid heads and `walkChain` merges the branches by claimed timestamp.
+ *
+ * ⛔ NESTING IS GONE, AND IT IS NOT COMING BACK BY ACCIDENT. The wire format gives a `post` exactly
+ * one link — `prev`, its position in a chain — and no parent pointer. `parentReplyIndex` and `depth`
+ * are therefore not representable, and inventing a field to carry them would fork the format for one
+ * feature. Replies are a single flat level; the reply-to-a-reply controls were removed rather than
+ * left to fail. If threading is wanted later, the honest shape is a nested registry
+ * (`thread:<replyCid>`), which this derivation already supports for free.
+ *
+ * ⚠️ Timestamps here are epoch MILLISECONDS, like every other migrated surface. `HeadRef.movedAt` is
+ * SECONDS and is converted at this boundary; `formatTimestamp` must not multiply again.
+ */
 
-export type EntityType = (typeof EntityType)[keyof typeof EntityType];
+/** Matches PostRegistry's `HeadRef` tuple. ⚠️ `movedAt`, never `at` — see usePublisher. */
+interface OnChainHead {
+  cid: string;
+  prev: string;
+  storeBlock: bigint;
+  movedAt: bigint;
+  by: string;
+  allowed: boolean;
+}
+
+/** How many reply chains and how many replies we pull in one pass. */
+const PAGE = 50;
 
 interface UseRepliesProps {
+  /** The PostRegistry address. Named for the old contract so callers need no change. */
   repliesAddress: string | null;
-  parentContract: string | null; // e.g., UserPosts address
-  entityType: EntityType;
-  entityIndex: number | null; // Post index
+  /**
+   * The CID of the thing being replied to — a thread ANNOUNCEMENT's cid, or a profile post's cid.
+   * Null while it is unknown, which is a real state: a head whose body has not resolved has no id.
+   */
+  parentCid: string | null;
+  /**
+   * The board or feed this conversation belongs to, used as `HeadSet.group`.
+   *
+   * That is exactly what the group parameter is for, per PostRegistry's docstring: one board
+   * subscription then hears the board's own chain AND every reply on it. Omitting it routes the
+   * event to the reply registry itself, which is correct but noisier to subscribe to.
+   */
+  group?: string;
   provider: Provider | null;
+  /** ⛔ Unused for writes. Kept only because callers still thread it through for voting. */
   signer?: Signer | null;
   getDisplayName?: (address: string) => Promise<string>;
   enabled?: boolean;
 }
 
 interface UseRepliesReturn {
-  // State
   replies: Reply[];
+  /** ⚠️ Replies LOADED, not replies that exist. A page is capped and history can expire. */
   replyCount: number;
   isLoading: boolean;
   error: string | null;
+  /** False when this session cannot write. Gate the composer on THIS, never on `signer`. */
+  canReply: boolean;
+  /** The `bytes32` these replies live in, or null when the parent has no CID. Useful for debugging. */
+  registryId: string | null;
 
-  // Actions
-  addReply: (content: string, parentReplyIndex?: number) => Promise<number>;
+  addReply: (content: string) => Promise<void>;
   editReply: (replyIndex: number, newContent: string) => Promise<void>;
   deleteReply: (replyIndex: number) => Promise<void>;
   refresh: () => Promise<void>;
-
-  // Helpers
-  getParentId: () => Promise<string | null>;
-  getChildReplies: (replyIndex: number) => Promise<Reply[]>;
-}
-
-// Raw reply from contract
-interface RawReply {
-  parentId: string;
-  profileOwner: string;
-  sender: string;
-  content: string;
-  timestamp: bigint;
-  editedAt: bigint;
-  isDeleted: boolean;
-  parentReplyIndex: bigint;
-  depth: bigint;
 }
 
 export function useReplies({
   repliesAddress,
-  parentContract,
-  entityType,
-  entityIndex,
+  parentCid,
+  group,
   provider,
-  signer,
   getDisplayName,
   enabled = true,
 }: UseRepliesProps): UseRepliesReturn {
+  // `null` when this session cannot write. Not an error — see `usePublisher`.
+  const publisher = usePublisher();
   const [replies, setReplies] = useState<Reply[]>([]);
-  const [replyCount, setReplyCount] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const pollIntervalRef = useRef<number | null>(null);
 
-  const getReadContract = useCallback(() => {
-    return createReadContract(repliesAddress, RepliesABI.abi, provider);
-  }, [repliesAddress, provider]);
+  /** Derived in exactly one place — `lib/registry.ts`. Null parent ⇒ null id ⇒ no reads, no writes. */
+  const registryId = useMemo(() => threadRegistryId(parentCid), [parentCid]);
 
-  const getWriteContract = useCallback(async () => {
-    return createWriteContract(repliesAddress, RepliesABI.abi, provider, signer ?? null);
-  }, [repliesAddress, provider, signer]);
+  // Bodies are immutable and content-addressed, so a cache hit can never be stale — only absent.
+  const cache = useMemo(
+    () => createBlobCache({ fetcher: gatewayFetcher(), persist: browserPersistence() }),
+    []
+  );
 
-  const computeParentId = useCallback(async (): Promise<string | null> => {
-    if (!parentContract || entityIndex === null) return null;
-
-    const contract = getReadContract();
-    if (!contract) {
-      // Fallback: compute client-side
-      return ethers.solidityPackedKeccak256(
-        ["address", "uint8", "uint256"],
-        [parentContract, entityType, entityIndex]
-      );
-    }
-
-    try {
-      return await contract.getParentId(parentContract, entityType, entityIndex);
-    } catch {
-      return null;
-    }
-  }, [getReadContract, parentContract, entityType, entityIndex]);
-
-  const formatReply = useCallback(
-    async (raw: RawReply, index: number): Promise<Reply> => {
-      let displayName: string | undefined;
-      if (getDisplayName) {
-        try {
-          displayName = await getDisplayName(raw.profileOwner);
-        } catch {
-          displayName = undefined;
-        }
-      }
-
-      return {
-        index,
-        parentId: raw.parentId,
-        profileOwner: raw.profileOwner,
-        sender: raw.sender,
-        content: raw.content,
-        timestamp: Number(raw.timestamp),
-        editedAt: raw.editedAt > 0n ? Number(raw.editedAt) : null,
-        isDeleted: raw.isDeleted,
-        parentReplyIndex: Number(raw.parentReplyIndex),
-        depth: Number(raw.depth),
-        displayName,
-      };
-    },
-    [getDisplayName]
+  const getReadContract = useCallback(
+    () => createReadContract(repliesAddress, PostRegistryABI.abi, provider),
+    [repliesAddress, provider]
   );
 
   const loadReplies = useCallback(async () => {
     const contract = getReadContract();
-    const parentId = await computeParentId();
-
-    if (!contract || !parentId) {
+    if (!contract || !registryId) {
       setReplies([]);
-      setReplyCount(0);
       return;
     }
 
@@ -142,22 +140,75 @@ export function useReplies({
       setIsLoading(true);
       setError(null);
 
-      // Get top-level reply count
-      const count = await contract.getTopLevelReplyCount(parentId);
-      setReplyCount(Number(count));
+      // One head per replier, sorted newest-first by the contract. Cost grows with the number of
+      // people who replied, not with the number of replies.
+      const [refs] = await contract.getHeadsPaged(registryId, 0, PAGE);
 
-      if (count === 0n) {
+      const heads = (refs as OnChainHead[])
+        // A writer banned after the fact keeps their row; moderation is a write gate plus a hide
+        // flag, never a delete, because freeing storage would refund the wrong person.
+        .filter((ref) => ref.allowed && ref.cid)
+        .map((ref) => ({
+          cid: ref.cid,
+          prev: ref.prev || null,
+          // ⚠️ SECONDS on chain, milliseconds everywhere above this line.
+          at: ref.movedAt > 0n ? Number(ref.movedAt) * 1000 : null,
+          by: ref.by,
+          block: ref.storeBlock > 0n ? Number(ref.storeBlock) : null,
+          index: null,
+        }));
+
+      if (heads.length === 0) {
         setReplies([]);
         return;
       }
 
-      // Load latest 50 top-level replies
-      const limit = count > 50n ? 50n : count;
-      const [rawReplies, indices] = await contract.getLatestTopLevelReplies(parentId, limit);
+      const page = await walkChain({ heads, cache, limit: PAGE });
 
-      // Format replies with display names
-      const formatted: Reply[] = await Promise.all(
-        rawReplies.map((raw: RawReply, i: number) => formatReply(raw, Number(indices[i])))
+      // `walkChain` emits newest-first across the merged branches. A conversation reads oldest-first,
+      // so reverse HERE rather than asking the walk for a different order — the merge has to be
+      // newest-first to be a k-way merge at all.
+      const ordered = [...page.entries].reverse();
+
+      const formatted = await Promise.all(
+        ordered.map(async (entry, index): Promise<Reply> => {
+          const decoded = entry.object;
+          // `decoded.author` is what the object CLAIMS; `entry.author` is the index's attribution,
+          // which is the only one that is actually authenticated. Prefer the object, fall back.
+          const author = decoded?.author || entry.author || "";
+
+          let displayName: string | undefined;
+          if (getDisplayName && author) {
+            try {
+              displayName = await getDisplayName(author);
+            } catch {
+              displayName = undefined;
+            }
+          }
+
+          // A hole: the body expired from Bulletin, or no gateway would serve it. The pointer is
+          // still on chain, so the reply is real — it is the CONTENT that is gone, and calling that
+          // "deleted" would be wrong. Retention expiry is this design's only deletion mechanism.
+          const content = !decoded
+            ? "(this reply's body has expired from Bulletin storage)"
+            : decoded.kind === "post" || decoded.kind === "msg"
+              ? decoded.body
+              : decoded.kind === "thread"
+                ? decoded.excerpt
+                : "";
+
+          return {
+            index,
+            cid: entry.cid,
+            author,
+            sender: entry.author || author,
+            content,
+            timestamp: decoded?.at ?? entry.at ?? 0,
+            editedAt: null,
+            isDeleted: false,
+            displayName,
+          };
+        })
       );
 
       setReplies(formatted);
@@ -167,149 +218,103 @@ export function useReplies({
     } finally {
       setIsLoading(false);
     }
-  }, [getReadContract, computeParentId, formatReply]);
-
-  const fetchChildReplies = useCallback(
-    async (replyIndex: number): Promise<Reply[]> => {
-      const contract = getReadContract();
-      if (!contract) return [];
-
-      try {
-        const count = await contract.getChildReplyCount(replyIndex);
-        if (count === 0n) return [];
-
-        const [rawReplies, indices] = await contract.getChildReplies(replyIndex, 0, count);
-
-        return await Promise.all(
-          rawReplies.map((raw: RawReply, i: number) => formatReply(raw, Number(indices[i])))
-        );
-      } catch (err) {
-        console.error("Failed to load child replies:", err);
-        return [];
-      }
-    },
-    [getReadContract, formatReply]
-  );
+  }, [getReadContract, registryId, cache, getDisplayName]);
 
   const addReply = useCallback(
-    async (content: string, parentReplyIndex: number = 0): Promise<number> => {
-      if (!enabled) throw new Error("Wallet not ready");
-      if (!content.trim()) throw new Error("Reply content cannot be empty");
-      if (!parentContract || entityIndex === null) throw new Error("Parent entity not set");
-
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      try {
-        // parentReplyIndex: 0 = top-level, 1-indexed for nested
-        const tx = await contract.addReply(
-          parentContract,
-          entityType,
-          entityIndex,
-          content,
-          parentReplyIndex
+    async (content: string): Promise<void> => {
+      if (!enabled) throw new Error("Replying is turned off in this view.");
+      if (!publisher) throw new Error(NO_WRITE_SESSION);
+      if (!registryId) {
+        throw new Error(
+          "This post has no CID yet, so there is no reply chain to write into. Wait for it to load."
         );
-        const receipt = await tx.wait();
+      }
 
-        // Extract reply index from event
-        const event = receipt.logs.find((log: { topics: readonly string[]; data: string }) => {
-          try {
-            const parsed = contract.interface.parseLog(log);
-            return parsed?.name === "ReplyCreated";
-          } catch {
-            return false;
-          }
-        });
+      // Validated BEFORE anything is stored, so an over-long reply is refused at the field that can
+      // fix it rather than after a Bulletin write has already been paid for.
+      const draft = validatePostDraft({ body: content });
 
-        let replyIndex = 0;
-        if (event) {
-          const parsed = contract.interface.parseLog(event);
-          replyIndex = Number(parsed?.args?.replyIndex ?? 0);
-        }
+      // Body to Bulletin, THEN the pointer — `publisher.publish` owns that order and it is
+      // load-bearing. Do not hand-roll it. `group` is the board, so one board subscription hears
+      // this reply too.
+      const { confirmed } = await publisher.publish({
+        registry: registryId,
+        group,
+        cache,
+        label: "reply",
+        build: (link) =>
+          encodePost({
+            ...link,
+            author: publisher.author,
+            body: draft.body,
+            attachments: draft.attachments,
+            // `i` lets a reply count be read off the head object without walking the chain. It is a
+            // LOWER BOUND: two repliers can concurrently produce the same index (architecture §2).
+            index: replies.length,
+            registry: registryId,
+          }),
+      });
 
-        await loadReplies();
-        return replyIndex;
-      } catch (err) {
-        throw err instanceof Error ? err : new Error("Failed to add reply");
+      await loadReplies();
+      if (!confirmed) {
+        // The write went through — the head move returned a transaction hash — but the read RPC had
+        // not caught up. Saying so beats a list that silently has not changed yet.
+        throw new Error(
+          "Your reply was submitted, but it has not shown up in a read yet. It should appear " +
+            "within a minute; replies refresh on their own."
+        );
       }
     },
-    [enabled, getWriteContract, parentContract, entityType, entityIndex, loadReplies]
+    [enabled, publisher, registryId, group, cache, replies.length, loadReplies]
   );
 
-  const editReply = useCallback(
-    async (replyIndex: number, newContent: string): Promise<void> => {
-      if (!enabled) throw new Error("Wallet not ready");
-      if (!newContent.trim()) throw new Error("Reply content cannot be empty");
+  const editReply = useCallback(async (): Promise<void> => {
+    // Bodies are immutable Bulletin objects. An "edit" is a NEW object with a new CID — and so a
+    // new, empty vote tally, deliberately: a tally belongs to the bytes people actually voted on.
+    throw new Error(
+      "Editing is not wired up yet. A Bulletin object cannot be changed, so an edit publishes a " +
+        "replacement — and what that should do to existing votes is not decided."
+    );
+  }, []);
 
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
+  const deleteReply = useCallback(async (): Promise<void> => {
+    throw new Error(
+      "Deleting is not available, and will not work the way it used to: freeing storage refunds " +
+        "whoever freed it, so a moderated delete would hand an admin the author's deposit. Content " +
+        "goes away by stopping renewal instead."
+    );
+  }, []);
 
-      try {
-        const tx = await contract.editReply(replyIndex, newContent);
-        await tx.wait();
-        await loadReplies();
-      } catch (err) {
-        throw err instanceof Error ? err : new Error("Failed to edit reply");
-      }
-    },
-    [enabled, getWriteContract, loadReplies]
-  );
-
-  const deleteReply = useCallback(
-    async (replyIndex: number): Promise<void> => {
-      if (!enabled) throw new Error("Wallet not ready");
-
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      try {
-        const tx = await contract.deleteReply(replyIndex);
-        await tx.wait();
-        await loadReplies();
-      } catch (err) {
-        throw err instanceof Error ? err : new Error("Failed to delete reply");
-      }
-    },
-    [enabled, getWriteContract, loadReplies]
-  );
-
-  // Load replies when parent entity changes
   useEffect(() => {
-    if (repliesAddress && provider && parentContract && entityIndex !== null) {
+    if (repliesAddress && provider && registryId) {
       loadReplies();
     } else {
       setReplies([]);
-      setReplyCount(0);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [repliesAddress, provider, parentContract, entityType, entityIndex, getDisplayName]);
+  }, [repliesAddress, provider, registryId]);
 
-  // Poll for new replies every 30 seconds
+  // Polling, NOT log subscriptions. `eth_getLogs` cannot see events from host-submitted contract
+  // calls — the host submits native `Revive` extrinsics, which emit `Revive.ContractEmitted` in
+  // `System.Events` and nothing in the ETH log index (architecture §8). Do not "modernise" this.
   useEffect(() => {
-    if (!repliesAddress || !provider || !parentContract || entityIndex === null) return;
-
-    pollIntervalRef.current = window.setInterval(() => {
-      loadReplies();
-    }, 30000);
-
+    if (!repliesAddress || !provider || !registryId) return;
+    pollIntervalRef.current = window.setInterval(() => void loadReplies(), 30000);
     return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-      }
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [repliesAddress, provider, parentContract, entityType, entityIndex]);
+  }, [repliesAddress, provider, registryId, loadReplies]);
 
   return {
     replies,
-    replyCount,
+    replyCount: replies.length,
     isLoading,
     error,
+    canReply: enabled && publisher !== null,
+    registryId,
     addReply,
     editReply,
     deleteReply,
     refresh: loadReplies,
-    getParentId: computeParentId,
-    getChildReplies: fetchChildReplies,
   };
 }

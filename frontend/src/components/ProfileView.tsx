@@ -11,10 +11,6 @@ interface ProfileViewProps {
   userAddress: string | null;
   currentUserAddress?: string | null;
   getProfile: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
-  dmRegistryAvailable?: boolean;
-  canSendDM?: boolean;
-  hasSessionPublicKey?: (address: string) => Promise<boolean>;
   // Follow functionality
   isFollowing?: boolean;
   onFollow?: (address: string) => Promise<void>;
@@ -43,8 +39,6 @@ interface ProfileViewProps {
   sessionWallet?: Signer | null;
   sessionWalletAddress?: string | null;
   sessionWalletBalance?: bigint;
-  browserProvider?: Provider | null;
-  browserWalletAddress?: string | null;
   // Tooltip props for nested UserLinks
   isFollowingUser?: (address: string) => boolean;
   onTip?: (address: string) => void;
@@ -60,10 +54,6 @@ export function ProfileView({
   userAddress,
   currentUserAddress,
   getProfile,
-  onStartDM,
-  dmRegistryAvailable = false,
-  canSendDM = false,
-  hasSessionPublicKey,
   isFollowing = false,
   onFollow,
   onUnfollow,
@@ -86,8 +76,6 @@ export function ProfileView({
   sessionWallet,
   sessionWalletAddress,
   sessionWalletBalance,
-  browserProvider,
-  browserWalletAddress,
   // Tooltip props for nested UserLinks
   isFollowingUser,
   onTip,
@@ -119,7 +107,6 @@ export function ProfileView({
   const [profileBalance, setProfileBalance] = useState<bigint>(0n);
 
   // Target user session key state
-  const [targetHasSessionKey, setTargetHasSessionKey] = useState<boolean | null>(null);
 
   const isOwnProfile = userAddress?.toLowerCase() === currentUserAddress?.toLowerCase();
   const canEdit = isOwnProfile && onUpdateDisplayName && onUpdateBio;
@@ -189,21 +176,6 @@ export function ProfileView({
       setProfileBalance(0n);
     }
   }, [userAddress, provider]);
-
-  // Check if target user has session key for encrypted DMs
-  useEffect(() => {
-    if (userAddress && hasSessionPublicKey) {
-      hasSessionPublicKey(userAddress)
-        .then(setTargetHasSessionKey)
-        .catch(() => setTargetHasSessionKey(false));
-    } else {
-      setTargetHasSessionKey(null);
-    }
-  }, [userAddress, hasSessionPublicKey]);
-
-  // Compute DM disabled state and reason
-  const dmDisabled = !canSendDM || !profile?.exists || targetHasSessionKey === false;
-  const dmDisabledReason = dmDisabled ? "Both users need a profile to send DMs" : undefined;
 
   // Start editing
   const handleStartEdit = () => {
@@ -398,35 +370,6 @@ export function ProfileView({
                 </button>
               </>
             )}
-            {!isOwnProfile && dmRegistryAvailable && onStartDM && (
-              <div className="relative group">
-                <button
-                  onClick={() => onStartDM(userAddress)}
-                  disabled={dmDisabled}
-                  className={`px-4 py-1.5 border-2 text-sm font-mono transition-colors ${
-                    !dmDisabled
-                      ? 'bg-accent-900 border-accent-500 text-accent-400 hover:bg-accent-800'
-                      : 'bg-gray-900 border-gray-700 text-gray-500 cursor-not-allowed'
-                  }`}
-                >
-                  SEND DM
-                </button>
-                {dmDisabled && (
-                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 bg-black border border-primary-700 text-primary-500 font-mono text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-10">
-                    {dmDisabledReason}
-                    <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-primary-700" />
-                  </div>
-                )}
-              </div>
-            )}
-            {!isOwnProfile && onTip && (
-              <button
-                onClick={() => setShowTipModal(true)}
-                className="px-4 py-1.5 bg-yellow-900 border-2 border-yellow-500 text-yellow-400 text-sm font-mono hover:bg-yellow-800 transition-colors"
-              >
-                SEND TIP
-              </button>
-            )}
             {!isOwnProfile && onFollow && onUnfollow && (
               <button
                 onClick={isFollowing ? handleUnfollow : handleFollow}
@@ -579,8 +522,6 @@ export function ProfileView({
                     selectedPostIndex={selectedPostFromUrl}
                     onPostChange={onPostChange}
                     getProfile={getProfile}
-                    onStartDM={onStartDM}
-                    canSendDM={canSendDM}
                     onFollow={onFollow}
                     onUnfollow={onUnfollow}
                     isFollowing={isFollowingUser}
@@ -604,8 +545,6 @@ export function ProfileView({
           sessionWallet={sessionWallet}
           sessionWalletAddress={sessionWalletAddress}
           sessionWalletBalance={sessionWalletBalance}
-          browserProvider={browserProvider}
-          browserWalletAddress={browserWalletAddress}
           onConnectWallet={onConnectWallet}
         />
       )}

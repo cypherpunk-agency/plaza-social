@@ -1,11 +1,13 @@
 import { useState, useMemo, useEffect } from 'react';
 import { useForumThread } from '../hooks/useForumThread';
+import { usePublisher } from '../hooks/usePublisher';
 import { useVoting } from '../hooks/useVoting';
 import { ThreadCard } from './ThreadCard';
 import { ThreadDetailView } from './ThreadDetailView';
 import type { Provider, Signer } from '../utils/contracts';
 import type { Profile } from '../types/contracts';
 import toast from 'react-hot-toast';
+import { reportError } from '../lib/reportError';
 
 interface ForumViewProps {
   forumThreadAddress: string | null;
@@ -24,8 +26,6 @@ interface ForumViewProps {
   onThreadTitleChange?: (title: string | null) => void;
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   isFollowing?: (address: string) => boolean;
@@ -49,8 +49,6 @@ export function ForumView({
   onThreadTitleChange,
   // Tooltip props
   getProfile,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing,
@@ -63,6 +61,14 @@ export function ForumView({
   const [newTags, setNewTags] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState('');
   const [isCreating, setIsCreating] = useState(false);
+
+  /**
+   * ⚠️ SEPARATE FROM `disabled`. `disabled` covers the read-only session and also gates the per-card
+   * controls; this is specifically "can a new thread be published right now". They come apart on a
+   * session that is signed in but whose host-signed write path never came up — offering + NEW THREAD
+   * there is a control that can only fail.
+   */
+  const canCreateThread = !!usePublisher();
 
   // Use URL param if provided, otherwise use internal state
   const selectedThreadIndex = selectedThreadFromUrl ?? null;
@@ -85,7 +91,6 @@ export function ForumView({
   });
 
   const {
-    computeEntityId,
     getVoteTally,
     getUserVote,
     vote,
@@ -123,8 +128,10 @@ export function ForumView({
       setShowCreateForm(false);
       toast.success('Thread created');
     } catch (error) {
-      console.error('Failed to create thread:', error);
-      toast.error('Failed to create thread');
+      // ⚠️ NOT `toast.error('Failed to create thread')`. That sentence was the end of the trail: the
+      // real cause lived only in a console nobody can open on a phone. `reportError` keeps the toast
+      // short, makes it tap-to-copy, and files the detail in Settings → RECENT ERRORS.
+      reportError('create thread', error);
     } finally {
       setIsCreating(false);
     }
@@ -179,13 +186,11 @@ export function ForumView({
     return (
       <ThreadDetailView
         thread={selectedThread}
-        forumThreadAddress={forumThreadAddress}
         repliesAddress={repliesAddress}
         votingAddress={votingAddress}
         provider={provider}
         signer={signer}
         currentAddress={currentAddress}
-        computeEntityId={computeEntityId}
         getVoteTally={getVoteTally}
         getUserVote={getUserVote}
         vote={vote}
@@ -198,8 +203,6 @@ export function ForumView({
         getDisplayName={getDisplayName}
         disabled={disabled}
         getProfile={getProfile}
-        onStartDM={onStartDM}
-        canSendDM={canSendDM}
         onFollow={onFollow}
         onUnfollow={onUnfollow}
         isFollowing={isFollowing}
@@ -225,7 +228,7 @@ export function ForumView({
             >
               {isLoading ? 'LOADING...' : 'REFRESH'}
             </button>
-            {!disabled && !showCreateForm && (
+            {!disabled && canCreateThread && !showCreateForm && (
               <button
                 onClick={() => setShowCreateForm(true)}
                 className="px-3 py-1 text-xs font-mono text-primary-400 border border-primary-500 hover:bg-primary-900"
@@ -379,13 +382,11 @@ export function ForumView({
                 <ThreadCard
                   key={thread.index}
                   thread={thread}
-                  forumThreadAddress={forumThreadAddress}
                   repliesAddress={repliesAddress}
                   votingAddress={votingAddress}
                   provider={provider}
                   signer={signer}
                   currentAddress={currentAddress}
-                  computeEntityId={computeEntityId}
                   getVoteTally={getVoteTally}
                   getUserVote={getUserVote}
                   vote={vote}
@@ -398,8 +399,6 @@ export function ForumView({
                   getDisplayName={getDisplayName}
                   disabled={disabled}
                   getProfile={getProfile}
-                  onStartDM={onStartDM}
-                  canSendDM={canSendDM}
                   onFollow={onFollow}
                   onUnfollow={onUnfollow}
                   isFollowing={isFollowing}

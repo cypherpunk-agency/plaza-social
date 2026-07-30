@@ -13,8 +13,6 @@ interface ChatFeedProps {
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
   provider?: Provider | null;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   isFollowing?: (address: string) => boolean;
@@ -30,8 +28,6 @@ export function ChatFeed({
   onSelectUser,
   getProfile,
   provider,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing,
@@ -89,7 +85,8 @@ export function ChatFeed({
         return (
           <div key={index} className="w-full max-w-4xl font-mono text-sm text-primary-400">
             <span className="text-primary-600 text-xs">
-              [ {formatTimestamp(msg.timestamp)} ]
+              {/* `* 1000`: a Solidity seconds timestamp, from the un-migrated chat path. */}
+              [ {formatTimestamp(msg.timestamp * 1000)} ]
             </span>
             {' '}
             {onSelectUser && (
@@ -100,8 +97,6 @@ export function ChatFeed({
                 isCurrentUser={isCurrentUser}
                 getProfile={getProfile}
                 provider={provider}
-                onStartDM={onStartDM}
-                canSendDM={canSendDM}
                 onFollow={onFollow}
                 onUnfollow={onUnfollow}
                 isFollowing={isFollowing?.(msg.profileOwner)}

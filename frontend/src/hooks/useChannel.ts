@@ -117,7 +117,9 @@ export function useChannel({
             sender: msg.sender,
             content: msg.content,
             timestamp: Number(msg.timestamp),
-            formattedTime: formatTimestamp(Number(msg.timestamp)),
+            // `* 1000` because this is a Solidity `block.timestamp`, in SECONDS, while
+            // `formatTimestamp` takes epoch ms like the rest of the migrated data layer.
+            formattedTime: formatTimestamp(Number(msg.timestamp) * 1000),
             displayName,
           };
         })

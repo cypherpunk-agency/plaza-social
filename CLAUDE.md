@@ -1,76 +1,145 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code working in this repository.
 
-## Project Overview
+## ⚠️ READ THESE FIRST
 
-Plaza is a decentralized social platform on Polkadot Asset Hub featuring on-chain user profiles, chat channels, encrypted DMs, profile posts, and gasless messaging via session wallets (delegate pattern).
+Plaza is mid-migration onto the **Polkadot Products platform**. Much of the older documentation in this
+repo describes the pre-migration app and is wrong. These four files are current and authoritative:
 
-**Live Demo:** https://tomen.github.io/plaza/
+| File | Read it for |
+|---|---|
+| **[`docs/products-platform/STATUS.md`](docs/products-platform/STATUS.md)** | **Start here.** What is live, what is broken, the open decision, next actions. Short. |
+| [`docs/products-platform/gotchas.md`](docs/products-platform/gotchas.md) | Addresses, constants, and ~25 traps that fail *silently*. Check before debugging anything. |
+| [`docs/products-platform/architecture.md`](docs/products-platform/architecture.md) | The design and **why** — content model, where state lives, retention, signing. Every non-obvious choice traces to a section here. |
+| [`docs/products-platform/publishing.md`](docs/products-platform/publishing.md) · [`pgas-deposits-and-renewal.md`](docs/products-platform/pgas-deposits-and-renewal.md) | Deep verified references on the deploy pipeline and on PGAS/deposits/renewal. |
 
-## Quick Start
+Claims in those files are tagged **[V]** verified / **[I]** inference / **[?]** unknown, with method and
+date. **Keep that convention** — a stale `[V]` is worse than a `[?]`, and this project has been bitten by
+exactly that (see gotchas § *Documents that are wrong*).
+
+Related repo: `D:\Code\web3\yolodot` — a separate set of experiments on the same platform. Excellent
+source of working reference code and measurements, but **several of its `[V]` claims are stale**; verify
+before relying on them.
+
+## What Plaza is now
+
+A static bundle published to Bulletin, bound to a `.dot` domain, running **inside the Polkadot host
+container**. Post bodies are immutable Bulletin objects chained backwards by `prev`; the only mutable
+state is a head pointer per (registry, writer) held on chain.
+
+**The host container is the only surface.** There is no MetaMask path and no standalone wallet — both
+were deleted. Anonymous reading still works inside the host.
+
+**Live:** https://plaza-social.dot.li · chainId `420420417` · **all four contracts deployed**
+(addresses in STATUS.md and `contracts/deployments.json`).
+
+**Host-signed contract writes work** — a profile was created on chain from the phone (2026-07-30).
+**The two-signature write is wired** — body → Bulletin, then pointer → `PostRegistry` — in
+`frontend/src/lib/publish.ts`, with threads and profile posts on it. It has unit tests but **has not
+yet published from a phone**, and it rides the same preimage channel that is itself unconfirmed; one
+post attempt settles both. Chat, replies and channels still call deleted contracts. See STATUS.md
+before assuming a feature works.
+
+## Quick start
 
 ### Contracts (`contracts/`)
 ```bash
-npm test              # Run tests
-npm run compile       # Compile contracts
-npm run deploy:polkadot   # Deploy to testnet
+npm test              # 136 tests, plain solc on the in-process EVM
+npm run build:cdm     # PolkaVM build via resolc (this is what cdm deploys)
+npm run deploy:devnet -- --suri "$SEED_PHRASE"   # cdm deploy, -n devnet
+node scripts/verify-deployment.mjs    # what is ACTUALLY on chain
+node scripts/probe-personhood.mjs     # why personhood cannot gate a write
 ```
+⚠️ **`cdm deploy` redeploys everything it finds, at new addresses, as new versions** — there is no
+unchanged-code skip and no subset flag. Do not run it casually; it will orphan live instances along
+with their storage. To deploy a subset, move the rest out of `contracts/` for that one command.
+There are **two Hardhat configs on purpose**: `hardhat.config.cjs` (PolkaVM/resolc, for cdm) and
+`hardhat.evm.config.js` (plain solc, tests only). They must keep separate artifact directories.
+**Never deploy with `hardhat run --network`** — the funded account is sr25519 and cannot sign an
+Ethereum transaction. See gotchas.
 
 ### Frontend (`frontend/`)
 ```bash
-npm run dev           # Start dev server (port 5173)
-npm run build         # Build for production
+npm run dev                    # Vite dev server
+npm run build                  # tsc -b && vite build
+npm run test:lib               # 91 data-layer tests, zero dependencies
+npm run test:host              # Playwright against a real Spektr host
+```
+**The SDK throws outside a host container**, so local development runs against the fake backend:
+`?backend=fake&caps=write` is the scenario that matters most. Use it because the loop is fast — **not**
+because publishing is scarce: the "1/day" rate limit this file used to assert was falsified on
+2026-07-30 (two deploys, 20 minutes apart). See gotchas § Publishing.
+
+## Contract set
+
+```
+UserRegistry     profiles, links, delegation with expiry     0xfD00289e…F055FBD7   v0, PINNED
+PostRegistry     head pointer per (registry, writer)         0xF6daC4BC…3722f8c9
+Voting           tallies keyed by CID                        0x948c71E7…B96A14C0
+FollowRegistry   follow graph, enumerable both ways          0x96A3274F…B9b7032E
 ```
 
-See subdirectory `CLAUDE.md` files for detailed documentation.
+A chat room, a board, a thread and a profile feed are all just `bytes32` registry ids inside the one
+`PostRegistry`. There is nothing per-room or per-thread to deploy.
 
-## Contract Hierarchy
+**The other three pin `UserRegistry` as a compile-time `constant` and take no constructor arguments**,
+because cdm hard-codes empty constructor calldata. That is also the right semantics: resolving the CDM
+name at call time would follow the *latest* version and a redeploy lands on empty storage, silently
+invalidating every delegation. To change the pin, grep `PLAZA-USER-REGISTRY-ADDRESS`, edit all three,
+recompile, redeploy — and keep `deployments.json` in agreement.
 
-```
-UserRegistry (profiles, delegates, session keys)
-     |
-     +-- ChatChannel → ChannelRegistry (public messaging)
-     |
-     +-- DMConversation → DMRegistry (encrypted 1-on-1)
-     |
-     +-- UserPosts (profile posts)
-     |
-     +-- Replies (shared threading system)
-     |
-     +-- Voting (shared voting system)
-```
+**Deleted:** `ChatChannel`, `ChannelRegistry`, `DMConversation`, `DMRegistry`, `OnChainChat`,
+`lib/Moderation`, `posts/{ForumThread,UserPosts,Replies}`.
 
-## Core Concepts
+## Core concepts
 
-### Delegate Wallet System (Gasless UX)
-1. User's main wallet authorizes a session wallet as delegate (one-time tx)
-2. Session wallet is funded with small amount (~0.05 PAS)
-3. Messages are signed by session wallet automatically
-4. UserRegistry resolves delegate addresses to profile owners
+**Storage does not accumulate.** One head per (registry, writer); the deposit is paid once and reused
+forever. The thousandth message in a room costs no new storage. Do not add per-post arrays — that is the
+mistake this design replaced.
 
-### Encrypted DMs (ECDH + AES-GCM)
-1. Each user has a session public key stored on-chain
-2. Messages encrypted using ECDH shared secret + AES-256-GCM
-3. Only participants can decrypt messages
-4. Session keys stored in localStorage
+**Delegation, and its one hard rule.** A locally-derived key signs contract writes prompt-free. Every
+delegated call **names its principal** (`setHeadFor`, `followFor`, `voteFor`) and the callee checks
+`canActAs`. There is no reverse lookup from a delegate to an owner, because a delegate address is only
+unique per owner and guessing would misattribute a post.
 
-### Dual Wallet Modes
-- **Browser Mode:** MetaMask + auto-generated session wallet
-- **Standalone Mode:** In-app wallet for users without MetaMask
+**Two signers per post, both prompt-free.** The body goes to Bulletin signed by the host; the pointer
+goes to the contract signed by the delegate. A delegate cannot write Bulletin at all.
 
-## Detailed Documentation
+**Moderation cannot mean deletion.** Freeing storage refunds whoever freed it, so a moderated delete
+would hand an admin the writer's deposit. Moderation is a write gate plus a hide flag; if content must
+actually go, the mechanism is Bulletin retention — stop renewing it.
 
-| Directory | File | Purpose |
-|-----------|------|---------|
-| `contracts/` | `CLAUDE.md` | Contract details, testing, deployment |
-| `frontend/` | `CLAUDE.md` | Hooks, components, URL persistence |
-| `frontend/docs/` | `architecture.md` | Deep technical docs, patterns |
-| `frontend/docs/` | `user-flow.md` | User flows, troubleshooting |
-| `frontend/docs/` | `STYLE_GUIDE.md` | UI patterns, styling |
+**Encrypted DMs are gone.** The platform offers no 1:1 messaging primitive, so the feature was dropped
+rather than delegated. `sessionPublicKeys` and the whole ECDH layer went with it.
 
-## Important Notes
+**Personhood: the app can check it, Solidity cannot.** Personhood lives on the **Individuality /
+People chain**, not Asset Hub — reach it zero-config as `getChainAPI("devnet").individuality`
+(`wss://people-paseo.rotko.net`). `PeopleLite.LitePeople` is keyed by plain account and has 151
+entries, so **an app-side personhood gate works today and we should use it**. Full personhood is not
+account-resolvable yet, so never require it. What does *not* work is the Asset Hub precompile a
+contract would have to call: it resolves through `AccountToAlias`, empty everywhere, so it returns 0
+for everyone — hence `Voting` gates on `hasProfile`. Run `contracts/scripts/probe-personhood.mjs`
+before re-proposing anything here.
 
-- Contract ABIs must be manually copied to `frontend/src/contracts/` after contract changes
-- `deployments.json` is auto-copied to `frontend/public/` by deploy script
-- Frontend loads contract addresses from `deployments.json`; URL params override
+## Older documentation — treat with suspicion
+
+`frontend/docs/user-flow.md` and `frontend/docs/STYLE_GUIDE.md` still document DM flows and wallet modes
+that no longer exist. `contracts/CLAUDE.md` is **stale in its Commands and Configuration sections**
+(`deploy:polkadot`, chainId 420420422, "stock Hardhat + solc") — its per-contract detail is current.
+`frontend/CLAUDE.md` has been updated for the migration.
+
+## Important notes
+
+- Contract ABIs are hand-copied to `frontend/src/contracts/` after contract changes.
+- `deployments.json` lives in `contracts/` and is copied to `frontend/public/`.
+- Secrets are in `contracts/.env` (gitignored): `SEED_PHRASE`, `DOTNS_MNEMONIC`. Never print or commit.
+- **Always pass `--env devnet` to `pad` and `-n devnet` to `cdm`.** Both default elsewhere, and the wrong
+  default succeeds silently on the wrong network.
+- ⚠️ **The CLIs are `@polkadot-community-foundation/*`, NOT `@parity/*`.** Both scopes publish a `pad`
+  with the same version number; the `@parity` one cannot deploy and fails with a convincing-looking
+  Bulletin authorization error. Deploy command that works:
+
+  ```bash
+  npx @polkadot-community-foundation/polkadot-app-deploy@latest frontend/dist plaza-social.dot --env devnet --mnemonic "$MNEMONIC"
+  ```

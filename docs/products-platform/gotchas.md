@@ -1,0 +1,513 @@
+# Gotchas, constants and hard-won facts
+
+> ## How to not waste a day here
+>
+> Every expensive mistake in this project so far has had the same shape: **a confident conclusion drawn
+> from one observation, about a system with more than one moving part.** In order of how much time each
+> cost:
+>
+> 1. **Check the package name before believing an error.** `@parity/polkadot-app-deploy` and
+>    `@polkadot-community-foundation/polkadot-app-deploy` are different tools with the same binary name
+>    and the same version number. The wrong one produced a detailed, plausible error about Bulletin
+>    authorization that sent me debugging chain state for an hour. An error naming chain state is not
+>    evidence about the chain until the tool producing it is known-good.
+> 2. **Diff against the working sibling FIRST.** `D:\Code\web3\yolodot` does most of this successfully.
+>    Two turns went into theorising about which Bulletin chains a host supports; a single comparison
+>    pass found the answer (they have a preimage fallback, we did not) along with proof that versions,
+>    permissions and genesis hashes were all identical.
+> 3. **Read the type before passing the argument.** Two consecutive bugs — `client.descriptors?.assetHub`
+>    (does not exist → `Invalid value used as weak map key`) and a guessed `walkChain` entry shape —
+>    were both one `.d.ts` read away.
+> 4. **A missing key looks exactly like a missing deployment.** `DEFAULT_NETWORK` pointed at a network
+>    absent from `deployments.json`, so every address was `undefined` and every screen said "contract
+>    not deployed" — for the entire migration, while the contracts were live.
+> 5. **Distrust `[V]` tags, including your own.** Several in these files were falsified within a day of
+>    being written. A stale `[V]` is worse than an honest `[?]`.
+
+
+Everything here cost real time to establish, and most of it fails **silently** — which is why it is
+written down. Each item says how it was verified and when.
+
+Companions: [`STATUS.md`](STATUS.md) (where we are), [`architecture.md`](architecture.md) (why the
+design is what it is), plus two deep references written by subagents:
+[`publishing.md`](publishing.md) and [`pgas-deposits-and-renewal.md`](pgas-deposits-and-renewal.md).
+
+---
+
+## Addresses and constants
+
+```
+Chain             Products Devnet, EIP-155 chainId 420420417
+ETH JSON-RPC      https://paseo-assethub-rpc.laissez-faire.trade
+Substrate RPC     https://asset-hub-paseo-rpc.n.dwellir.com     (DISJOINT from the above:
+                  eth_* only works on the first, chain_*/state_* only on the second)
+Bulletin — TWO CHAINS, AND A HOST BUILD MAY SUPPORT ONLY ONE  [V] 2026-07-30
+  CloudStorageNetworks.devnet  0xe101f0fa4627d29a257645e02be86d80378fea1a2bf8fa6a918d150ebc760a59
+                               "Bulletin Paseo"      wss://bulletin-paseo.tservices.es:8443
+  CloudStorageNetworks.paseo   0x8cfe6717dc4becfda2e13c488a1e2061ff2dfee96e7d031157f72d36716c0a22
+                               "Paseo Bulletin Next" wss://paseo-bulletin-next-rpc.polkadot.io
+  Both SDK constants are CORRECT and both chains are live — checked via chain_getBlockHash(0).
+  A real phone host REJECTED the devnet one:
+    ChainNotSupportedError: Chain 0xe101f0fa… is not supported by the current host.
+  That is NOT genesis drift; the host build simply had the other chain enabled. Because canWrite
+  hangs off the Bulletin client, one unsupported chain silently turns a fully signed-in session
+  read-only. session.ts now tries the configured chain then FALLS BACK to the other, and records
+  which one won — that also decides which gateway can serve the content back.
+
+Personhood precompile   0x000000000000000000000000000000000a010000
+  selector              0x886af133 = personhoodStatus(address,bytes32)
+  returns               (uint8 status, bytes32 contextAlias)   0=none 1=lite 2=full
+  context               "pop:polkadot.network/people-lite" | "pop:polkadot.network/people     "
+                        (ASCII, space-padded to 32 bytes — NOT bytes32(0); see §Personhood)
+  ⛔ returns 0 for EVERY address today. Unusable as a contract gate. See §Personhood.
+
+CDM registry            0x59b0245778917af55224e5f8fb55f7f8d452619f
+Multicall3              0x0C206218c5949c00e51825364a7C3A17d9909ef6
+
+Our contracts, all deployed 2026-07-30 (verify: node contracts/scripts/verify-deployment.mjs)
+  UserRegistry          0xfD00289e765414C0281EFC35335b6453F055FBD7   v0 — PINNED by the other three
+  PostRegistry          0xF6daC4BC4e721c5C84504A5Bfe033AE63722f8c9
+  Voting                0x948c71E7134E82c8d71e1bAD781F5BD4B96A14C0
+  FollowRegistry        0x96A3274Fa3696bbF5F8e1D8B58455300B9b7032E
+
+Bulletin RetentionPeriod   201,600 blocks  (~14.07 d at 6.03 s, ~15.06 d at 6.457 s — use BLOCKS)
+Revive DepositPerByte              100,000 planck
+Revive DepositPerChildTrieItem  20,000,000 planck
+Storage cost                0.00264 PAS-or-PGAS per new 32-byte slot; overwrites are FREE
+```
+
+## Secrets
+
+`contracts/.env` holds `SEED_PHRASE` and `DOTNS_MNEMONIC`, copied from `D:\Code\web3\yolodot\.env`
+(where the variable is called `MNEMONIC`). Covered by the root `.gitignore`. **Never print it, never
+commit it.** Hardhat reads `SEED_PHRASE`; `pad` reads `MNEMONIC`; `dotns` reads `DOTNS_MNEMONIC`;
+`cdm` takes `--suri` on the command line only.
+
+**The funded account is sr25519 and cannot sign Ethereum transactions.** Its `0x82A06d…B345` is a
+pallet-revive *mapping* from an `AccountId32`, not a secp256k1 keypair — no ethers wallet can ever sign
+as it. Every ETH derivation path of the mnemonic holds **zero**. Verified 2026-07-30 across
+`m/44'/60'/0'/0/{0,1,2}`, `m/44'/60'/1'/0/0`, `m/44'/60'/0'/0'/0`, `m/0'/0`, `m/0`.
+**Consequence: deployment goes through `cdm`, never `hardhat run --network`.**
+
+---
+
+## Personhood — an APP can check it; a CONTRACT cannot
+
+Reproduce everything below with `node contracts/scripts/probe-personhood.mjs`.
+
+**Separate the two questions, because conflating them produced a wrong conclusion once already:**
+
+| Question | Answer | How |
+|---|---|---|
+| "Is this account a person?" asked by **the app** | **YES, works today** | People chain, `PeopleLite.LitePeople[account]` — **151 entries**. Zero-config via `getChainAPI("devnet").individuality`. |
+| "Is `msg.sender` a person?" asked by **Solidity** | **No** | Needs the Asset Hub precompile, which needs an alias binding. `AccountToAlias` is empty in all three places it exists. |
+
+Personhood lives on the **Individuality / People chain**, not on Asset Hub — Asset Hub only holds a
+`MembersSubscriber` subscription to the People chain's member rings. The SDK abstracts this: `devnet`
+and `paseo` both ship a live `individuality` descriptor (`@parity/product-sdk-chain-client`; only
+`polkadot`/`kusama` are documented as "not yet live"). Devnet's endpoint is
+`wss://people-paseo.rotko.net`.
+
+Pallets there: `People`, `PeopleLite`, `ProofOfInk`, `DummyDim`, `MobRule`, `Members`, `Honour`.
+
+- **`PeopleLite.LitePeople` is keyed by plain account address** and has **151 entries** — verified
+  2026-07-30 by a positive lookup on a real account and a negative on Alice. This is the read to gate
+  UI on.
+- **Full personhood is NOT account-addressable yet.** `People.People` has 41 entries but is keyed by
+  *personal id*, and `People.AccountToPersonalId` has **0 entries**. So "lite counts" is not merely a
+  fairness argument here — lite is the only tier you can currently resolve from an account.
+- The `41` matches yolodot's "41 full" exactly; lite has grown from their 94 to 151.
+
+### The Asset Hub precompile, and why it is the wrong tool
+
+**It is real and live.** Address `0x…0a010000`, selector `0x886af133` =
+`personhoodStatus(address,bytes32)`. Not in the docs, the descriptors, or any `@parity/product-sdk-*`
+package; `yolodot/docs/platform/sdk-notes.md` §5c records it as `[?]` while
+`yolodot/apps/plaza/src/lib/personhood.js` has had the address all along.
+
+**And it returns 0 for every address tested.** [V] 2026-07-30 — because the account→alias binding it
+resolves through does not exist yet, anywhere:
+
+- `AliasAccounts.AccountToAlias` on Asset Hub: **0 entries**. Also `People.AccountToAlias` and
+  `PeopleLite.AccountToAlias` on the People chain: **0 entries** each.
+- Binding is a user action — `set_alias_account(proof, collection, ring_index, ring_revision, context,
+  proof_valid_at)` carries a ring-VRF proof; an app cannot do it for you.
+- Asset Hub's version needs `AliasAccounts.AliasFee`, which is **unset** (`None`; the pallet declares
+  an `AliasFeeUnset` error), so nobody *can* bind there right now regardless.
+- Meanwhile `Pgas.ClaimedGasAliases` has **23 entries** — real people minting PGAS. Personhood is
+  proven per-extrinsic by an alias, never by an account a contract could look up.
+
+⚠️ The `0` is a correct answer to a question nobody has enabled, **not** evidence that personhood is
+unavailable. Use the People chain instead (table above).
+
+**⚠️ The `context` argument is not free-form, and passing zeros is why this looked like a dead
+precompile.** The valid contexts are the keys of `MembersSubscriber.RingCollectionStates`, and they
+are ASCII space-padded to exactly 32 bytes:
+
+```
+"pop:polkadot.network/people-lite"   (32 chars exactly)
+"pop:polkadot.network/people     "   (27 chars + 5 spaces)
+```
+
+`yolodot/apps/plaza/src/lib/personhood.js` defaults `context` to `bytes32(0)`, which names no ring at
+all. Both real contexts still return 0 — so the conclusion stands — but any future probe must use
+these, or a 0 proves nothing.
+
+**Consequences:**
+- `Voting` keeps `hasProfile` **as its on-chain gate**, because a precompile gate would reject 100% of
+  users including us. That is a limitation of Solidity's reach, not of personhood.
+- **The app should gate on real personhood** via `PeopleLite.LitePeople[account]` — that is a genuine
+  one-human-one-account check and much stronger than `hasProfile`, which gates nothing (profiles are
+  free and unlimited). Belt and braces: app enforces personhood, contract enforces attribution.
+- **LITE COUNTS. NEVER REQUIRE FULL.** 151 lite versus 41 full, and full is not even resolvable from
+  an account (`People.AccountToPersonalId` is empty). There is no defensible reason to require it.
+- `contextAlias` is a per-context pseudonym — the same human yields a different alias per app, giving
+  sybil resistance *and* anonymity. Worth adopting for the contract the day `AccountToAlias` fills up.
+- Re-run the probe before trusting any of this. The moment `AccountToAlias` has entries, the
+  contract-side conclusion is stale.
+
+**A note on how this was got wrong.** The first pass tested only the Asset Hub precompile, saw 0
+everywhere, and wrote up "personhood cannot be checked" — a claim about the platform inferred from one
+API on one chain. The tell was visible and ignored: the frontend bundle contains
+`devnet_individuality_metadata` chunks, i.e. the SDK ships a People-chain client. When a capability
+seems absent, check whether you looked on the right chain before concluding the platform lacks it.
+
+---
+
+## Contract toolchain
+
+**`cdm deploy` cannot pass constructor arguments.** [V] from source 2026-07-30, cdm-cli 0.8.26:
+`ContractDeployer.dryRunDeploy` builds `Revive.instantiate_with_code({… data, salt})` after
+`const data = new Uint8Array(0);` — the calldata is hard-coded empty and no flag reaches it. A contract
+with `constructor(address x)` receives `address(0)` and reverts, surfacing as `Revive.ContractReverted`
+on "AssetHub deploy+register chunk" with **all** contracts in the chunk marked failed regardless of
+which one broke. yolodot never hit this because `PlazaHeads` and `Guestbook` take no constructor args.
+
+Our fix: the three satellites pin `UserRegistry` as a `constant` and take no constructor arguments.
+Grep `PLAZA-USER-REGISTRY-ADDRESS`. Each constructor reverts `UserRegistryNotDeployed` if that address
+holds no code, so a wrong-network deploy dies at deploy time rather than at first delegated write.
+
+**`cdm deploy` ALWAYS redeploys, at a NEW address, as a NEW version.** The salt is
+`computeDeploySalt(cdmPackage, version, scope)` and the version comes from
+`queryRegistryVersionCounts`, so every run bumps it and lands somewhere else. `getOnChainCode` exists
+in the source but **is never called** — there is no unchanged-code skip. Two consequences: re-running
+a deploy silently orphans the previous instance *with its storage*, and it will do that to
+`UserRegistry` even when the source has not changed. To deploy a subset, move the others out of
+`contracts/` first (a dot-directory like `contracts/.isolate/` is not scanned); there is no filter
+flag, and cdm deploys every contract it detects.
+
+**`.cdm/solidity/<scope>/<name>.sol` is NOT a reliable address record.** It is regenerated on every
+build, and a contract that was not part of *this* build comes back as a local stub with
+`ADDRESS = 0x0000…0000`. Observed 2026-07-30: `user-registry.sol` was zeroed by a deploy that excluded
+it, while the contract was live on chain the whole time. `deployments.json` plus
+`scripts/verify-deployment.mjs` are the record; `.cdm/` is build output.
+
+**`networks.hardhat.polkadot: true` is what switches the compiler to resolc.** Requiring
+`@parity/hardhat-polkadot` alone is NOT enough: the build succeeds and silently emits **EVM** bytecode,
+and cdm then says "hardhat build did not produce deployable bytecode" — which points nowhere near the
+cause. Check the magic bytes: PolkaVM starts `0x50564d00` (`PVM\0`), EVM starts `0x60…`.
+
+**The two builds need separate output directories.** EVM → `artifacts-evm`/`cache-evm`; PolkaVM → the
+defaults. Sharing them means the two overwrite each other and a deploy picks up the wrong bytecode.
+
+**The PolkaVM config is `hardhat.config.cjs`, not `.ts`.** `contracts/package.json` is
+`"type": "module"`; Hardhat 2 loads a TS config through ts-node as CommonJS and rejects it with HH19.
+Plain `.cjs` needs no ts-node — worth having, because **ts-node 10.9 cannot read TypeScript 7's compiler
+API** and fails as `Cannot read properties of undefined (reading 'fileExists')`, which reads exactly
+like a missing tsconfig and is not.
+
+**No Rust needed.** `resolc` ships as a WASM binary inside `@parity/resolc`, pulled in transitively.
+`cdm setup --check` reporting `rustup ✖` is about the `cargo pvm-contract` route. Ignore it.
+
+**cdm deploys everything under `contracts/`.** That is the guard against deploying probes — keep
+anything undeployable outside that directory. We use `contracts/.isolate/` for contracts that are not
+ready.
+
+**Solc parses `@scope/name` inside a NatSpec comment as a documentation tag.** Writing
+`` `@plaza-social/user-registry` `` in prose above a state variable fails the build with
+`DocstringParsingError: Documentation tag @plaza-social/user-registry` not valid for public state
+variables`, which reads like a problem with the variable and is not. Drop the `@` in prose; only the
+real `@custom:cdm` line should have one.
+
+**Names claim themselves on first publish.** `@plaza-social/user-registry` was unowned and registered
+automatically. Decision 005 says the signer must own the name and never explains how ownership is
+acquired — because nothing is needed. Contract **code size is not a constraint** either: 73.8 KB
+deployed fine, above yolodot's proven 56,507 bytes.
+
+**`cdm` is broken on Windows** — it calls `spawn("npx", …)` without `shell: true`. Use the shim at
+`contracts/tools/cdm.mjs` (copied from yolodot). Pass-through on Linux/macOS.
+
+---
+
+## Publishing
+
+**Always pass `--env devnet` to `pad`.** Its default is `paseo-next-v2`, which is a *valid* id — so
+omitting the flag deploys to the wrong network and looks completely successful. `dotns` defaults the
+other way and silently ignores an unknown `--env` entirely.
+
+**Vite needs `base: './'`.** The bundle is served from a CID path inside a sandboxed iframe, so absolute
+asset URLs 404 with no reachable console.
+
+**~~Publishing is rate-limited by personhood: 1/day Lite, 5/day Full.~~ FALSIFIED — do not plan around
+this.** [V] 2026-07-30: **two full `pad` deploys succeeded ~20 minutes apart** on the same account, both
+finalising on chain (blocks 11599710 and 11600873). Whatever the limit is, "one publish a day" is not
+it, and treating it as a blocker wasted real time — including telling the user a fix could not go live.
+`publishing.md` §351 records a `RateLimitExceeded` error existing in the pallet with those numbers; that
+may apply to `pad --publish` (the Browse directory listing, separately personhood-gated, fails
+non-fatally exiting 0) rather than to a deploy. **Actual deploy cap: `[?]` — just try it.**
+
+**Domain cost is a refundable 10 PAS deposit, not a fee** (`dotns escrow status` shows
+`status: held`). A 9+ character stem avoids a personhood check on the name.
+
+**An HTTP 200 from the host domain proves nothing.** [V] 2026-07-30: `plaza-social.dot.li` and
+`plaza-social.dev-dot.li` both return the identical **20,506-byte** host shell — as does every hostname
+under those domains, including names never registered. Both domains are live; `pad` now prints
+`.dot.li`.
+
+**⚠️ THE PUBLISHED CID IS A CAR FILE, NOT A UNIXFS DIRECTORY.** [V] 2026-07-30, and this invalidates the
+verification recipe that used to be written here. `GET /ipfs/<cid>` returns **7,571,187 bytes** of
+`application/octet-stream` beginning `a2 65 72 6f 6f 74 73…` — CBOR `{roots, version}`, a CAR v1 header.
+So:
+
+- **Fetching the CID root works** on both `ipfs.io` and the devnet gateway, and its size is a real check.
+- **Pathing into it does NOT.** `<cid>/index.html` and `<cid>/deployments.json` both 404 with
+  `no link named … under <cid>`. This is expected, not a broken deploy — it is why the host's loading
+  screen says "Walking dag-pb via bitswap": it unpacks the CAR itself.
+- ~~"fetch the CID from a gateway" to check individual files~~ — impossible. Do not conclude from a 404
+  on a file path that the publish failed.
+
+**To verify a deploy:** (1) `dotns content view <name> --json` and compare the CID to what `pad`
+printed; (2) `grep` the strings you changed in the exact `dist/` you uploaded — that is what proves the
+new code is in the bundle; (3) load it in the host and read the UI.
+
+**Neither `pad` nor `dotns` can renew stored data.** `dotns bulletin refresh` renews the
+*authorization*, not the record. `CloudStorageClient.renew()` in the SDK is the only programmatic path.
+
+## ⚠️⚠️ THERE ARE TWO `pad` PACKAGES. USE THE COMMUNITY FOUNDATION ONE.
+
+```
+✅ @polkadot-community-foundation/polkadot-app-deploy    ← THIS ONE. Works.
+❌ @parity/polkadot-app-deploy                            ← different package, same `pad` binary name,
+                                                            also versioned 0.13.1
+```
+
+Same for the others — the working toolchain is **all** `@polkadot-community-foundation`:
+`dotns-cli`, `polkadot-app-deploy`, `cdm-cli`.
+
+**[V] 2026-07-30.** The `@parity` package refuses to deploy with an error that reads like real chain
+state and is not:
+
+```
+Deployment failed: Bulletin storage account pool account 0 (5DDa6Wx3...) is not authorized
+(or its authorization expired). polkadot-app-deploy no longer self-authorizes on the Bulletin
+chain — request authorization for this account from the chain's authorizer.
+```
+
+That message sent a whole investigation down a hole: pool-account derivation, `--pool-size 1`, byte
+quotas, `dotns bulletin status/refresh`, and a written-up "finding" that deploys are gated by Bulletin
+authorization per derived pool account. **All of it was an artefact of the wrong package.** The
+community-foundation package deployed the identical bundle with the same mnemonic minutes later,
+first try.
+
+**The tell I ignored:** the `@parity` package prints `https://<name>.dot.li`, the community-foundation
+one prints `https://<name>.dev-dot.li`. When the URL a tool reports stops matching the URL in your own
+notes and screenshots, that is a different tool — not a platform change. I instead "corrected" the docs
+to say `.dot.li`. Both hostnames do serve the app (identical 20,506-byte shell), which is why the
+mismatch looked harmless.
+
+**Rule this earns:** an error naming chain state is not evidence about the chain until the tool
+producing it is the one known to work. Check the package name first.
+
+---
+
+## Tests and scripts
+
+**`hardhat_setCode` does not clear storage, and a pinned address is the same address every test.**
+The three satellites are only deployable in a test once `UserRegistry`'s code sits at the pinned
+address, which `test/helpers/pinnedUserRegistry.js` arranges — but profiles created in one test were
+still there in the next, so `createProfile` reverted with `ProfileExists` and looked like a contract
+bug. The helper now calls `hardhat_reset` first. Test-state leakage of this kind is only possible
+*because* the address is fixed.
+
+Mirroring code is sound here only because **`UserRegistry` has no constructor**, so runtime code plus
+empty storage is indistinguishable from a fresh deploy. If it ever gains constructor state the helper
+becomes a lie that passes.
+
+**`import.meta.url === \`file://${process.argv[1]}\`` is always false on Windows** — `file:///D:/…`
+versus `file://D:/…`. A script guarded that way exits 0 with no output, which is indistinguishable
+from "ran fine, found nothing". Cost 10 minutes on the personhood probe.
+
+## ⭐ Bulletin writes: the CloudStorage route can be UNREACHABLE, and the fallback is the real path
+
+**[V] 2026-07-30, on a real phone, with every other step green.** The single most expensive finding of
+the migration, and it was sitting in yolodot's code the whole time.
+
+`CloudStorageClient` reaches Bulletin through the host's chain bridge, which first asks
+`system.featureSupported({ tag: 'Chain', value: { genesisHash } })`. **A host in `rpc-gateway`
+chain-backend mode answers that from a three-element list — relay, Asset Hub, People — that never
+contains a Bulletin chain.** So `ChainNotSupportedError` comes back for *every* Bulletin genesis:
+
+```
+devnet: ChainNotSupportedError: Chain 0xe101f0fa… is not supported by the current host.
+paseo:  ChainNotSupportedError: Chain 0x8cfe6717… is not supported by the current host.
+```
+
+The mode is sticky in `localStorage['dotli:chain-backend']`, and legacy values
+(`rpc`/`gateway`/`centralized`/`ipfs-gateway`) migrate onto `rpc-gateway` permanently. In that mode the
+host reaches Bulletin over a direct WebSocket that bypasses its own bridge — which is why the host works
+and the product does not.
+
+**⛔ A devnet→paseo fallback CANNOT fix this** — that was our first attempt, and it failed on both
+chains, because both are absent from the same list. Two wrong chains are not a fallback.
+
+**The fix: fall back to the host preimage channel.** `getPreimageManager()` from
+`@parity/product-sdk-host` goes through the TruAPI bridge (`client.preimage.submit`) and touches no
+chain client, no genesis hash and no support probe. yolodot has had this since its first commit:
+
+```
+try { await storage.store(bytes).send() }        // primary
+catch { await preimages.submit(bytes) }          // the path that actually carries the bytes
+```
+
+Consequences to design around:
+- **`submit` returns a hex preimage key, NOT a CID.** Compute the CID locally first with
+  `calculateCid(bytes)` (a pure re-export of `@parity/bulletin-sdk`; no chain client).
+- **No `(blockNumber, extrinsicIndex)` receipt**, and Bulletin `renew` is positional — so content
+  written this way is the hardest on the chain to keep alive. The renewal TODO is unsatisfiable here.
+- **A per-write "Submit Preimage" dialog is unconditional** — no grant suppresses it.
+- `canWrite` must be `(!!storage || !!preimages) && canChain`. Requiring `storage` told users who could
+  post that posting was off.
+
+**⚠️ `PreimageSubmit` MUST be requested.** Both repos carried a comment saying it is never read by the
+host and must not be requested — inherited from yolodot, and **refuted by yolodot's own later audit**:
+the TruAPI sandbox gates `remote_preimage_submit` on it, one layer above where the host bundle was
+originally grepped. Corrected in `diagnostics.ts` and `session.ts`.
+
+**What ruled everything else out** (so nobody re-runs it): all `@parity/*` package versions are
+**identical** across the two repos, `product-sdk-cloud-storage` and `product-sdk-host` are byte-identical
+installs, the permission set is identical, the resource-allocation tags are identical, and yolodot passes
+**the same genesis hash our phone rejected**. There is no magic hash and no version drift. The only
+difference was the fallback.
+
+**Method note:** two turns were spent theorising about chain support, pool accounts and quotas. The
+answer came from diffing against the working repo in one pass. When a sibling project does the same thing
+successfully, compare the code before investigating the platform.
+
+## Host-signed contract writes (arm 1)
+
+**Owner-only calls must NOT be signed by the delegate**, for two independent reasons — profile creation
+hits both, and the second one hides the first:
+
+- **Attribution.** `UserRegistry.createProfile` records `msg.sender` as the owner, so a delegate-signed
+  call creates a profile owned by a throwaway per-device key. There is deliberately no
+  `createProfileFor`.
+- **Funding.** The delegate is a locally derived H160 that nobody funds — balance `0.0`, nonce `0`
+  [V] 2026-07-30. Sending from it produces:
+
+  ```
+  could not coalesce error { "code": 1012, "message": "Transaction is temporarily banned" }
+  ```
+
+  The node rejects the unpayable transaction and the txpool then **bans its hash**, so a retry fails
+  differently and more mysteriously than "no money". `1012` here means unfunded sender, not a ban you
+  did something to earn.
+
+**Asset Hub IS reachable through the host bridge even when Bulletin is not** — an `rpc-gateway`-mode
+host supports relay + Asset Hub + People. So contract writes work through the host chain client while
+Bulletin writes need the preimage fallback. Those two facts look contradictory in the diagnostics panel
+and are not.
+
+**⚠️ The chain descriptor is a SEPARATE IMPORT, not a property of the client.** `ChainClient` exposes
+`.raw.<name>` and the typed API; there is no `.descriptors`. Passing `client.descriptors?.assetHub`
+hands `undefined` to `createContractFromClient`, which uses it as a WeakMap key:
+
+```
+Invalid value used as weak map key
+```
+
+That message names nothing and points nowhere near the cause. Import
+`@parity/product-sdk-descriptors/<env>-asset-hub` and guard the value before passing it on.
+
+**Prefer `createChainClient({ chains: { assetHub } })` over `getChainAPI(env)`.** The preset table
+behind `getChainAPI` statically references polkadot/kusama/paseo metadata and emits a ~880 kB chunk per
+network into a bundle that gets **uploaded to Bulletin**. (Note: importing
+`@parity/product-sdk-chain-client` at all appears to pull the whole preset table in regardless — all
+four `*_asset_hub_metadata` chunks are present in our build and predate this code. Unsolved `[?]`.)
+
+**⭐ ARM 1 WORKS. [V] 2026-07-30** — a profile was created on chain from the phone, host-signed, with
+the product account as `msg.sender`. First real contract write through the host.
+
+**⚠️ ALWAYS POLL AFTER A HOST-SIGNED WRITE. One read is not enough, and the failure is silent.** The
+host submits and settles at best-block, but the app reads through a **separate public RPC** that can
+trail the block the host just saw. An immediate re-read therefore returns the OLD state: the profile
+existed on chain while `getProfile().exists` was still false, so the "set up your profile" banner stayed
+up over a visible profile, and the create form never switched to its edit view — which reads as "the
+write silently did nothing". Events are no help here: `eth_getLogs` cannot see host-submitted contract
+calls at all, so polling the view function is the correct mechanism, not a workaround. Give up quietly
+after a timeout — the write already succeeded, and the next natural refresh will show it.
+
+## Frontend / SDK traps
+
+**`contract.getAddress()` is an ethers v6 built-in** that silently shadows a same-named ABI function and
+returns the contract's *own* address. Use `contract.getFunction("getAddress(string)")`. Same family as
+the `HeadRef.movedAt` trap: a decoded struct is a `Result` (an Array subclass), so `ref.at` resolves to
+`Array.prototype.at` and hands you a **function** with no error.
+
+**`Number(params.get(x))` is `0` for a missing param**, and `0` is finite — so a `Number.isFinite`
+guard silently turns every numeric default into zero. Check `=== null` first.
+
+**`isInsideContainer()` is async**; `isInsideContainerSync()` is the sync one. A plain ternary on the
+async version is always truthy.
+
+**Two different `Result` types in one SDK.** `@parity/result` (`{ok, value|error}`, branch on `.ok`) for
+the `product-sdk-*` functions, and **neverthrow** `ResultAsync` (`.match(ok, err)`) for
+`AccountsProvider` methods.
+
+**`require.resolve` fails on the ESM-only `@parity/*` packages even when installed.** A Vite plugin used
+that check to decide whether to stub them, so it never stood down and **shadowed the real SDK** — the
+app built, deployed, and would have refused to sign. The tell was a 0.34 kB chunk where the SDK should
+be. Removed 2026-07-30; use `import.meta.resolve` if you ever need this check.
+
+**`eth_getLogs` cannot see events from host-submitted contract calls.** The host submits native `Revive`
+extrinsics, producing `Revive.ContractEmitted` in `System.Events` and nothing in the ETH log index.
+**Polling is correct here — do not "modernise" it into log subscriptions.** The tx hash the host reports
+is a Substrate extrinsic hash, not an ETH one.
+
+**The host does not proxy legacy JSON-RPC.** `state_getMetadata` returns `-32601`; only `chainHead_v1_*`
+is bridged. Fetch metadata through the `Metadata_metadata_at_version(15)` runtime API.
+
+**`Revive.call`'s field is `weight_limit`, not `gas_limit`**, and PAPI's dynamic builder wants plain hex
+strings for `H160`/`H256`. A wrong shape surfaces as `Incompatible runtime entry Tx(Revive.call)`, which
+reads like a missing call and is not.
+
+**Nothing opens the host transport for you.** Until something calls `getTruApi()`, the host never sees a
+connected product and `waitForConnection()` hangs forever.
+
+**`getLookupFn` from `@polkadot-api/metadata-builders` silently drops variant doc strings** — which is
+why an earlier pass concluded the Bulletin pallet was undocumented. The docs were on chain all along.
+
+---
+
+## Documents that are wrong
+
+Both repos' notes are load-bearing, so their errors matter.
+
+- **`yolodot/docs/platform/sdk-notes.md` §1** argues at length that `AutoSigning` works, with three
+  numbered consequences. Superseded by the host-bundle investigation and never annotated. Its §5c also
+  records the personhood precompile as `[?]` when the app code has the address, and it claims packages
+  ship `src/` alongside `dist/` — `@parity/truapi@0.5.1` does not.
+- **`docs.polkadot.com/apps/` documents a different product** (`playground-cli`, gateway `dot.li`, a
+  third network, no Windows build). yolodot's advice to "check it first" is wrong. It *is* the only
+  source for Bulletin retention and DotNS rules.
+- **`MAX_CONTENT_LENGTH` was 40,000 bytes**, not the 2,000 that `contracts/CLAUDE.md` and yolodot's
+  decision 007 both stated, nor the 10,000 in ForumThread's own docstring.
+- **This file was wrong twice, corrected 2026-07-30.** It claimed `.cdm/solidity/<scope>/<name>.sol`
+  was "the reliable way to recover" a deployed address — it is regenerated build output and can come
+  back zeroed. And it framed personhood as "the finding that unblocked Voting" when the precompile
+  cannot gate a write at all. Both were written the same day they were falsified, which is the whole
+  argument for the `[V]`/`[I]`/`[?]` convention: the first was `[I]` dressed as fact, and the second
+  had never been tested against a real context or checked for an account→alias binding.
+- **`CLAUDE.md` said "135 tests" while `npm test` ran 42.** Three contracts sat in
+  `contracts/.isolate/` so their artifacts did not exist and 93 tests never ran — the suite reported
+  "42 passing, 3 failing" and the 3 looked like the whole problem. Isolating a contract silently
+  disables its tests; if you must do it, do it for one command, not as a resting state.

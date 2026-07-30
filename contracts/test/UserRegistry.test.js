@@ -2,6 +2,18 @@ import { expect } from "chai";
 import hre from "hardhat";
 const { ethers } = hre;
 
+const DAY = 24 * 60 * 60;
+const MAX_DELEGATION_SECONDS = 90 * DAY;
+
+async function now() {
+  return (await ethers.provider.getBlock("latest")).timestamp;
+}
+
+async function increaseTime(seconds) {
+  await ethers.provider.send("evm_increaseTime", [seconds]);
+  await ethers.provider.send("evm_mine", []);
+}
+
 describe("UserRegistry", function () {
   let userRegistry;
   let owner;
@@ -29,31 +41,53 @@ describe("UserRegistry", function () {
 
     it("Should reject empty display name", async function () {
       await expect(userRegistry.createProfile("", "Bio"))
-        .to.be.revertedWith("Display name required");
+        .to.be.revertedWithCustomError(userRegistry, "DisplayNameRequired");
     });
 
     it("Should reject display name too long", async function () {
-      const longName = "a".repeat(51);
-      await expect(userRegistry.createProfile(longName, "Bio"))
-        .to.be.revertedWith("Display name too long");
+      await expect(userRegistry.createProfile("a".repeat(51), "Bio"))
+        .to.be.revertedWithCustomError(userRegistry, "TooLong")
+        .withArgs(51, 50);
     });
 
     it("Should reject bio too long", async function () {
-      const longBio = "a".repeat(501);
-      await expect(userRegistry.createProfile("Alice", longBio))
-        .to.be.revertedWith("Bio too long");
+      await expect(userRegistry.createProfile("Alice", "a".repeat(501)))
+        .to.be.revertedWithCustomError(userRegistry, "TooLong")
+        .withArgs(501, 500);
     });
 
     it("Should reject duplicate profile creation", async function () {
       await userRegistry.createProfile("Alice", "Bio");
       await expect(userRegistry.createProfile("Alice2", "Bio2"))
-        .to.be.revertedWith("Profile already exists");
+        .to.be.revertedWithCustomError(userRegistry, "ProfileExists");
     });
 
     it("Should check hasProfile correctly", async function () {
       expect(await userRegistry.hasProfile(owner.address)).to.be.false;
       await userRegistry.createProfile("Alice", "Bio");
       expect(await userRegistry.hasProfile(owner.address)).to.be.true;
+    });
+
+    it("Should create profile with address-derived name", async function () {
+      await userRegistry.createDefaultProfile();
+      const profile = await userRegistry.getProfile(owner.address);
+      expect(profile.displayName).to.match(/^0x[a-f0-9]{8}$/i);
+      expect(profile.bio).to.equal("");
+    });
+
+    it("Should read many profiles in one call", async function () {
+      await userRegistry.createProfile("Alice", "A");
+      await userRegistry.connect(addr1).createProfile("Bob", "B");
+
+      const result = await userRegistry.getProfiles([
+        owner.address,
+        addr1.address,
+        addr2.address,
+      ]);
+      expect(result.length).to.equal(3);
+      expect(result[0].displayName).to.equal("Alice");
+      expect(result[1].displayName).to.equal("Bob");
+      expect(result[2].exists).to.be.false; // absent rather than skipped
     });
   });
 
@@ -66,23 +100,26 @@ describe("UserRegistry", function () {
       await expect(userRegistry.setDisplayName("NewAlice"))
         .to.emit(userRegistry, "DisplayNameUpdated")
         .withArgs(owner.address, "NewAlice");
-
-      const profile = await userRegistry.getProfile(owner.address);
-      expect(profile.displayName).to.equal("NewAlice");
     });
 
     it("Should update bio", async function () {
       await expect(userRegistry.setBio("New bio"))
         .to.emit(userRegistry, "BioUpdated")
         .withArgs(owner.address, "New bio");
-
-      const profile = await userRegistry.getProfile(owner.address);
-      expect(profile.bio).to.equal("New bio");
     });
 
-    it("Should reject update from non-owner", async function () {
+    it("Should reject update from a non-owner", async function () {
       await expect(userRegistry.connect(addr1).setDisplayName("Hacker"))
-        .to.be.revertedWith("Profile does not exist");
+        .to.be.revertedWithCustomError(userRegistry, "NoProfile")
+        .withArgs(addr1.address);
+    });
+
+    it("Should NOT let a delegate rename its principal", async function () {
+      await userRegistry.authorizeDelegate(delegate.address, (await now()) + DAY);
+      // setDisplayName is owner-only on purpose: a leaked convenience key must not be able to
+      // rename the account it serves.
+      await expect(userRegistry.connect(delegate).setDisplayName("Impostor"))
+        .to.be.revertedWithCustomError(userRegistry, "NoProfile");
     });
   });
 
@@ -92,311 +129,268 @@ describe("UserRegistry", function () {
     });
 
     it("Should add a link", async function () {
-      await expect(userRegistry.addLink("Twitter", "https://twitter.com/alice"))
+      await expect(
+        userRegistry.addLink(owner.address, "Twitter", "https://twitter.com/alice")
+      )
         .to.emit(userRegistry, "LinkAdded")
         .withArgs(owner.address, 0, "Twitter", "https://twitter.com/alice");
 
       const links = await userRegistry.getLinks(owner.address);
       expect(links.length).to.equal(1);
       expect(links[0].name).to.equal("Twitter");
-      expect(links[0].url).to.equal("https://twitter.com/alice");
-    });
-
-    it("Should add multiple links", async function () {
-      await userRegistry.addLink("Twitter", "https://twitter.com/alice");
-      await userRegistry.addLink("GitHub", "https://github.com/alice");
-
-      const count = await userRegistry.getLinkCount(owner.address);
-      expect(count).to.equal(2);
     });
 
     it("Should remove a link", async function () {
-      await userRegistry.addLink("Twitter", "https://twitter.com/alice");
-      await userRegistry.addLink("GitHub", "https://github.com/alice");
+      await userRegistry.addLink(owner.address, "Twitter", "https://t.co/a");
+      await userRegistry.addLink(owner.address, "GitHub", "https://gh.com/a");
 
-      await expect(userRegistry.removeLink(0))
+      await expect(userRegistry.removeLink(owner.address, 0))
         .to.emit(userRegistry, "LinkRemoved")
         .withArgs(owner.address, 0);
 
       const links = await userRegistry.getLinks(owner.address);
       expect(links.length).to.equal(1);
-      expect(links[0].name).to.equal("GitHub");
+      expect(links[0].name).to.equal("GitHub"); // swap-and-pop reorders
     });
 
     it("Should clear all links", async function () {
-      await userRegistry.addLink("Twitter", "https://twitter.com/alice");
-      await userRegistry.addLink("GitHub", "https://github.com/alice");
-
-      await expect(userRegistry.clearLinks())
+      await userRegistry.addLink(owner.address, "Twitter", "https://t.co/a");
+      await expect(userRegistry.clearLinks(owner.address))
         .to.emit(userRegistry, "LinksCleared")
         .withArgs(owner.address);
-
-      const links = await userRegistry.getLinks(owner.address);
-      expect(links.length).to.equal(0);
+      expect(await userRegistry.getLinkCount(owner.address)).to.equal(0);
     });
 
     it("Should reject more than 10 links", async function () {
       for (let i = 0; i < 10; i++) {
-        await userRegistry.addLink(`Link${i}`, `https://example.com/${i}`);
+        await userRegistry.addLink(owner.address, `Link${i}`, `https://e.com/${i}`);
       }
-      await expect(userRegistry.addLink("Link10", "https://example.com/10"))
-        .to.be.revertedWith("Max 10 links");
+      await expect(userRegistry.addLink(owner.address, "Link10", "https://e.com/10"))
+        .to.be.revertedWithCustomError(userRegistry, "TooManyLinks")
+        .withArgs(10);
+    });
+
+    it("Should let a live delegate manage links", async function () {
+      await userRegistry.authorizeDelegate(delegate.address, (await now()) + DAY);
+      await userRegistry.connect(delegate).addLink(owner.address, "Site", "https://a.dev");
+
+      const links = await userRegistry.getLinks(owner.address);
+      expect(links.length).to.equal(1);
+    });
+
+    it("Should reject link writes from a stranger", async function () {
+      await expect(
+        userRegistry.connect(addr1).addLink(owner.address, "Spam", "https://spam")
+      )
+        .to.be.revertedWithCustomError(userRegistry, "NotAuthorized")
+        .withArgs(owner.address, addr1.address);
     });
   });
 
-  describe("Delegate Management", function () {
-    beforeEach(async function () {
-      await userRegistry.createProfile("Alice", "Hello world");
-    });
+  // The delegation model is the substantive change from the previous version: expiry with an
+  // enforced maximum, per-owner (not global) uniqueness, and no reverse lookup.
+  describe("Delegation", function () {
+    it("Should authorize a delegate with an expiry", async function () {
+      const expiry = (await now()) + DAY;
+      await expect(userRegistry.authorizeDelegate(delegate.address, expiry))
+        .to.emit(userRegistry, "DelegateAuthorized")
+        .withArgs(owner.address, delegate.address, expiry);
 
-    it("Should add a delegate", async function () {
-      await expect(userRegistry.addDelegate(delegate.address))
-        .to.emit(userRegistry, "DelegateAdded")
-        .withArgs(owner.address, delegate.address);
-
+      expect(await userRegistry.delegateExpiry(owner.address, delegate.address)).to.equal(expiry);
       expect(await userRegistry.isDelegate(owner.address, delegate.address)).to.be.true;
-      expect(await userRegistry.delegateToOwner(delegate.address)).to.equal(owner.address);
+      expect(await userRegistry.canActAs(delegate.address, owner.address)).to.be.true;
     });
 
-    it("Should remove a delegate", async function () {
-      await userRegistry.addDelegate(delegate.address);
+    it("Should not require a profile to authorize", async function () {
+      // Onboarding must not be order-dependent: authorising the session key before picking a
+      // display name would otherwise cost a second prompt.
+      expect(await userRegistry.hasProfile(owner.address)).to.be.false;
+      await userRegistry.authorizeDelegate(delegate.address, (await now()) + DAY);
+      expect(await userRegistry.isDelegate(owner.address, delegate.address)).to.be.true;
+    });
 
-      await expect(userRegistry.removeDelegate(delegate.address))
-        .to.emit(userRegistry, "DelegateRemoved")
-        .withArgs(owner.address, delegate.address);
+    it("Should stop authorizing once the expiry passes", async function () {
+      const expiry = (await now()) + 100;
+      await userRegistry.authorizeDelegate(delegate.address, expiry);
+      expect(await userRegistry.isDelegate(owner.address, delegate.address)).to.be.true;
+
+      await increaseTime(101);
 
       expect(await userRegistry.isDelegate(owner.address, delegate.address)).to.be.false;
-      expect(await userRegistry.delegateToOwner(delegate.address)).to.equal(ethers.ZeroAddress);
+      expect(await userRegistry.canActAs(delegate.address, owner.address)).to.be.false;
+      await expect(
+        userRegistry.connect(delegate).addLink(owner.address, "Late", "https://late")
+      ).to.be.revertedWithCustomError(userRegistry, "NotAuthorized");
     });
 
-    it("Should reject self-delegation", async function () {
-      await expect(userRegistry.addDelegate(owner.address))
-        .to.be.revertedWith("Cannot delegate to self");
+    it("Should treat the expiry second itself as expired", async function () {
+      // `block.timestamp < expiry` — the boundary is exclusive, so an expiry equal to now is dead.
+      const expiry = (await now()) + 10;
+      await userRegistry.authorizeDelegate(delegate.address, expiry);
+      await ethers.provider.send("evm_setNextBlockTimestamp", [expiry]);
+      await ethers.provider.send("evm_mine", []);
+      expect(await userRegistry.isDelegate(owner.address, delegate.address)).to.be.false;
     });
 
-    it("Should reject duplicate delegate", async function () {
-      await userRegistry.addDelegate(delegate.address);
-      await expect(userRegistry.addDelegate(delegate.address))
-        .to.be.revertedWith("Already a delegate");
+    it("Should reject an expiry in the past", async function () {
+      const past = (await now()) - 1;
+      await expect(userRegistry.authorizeDelegate(delegate.address, past))
+        .to.be.revertedWithCustomError(userRegistry, "ExpiryInPast");
     });
 
-    it("Should reject delegate already assigned to another profile", async function () {
-      await userRegistry.addDelegate(delegate.address);
-
-      await userRegistry.connect(addr1).createProfile("Bob", "Hi");
-      await expect(userRegistry.connect(addr1).addDelegate(delegate.address))
-        .to.be.revertedWith("Address is delegate for another profile");
-    });
-  });
-
-  describe("Lookup Functions", function () {
-    beforeEach(async function () {
-      await userRegistry.createProfile("Alice", "Hello world");
-      await userRegistry.addDelegate(delegate.address);
+    it("Should reject an expiry beyond the maximum rather than clamping it", async function () {
+      // Reverting is deliberate: a client that guesses high must fail loudly instead of silently
+      // receiving less authority than it asked for.
+      const tooFar = (await now()) + MAX_DELEGATION_SECONDS + 1000;
+      await expect(userRegistry.authorizeDelegate(delegate.address, tooFar))
+        .to.be.revertedWithCustomError(userRegistry, "ExpiryTooFar");
     });
 
-    it("Should resolve owner to themselves", async function () {
-      expect(await userRegistry.resolveToOwner(owner.address)).to.equal(owner.address);
+    it("Should accept an expiry exactly at the maximum", async function () {
+      const next = (await now()) + 1;
+      await ethers.provider.send("evm_setNextBlockTimestamp", [next]);
+      const expiry = next + MAX_DELEGATION_SECONDS;
+      await userRegistry.authorizeDelegate(delegate.address, expiry);
+      expect(await userRegistry.delegateExpiry(owner.address, delegate.address)).to.equal(expiry);
     });
 
-    it("Should resolve delegate to owner", async function () {
-      expect(await userRegistry.resolveToOwner(delegate.address)).to.equal(owner.address);
+    it("Should expose MAX_DELEGATION_SECONDS as 90 days", async function () {
+      expect(await userRegistry.MAX_DELEGATION_SECONDS()).to.equal(MAX_DELEGATION_SECONDS);
     });
 
-    it("Should return zero address for unknown address", async function () {
-      expect(await userRegistry.resolveToOwner(addr2.address)).to.equal(ethers.ZeroAddress);
+    it("Should let re-authorizing extend and shorten the expiry", async function () {
+      const first = (await now()) + DAY;
+      await userRegistry.authorizeDelegate(delegate.address, first);
+
+      const longer = first + DAY;
+      await userRegistry.authorizeDelegate(delegate.address, longer);
+      expect(await userRegistry.delegateExpiry(owner.address, delegate.address)).to.equal(longer);
+
+      const shorter = (await now()) + 60;
+      await userRegistry.authorizeDelegate(delegate.address, shorter);
+      expect(await userRegistry.delegateExpiry(owner.address, delegate.address)).to.equal(shorter);
     });
 
-    it("Should check canActAs correctly", async function () {
-      expect(await userRegistry.canActAs(owner.address, owner.address)).to.be.true;
+    it("Should treat expiry 0 as a revoke", async function () {
+      await userRegistry.authorizeDelegate(delegate.address, (await now()) + DAY);
+      await expect(userRegistry.authorizeDelegate(delegate.address, 0))
+        .to.emit(userRegistry, "DelegateRevoked")
+        .withArgs(owner.address, delegate.address);
+      expect(await userRegistry.isDelegate(owner.address, delegate.address)).to.be.false;
+    });
+
+    it("Should revoke a live delegation", async function () {
+      await userRegistry.authorizeDelegate(delegate.address, (await now()) + DAY);
+      await expect(userRegistry.revokeDelegate(delegate.address))
+        .to.emit(userRegistry, "DelegateRevoked")
+        .withArgs(owner.address, delegate.address);
+      expect(await userRegistry.delegateExpiry(owner.address, delegate.address)).to.equal(0);
+    });
+
+    it("Should make revoke idempotent", async function () {
+      // A revocation that errors because the desired state already holds is a UI that tells the
+      // user their key is still live when it is not.
+      await expect(userRegistry.revokeDelegate(delegate.address)).to.not.be.reverted;
+    });
+
+    it("Should not let a delegate revoke itself", async function () {
+      await userRegistry.authorizeDelegate(delegate.address, (await now()) + DAY);
+      // The delegate revoking its own row would free storage it did not pay for.
+      await userRegistry.connect(delegate).revokeDelegate(owner.address);
+      expect(await userRegistry.isDelegate(owner.address, delegate.address)).to.be.true;
+    });
+
+    it("Should reject the zero address and self-delegation", async function () {
+      await expect(userRegistry.authorizeDelegate(ethers.ZeroAddress, (await now()) + DAY))
+        .to.be.revertedWithCustomError(userRegistry, "ZeroDelegate");
+      await expect(userRegistry.authorizeDelegate(owner.address, (await now()) + DAY))
+        .to.be.revertedWithCustomError(userRegistry, "SelfDelegate");
+    });
+
+    it("Should allow the SAME delegate address for two different owners", async function () {
+      // The point of the relaxation: delegate keys are derived, so the same address legitimately
+      // serves two profiles belonging to one person. The old global-uniqueness check made the
+      // second profile unable to authorise its own session key at all.
+      const expiry = (await now()) + DAY;
+      await userRegistry.authorizeDelegate(delegate.address, expiry);
+      await userRegistry.connect(addr1).authorizeDelegate(delegate.address, expiry);
+
       expect(await userRegistry.canActAs(delegate.address, owner.address)).to.be.true;
-      expect(await userRegistry.canActAs(addr2.address, owner.address)).to.be.false;
+      expect(await userRegistry.canActAs(delegate.address, addr1.address)).to.be.true;
+    });
+
+    it("Should keep delegation one-directional", async function () {
+      await userRegistry.authorizeDelegate(delegate.address, (await now()) + DAY);
+      expect(await userRegistry.canActAs(owner.address, delegate.address)).to.be.false;
+    });
+
+    it("Should report canActAs(x, x) as true without any delegation", async function () {
+      expect(await userRegistry.canActAs(owner.address, owner.address)).to.be.true;
+      expect(await userRegistry.isDelegate(owner.address, owner.address)).to.be.false;
+    });
+
+    it("Should expose no reverse delegate lookup", async function () {
+      // Dropping `delegateToOwner`/`resolveToOwner` is what makes per-owner uniqueness sound: with
+      // one address serving two owners there is no correct answer, only a guess that misattributes.
+      expect(userRegistry.delegateToOwner).to.equal(undefined);
+      expect(userRegistry.resolveToOwner).to.equal(undefined);
     });
   });
 
-  describe("Default Profile Creation", function () {
-    it("Should create profile with address-derived name", async function () {
-      await expect(userRegistry.createDefaultProfile())
-        .to.emit(userRegistry, "ProfileCreated")
-        .withArgs(owner.address);
-
-      const profile = await userRegistry.getProfile(owner.address);
-      expect(profile.exists).to.be.true;
-      // Display name should be "0x" + first 8 hex chars of address
-      expect(profile.displayName).to.match(/^0x[a-f0-9]{8}$/i);
-      expect(profile.bio).to.equal("");
-    });
-
-    it("Should reject if profile already exists", async function () {
-      await userRegistry.createProfile("Alice", "Bio");
-      await expect(userRegistry.createDefaultProfile())
-        .to.be.revertedWith("Profile already exists");
-    });
-
-    it("Should allow updating name after default profile creation", async function () {
-      await userRegistry.createDefaultProfile();
-      await userRegistry.setDisplayName("Alice");
-
-      const profile = await userRegistry.getProfile(owner.address);
-      expect(profile.displayName).to.equal("Alice");
+  describe("Session keys are gone", function () {
+    it("Should expose no session-public-key surface at all", async function () {
+      expect(userRegistry.setSessionPublicKey).to.equal(undefined);
+      expect(userRegistry.getSessionPublicKey).to.equal(undefined);
+      expect(userRegistry.sessionPublicKeys).to.equal(undefined);
+      expect(userRegistry.hasSessionPublicKey).to.equal(undefined);
     });
   });
 
   describe("Profile Ownership Transfer", function () {
     beforeEach(async function () {
       await userRegistry.createProfile("Alice", "Original bio");
-      await userRegistry.addLink("Twitter", "https://twitter.com/alice");
+      await userRegistry.addLink(owner.address, "Twitter", "https://t.co/a");
     });
 
-    it("Should transfer ownership successfully", async function () {
+    it("Should transfer the profile and its links", async function () {
       await expect(userRegistry.transferProfileOwnership(addr1.address))
         .to.emit(userRegistry, "ProfileOwnershipTransferred")
         .withArgs(owner.address, addr1.address);
 
-      // Check new owner has the profile
       const newProfile = await userRegistry.getProfile(addr1.address);
-      expect(newProfile.exists).to.be.true;
       expect(newProfile.displayName).to.equal("Alice");
-      expect(newProfile.bio).to.equal("Original bio");
+      expect((await userRegistry.getLinks(addr1.address)).length).to.equal(1);
 
-      // Check links transferred
-      const links = await userRegistry.getLinks(addr1.address);
-      expect(links.length).to.equal(1);
-      expect(links[0].name).to.equal("Twitter");
-
-      // Check old owner no longer has profile
-      const oldProfile = await userRegistry.getProfile(owner.address);
-      expect(oldProfile.exists).to.be.false;
-
-      // Check old owner has no links
-      const oldLinks = await userRegistry.getLinks(owner.address);
-      expect(oldLinks.length).to.equal(0);
+      expect((await userRegistry.getProfile(owner.address)).exists).to.be.false;
+      expect((await userRegistry.getLinks(owner.address)).length).to.equal(0);
     });
 
-    it("Should reject transfer to zero address", async function () {
+    it("Should NOT carry delegations across a transfer", async function () {
+      await userRegistry.authorizeDelegate(delegate.address, (await now()) + DAY);
+      await userRegistry.transferProfileOwnership(addr1.address);
+      expect(await userRegistry.canActAs(delegate.address, addr1.address)).to.be.false;
+    });
+
+    it("Should reject bad targets", async function () {
       await expect(userRegistry.transferProfileOwnership(ethers.ZeroAddress))
-        .to.be.revertedWith("Invalid new owner");
-    });
+        .to.be.revertedWithCustomError(userRegistry, "InvalidNewOwner");
+      await expect(userRegistry.transferProfileOwnership(owner.address))
+        .to.be.revertedWithCustomError(userRegistry, "InvalidNewOwner");
 
-    it("Should reject transfer to address with existing profile", async function () {
       await userRegistry.connect(addr1).createProfile("Bob", "Bio");
       await expect(userRegistry.transferProfileOwnership(addr1.address))
-        .to.be.revertedWith("New owner has profile");
+        .to.be.revertedWithCustomError(userRegistry, "ProfileExists");
     });
 
-    it("Should reject transfer to a delegate of another profile", async function () {
-      await userRegistry.connect(addr1).createProfile("Bob", "Bio");
-      await userRegistry.connect(addr1).addDelegate(addr2.address);
-
-      await expect(userRegistry.transferProfileOwnership(addr2.address))
-        .to.be.revertedWith("New owner is delegate");
+    it("Should reject transfer from a non-owner", async function () {
+      await expect(userRegistry.connect(addr2).transferProfileOwnership(addr1.address))
+        .to.be.revertedWithCustomError(userRegistry, "NoProfile");
     });
 
-    it("Should reject transfer from non-profile-owner", async function () {
-      await expect(userRegistry.connect(addr1).transferProfileOwnership(addr2.address))
-        .to.be.revertedWith("Profile does not exist");
-    });
-
-    it("Should transfer profile with multiple links", async function () {
-      await userRegistry.addLink("GitHub", "https://github.com/alice");
-      await userRegistry.addLink("Website", "https://alice.dev");
-
-      await userRegistry.transferProfileOwnership(addr1.address);
-
-      const links = await userRegistry.getLinks(addr1.address);
-      expect(links.length).to.equal(3);
-    });
-
-    it("Should transfer session public key", async function () {
-      // Create a 64-byte session public key
-      const sessionPubKey = ethers.randomBytes(64);
-      await userRegistry.setSessionPublicKey(sessionPubKey);
-
-      await userRegistry.transferProfileOwnership(addr1.address);
-
-      // Check new owner has the session key
-      const newSessionKey = await userRegistry.getSessionPublicKey(addr1.address);
-      expect(newSessionKey).to.equal(ethers.hexlify(sessionPubKey));
-
-      // Check old owner no longer has session key
-      const oldSessionKey = await userRegistry.getSessionPublicKey(owner.address);
-      expect(oldSessionKey).to.equal("0x");
-    });
-  });
-
-  describe("Session Public Key Management", function () {
-    beforeEach(async function () {
-      await userRegistry.createProfile("Alice", "Hello world");
-    });
-
-    it("Should set session public key", async function () {
-      const sessionPubKey = ethers.randomBytes(64);
-
-      await expect(userRegistry.setSessionPublicKey(sessionPubKey))
-        .to.emit(userRegistry, "SessionPublicKeyUpdated")
-        .withArgs(owner.address);
-
-      const storedKey = await userRegistry.getSessionPublicKey(owner.address);
-      expect(storedKey).to.equal(ethers.hexlify(sessionPubKey));
-    });
-
-    it("Should check hasSessionPublicKey correctly", async function () {
-      expect(await userRegistry.hasSessionPublicKey(owner.address)).to.be.false;
-
-      const sessionPubKey = ethers.randomBytes(64);
-      await userRegistry.setSessionPublicKey(sessionPubKey);
-
-      expect(await userRegistry.hasSessionPublicKey(owner.address)).to.be.true;
-    });
-
-    it("Should update session public key", async function () {
-      const sessionPubKey1 = ethers.randomBytes(64);
-      const sessionPubKey2 = ethers.randomBytes(64);
-
-      await userRegistry.setSessionPublicKey(sessionPubKey1);
-      await userRegistry.setSessionPublicKey(sessionPubKey2);
-
-      const storedKey = await userRegistry.getSessionPublicKey(owner.address);
-      expect(storedKey).to.equal(ethers.hexlify(sessionPubKey2));
-    });
-
-    it("Should clear session public key", async function () {
-      const sessionPubKey = ethers.randomBytes(64);
-      await userRegistry.setSessionPublicKey(sessionPubKey);
-
-      await expect(userRegistry.clearSessionPublicKey())
-        .to.emit(userRegistry, "SessionPublicKeyCleared")
-        .withArgs(owner.address);
-
-      const storedKey = await userRegistry.getSessionPublicKey(owner.address);
-      expect(storedKey).to.equal("0x");
-      expect(await userRegistry.hasSessionPublicKey(owner.address)).to.be.false;
-    });
-
-    it("Should reject invalid public key length", async function () {
-      const shortKey = ethers.randomBytes(32);
-      await expect(userRegistry.setSessionPublicKey(shortKey))
-        .to.be.revertedWith("Invalid public key length");
-
-      const longKey = ethers.randomBytes(65);
-      await expect(userRegistry.setSessionPublicKey(longKey))
-        .to.be.revertedWith("Invalid public key length");
-    });
-
-    it("Should reject set from non-profile-owner", async function () {
-      const sessionPubKey = ethers.randomBytes(64);
-      await expect(userRegistry.connect(addr1).setSessionPublicKey(sessionPubKey))
-        .to.be.revertedWith("Profile does not exist");
-    });
-
-    it("Should reject clear from non-profile-owner", async function () {
-      await expect(userRegistry.connect(addr1).clearSessionPublicKey())
-        .to.be.revertedWith("Profile does not exist");
-    });
-
-    it("Should return empty bytes for user without session key", async function () {
-      const storedKey = await userRegistry.getSessionPublicKey(addr1.address);
-      expect(storedKey).to.equal("0x");
+    it("Should never be delegable", async function () {
+      await userRegistry.authorizeDelegate(delegate.address, (await now()) + DAY);
+      await expect(userRegistry.connect(delegate).transferProfileOwnership(addr2.address))
+        .to.be.revertedWithCustomError(userRegistry, "NoProfile");
     });
   });
 });

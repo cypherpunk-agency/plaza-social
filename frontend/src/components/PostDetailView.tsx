@@ -1,23 +1,22 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useMemo } from 'react';
 import type { UserPost, VoteType, VoteTally, Profile } from '../types/contracts';
 import { VotingWidget } from './VotingWidget';
 import { ReplyThread } from './ReplyThread';
 import { UserLink } from './UserAddress';
 import { formatTimestamp } from '../utils/formatters';
 import type { Provider, Signer } from '../utils/contracts';
-import { EntityType } from '../hooks/useVoting';
+import { entityIdOfCid } from '../lib/entity';
+import { FEED_REGISTRY } from '../lib/registry';
 import toast from 'react-hot-toast';
 
 interface PostDetailViewProps {
   post: UserPost;
-  userPostsAddress: string | null;
   repliesAddress: string | null;
   votingAddress: string | null;
   provider: Provider | null;
   signer?: Signer | null;
   currentAddress: string | null;
   // Voting functions
-  computeEntityId: (contractAddress: string, entityType: EntityType, entityIndex: number) => Promise<string>;
   getVoteTally: (entityId: string) => Promise<VoteTally>;
   getUserVote: (entityId: string) => Promise<VoteType>;
   vote: (entityId: string, voteType: VoteType) => Promise<void>;
@@ -32,8 +31,6 @@ interface PostDetailViewProps {
   disabled?: boolean;
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   isFollowing?: (address: string) => boolean;
@@ -43,13 +40,11 @@ interface PostDetailViewProps {
 
 export function PostDetailView({
   post,
-  userPostsAddress,
   repliesAddress,
   votingAddress,
   provider,
   signer,
   currentAddress,
-  computeEntityId,
   getVoteTally,
   getUserVote,
   vote,
@@ -63,15 +58,12 @@ export function PostDetailView({
   disabled = false,
   // Tooltip props
   getProfile,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing,
   onTip,
   canTip = false,
 }: PostDetailViewProps) {
-  const [entityId, setEntityId] = useState<string>('');
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(post.content);
   const [isSaving, setIsSaving] = useState(false);
@@ -79,20 +71,9 @@ export function PostDetailView({
 
   const isOwner = currentAddress?.toLowerCase() === post.profileOwner.toLowerCase();
 
-  // Compute entity ID for voting
-  const loadEntityId = useCallback(async () => {
-    if (!userPostsAddress) return;
-    try {
-      const id = await computeEntityId(userPostsAddress, EntityType.UserPost, post.index);
-      setEntityId(id);
-    } catch (err) {
-      console.error('Failed to compute entity ID:', err);
-    }
-  }, [userPostsAddress, post.index, computeEntityId]);
-
-  useEffect(() => {
-    loadEntityId();
-  }, [loadEntityId]);
+  // A vote is cast on the BYTES, so the tally is keyed on the CID. Pure keccak — no round trip, no
+  // failure mode, and the count is right on the first paint. See `lib/entity.ts`.
+  const entityId = useMemo(() => entityIdOfCid(post.cid) ?? '', [post.cid]);
 
   const handleSaveEdit = async () => {
     if (!editContent.trim() || isSaving) return;
@@ -169,8 +150,6 @@ export function PostDetailView({
                 size="sm"
                 getProfile={getProfile}
                 provider={provider}
-                onStartDM={onStartDM}
-                canSendDM={canSendDM}
                 onFollow={onFollow}
                 onUnfollow={onUnfollow}
                 isFollowing={isFollowing?.(post.profileOwner)}
@@ -264,16 +243,14 @@ export function PostDetailView({
             </div>
           )}
 
-          {/* Replies Section */}
-          {userPostsAddress && (
-            <div>
+          {/* Replies Section. Keyed on the post's CID, grouped under the profile feed. */}
+          <div>
               <h2 className="text-sm font-mono text-primary-500 mb-4">REPLIES</h2>
               <ReplyThread
                 repliesAddress={repliesAddress}
                 votingAddress={votingAddress}
-                userPostsAddress={userPostsAddress}
-                postIndex={post.index}
-                entityType={EntityType.UserPost}
+                parentCid={post.cid}
+                group={FEED_REGISTRY}
                 provider={provider}
                 signer={signer}
                 currentAddress={currentAddress}
@@ -281,16 +258,13 @@ export function PostDetailView({
                 onSelectUser={onSelectUser}
                 disabled={disabled}
                 getProfile={getProfile}
-                onStartDM={onStartDM}
-                canSendDM={canSendDM}
                 onFollow={onFollow}
                 onUnfollow={onUnfollow}
                 isFollowing={isFollowing}
                 onTip={onTip}
                 canTip={canTip}
               />
-            </div>
-          )}
+          </div>
         </div>
       </div>
     </div>

@@ -77,9 +77,18 @@ export interface StoredWallet {
 
 export interface UserPost {
   index: number;
+  /**
+   * The Bulletin CID of this post's body — its real identity.
+   *
+   * ⚠️ `index` is a POSITION in the loaded page, not a stable id. There is no on-chain index any
+   * more, only CIDs, so anything that must survive another post arriving (a vote tally, a deep
+   * link) keys on this. See `lib/entity.ts`.
+   */
+  cid: string;
   profileOwner: string;
   sender: string;
   content: string;
+  /** Epoch **milliseconds**. The whole migrated data layer is in ms; see `lib/wire.ts`. */
   timestamp: number;
   editedAt: number | null;
   isDeleted: boolean;
@@ -88,19 +97,35 @@ export interface UserPost {
 
 // ============ Replies Types ============
 
+/**
+ * One reply, i.e. one `post` object in the reply registry of its parent (`lib/registry.ts`).
+ *
+ * ⛔ **REPLIES ARE FLAT.** `parentReplyIndex`, `depth` and `children` are gone and must not come
+ * back as optional fields. The wire format gives a `post` one link — `prev`, its place in a chain —
+ * and no parent pointer, so a reply-to-a-reply is not representable and a field carrying one would
+ * be decoration that nothing on chain can enforce. See `hooks/useReplies.ts`.
+ *
+ * `parentId` is gone for the same reason it went from `Voting`: identity is the CID now, and the
+ * parent is the REGISTRY the reply was written into, not a value stored inside it.
+ */
 export interface Reply {
+  /**
+   * Position in the loaded page, NOT a stable id — it changes when someone else replies. Anything
+   * that must outlive that (a vote key, a link) uses `cid`.
+   */
   index: number;
-  parentId: string;
-  profileOwner: string;
+  /** The Bulletin CID of this reply's body — its real identity, and its vote key via `entityIdOfCid`. */
+  cid: string;
+  /** Who the object claims wrote it. */
+  author: string;
+  /** Who the INDEX attributes the head to. Unlike `author`, this one is authenticated. */
   sender: string;
   content: string;
+  /** Epoch **milliseconds**. The whole migrated data layer is in ms; see `lib/wire.ts`. */
   timestamp: number;
   editedAt: number | null;
   isDeleted: boolean;
-  parentReplyIndex: number; // 0 for top-level, 1-indexed for nested
-  depth: number;
   displayName?: string;
-  children?: Reply[];
 }
 
 // ============ Voting Types ============
@@ -123,10 +148,18 @@ export interface VoteTally {
 
 export interface ForumThread {
   index: number;
+  /** The CID of the thread ANNOUNCEMENT — its identity. See `UserPost.cid`. */
+  cid: string;
+  /**
+   * The CID of the opening POST, which is where the body lives. A thread announcement carries no
+   * body: it points at one. Empty when the announcement could not be resolved.
+   */
+  opCid: string;
   author: string;
   sender: string;
   title: string;
   content: string;
+  /** Epoch **milliseconds**. The whole migrated data layer is in ms; see `lib/wire.ts`. */
   timestamp: number;
   editedAt: number | null;
   isDeleted: boolean;

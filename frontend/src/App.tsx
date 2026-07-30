@@ -1,57 +1,58 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Toaster } from 'react-hot-toast';
-import toast from 'react-hot-toast';
-import { ethers } from 'ethers';
-import { useWallet } from './hooks/useWallet';
-import { useChannelRegistry } from './hooks/useChannelRegistry';
-import { useChannel } from './hooks/useChannel';
 import { useUserRegistry } from './hooks/useUserRegistry';
-import { useAppWallet, type WalletMode } from './hooks/useAppWallet';
-import { useDMRegistry } from './hooks/useDMRegistry';
-import { useDMConversation } from './hooks/useDMConversation';
-import { useSessionKeys } from './hooks/useSessionKeys';
+import { useHostSession } from './hooks/useHostSession';
+import { PublisherProvider } from './hooks/usePublisher';
 import { useDeployments } from './hooks/useDeployments';
 import { useFollowRegistry } from './hooks/useFollowRegistry';
-import { hasStandaloneWallet } from './utils/appWallet';
-import { truncateAddress } from './utils/formatters';
-import { AccountButton } from './components/AccountButton';
-import { ChatFeed } from './components/ChatFeed';
-import { MessageInput } from './components/MessageInput';
+import { SessionStatus } from './components/SessionStatus';
 import { Sidebar, type ViewMode, type SidebarSection } from './components/Sidebar';
 import { ProfileView } from './components/ProfileView';
-import { ChannelHeader } from './components/ChannelHeader';
-import { ChannelModerationModal } from './components/ChannelModerationModal';
-import { UserListPanel } from './components/UserListPanel';
-import { CreateChannelModal } from './components/CreateChannelModal';
-import { WalletChoiceModal } from './components/WalletChoiceModal';
-import { SessionAccountSetup } from './components/SessionAccountSetup';
-import { PrivateKeyExportModal } from './components/PrivateKeyExportModal';
-import { LinkBrowserWalletModal } from './components/LinkBrowserWalletModal';
-import { DMConversationView } from './components/DMConversationView';
-import { NewDMModal } from './components/NewDMModal';
+import { HostNotice } from './components/HostNotice';
 import { SettingsView } from './components/SettingsView';
 import { ForumView } from './components/ForumView';
 import { TipModal } from './components/TipModal';
-import type { PostingMode } from './types/contracts';
 
-// RPC URL for standalone wallet (Paseo Asset Hub testnet)
-const RPC_URL = 'https://testnet-passet-hub-eth-rpc.polkadot.io';
+/**
+ * ⛔ CHAT IS UNWIRED FROM THE UI, AND NOT DELETED FROM THE REPO.
+ *
+ * `useChannel`, `useChannelRegistry`, `ChatFeed`, `MessageInput`, `ChannelHeader`,
+ * `ChannelModerationModal`, `UserListPanel` and `CreateChannelModal` are all still on disk with no
+ * importer. They call `ChatChannel` and `ChannelRegistry`, which were deleted when rooms collapsed
+ * into `PostRegistry`, so every one of them fails as an unreadable `require(false)` revert. The UI
+ * must not offer what cannot work; the code stays because it is the starting point for the
+ * migration, and `useForumThread` already demonstrates the pattern it needs.
+ */
+
+/**
+ * The product name the host binds this session to, and the statement-store topic. Not cosmetic — the
+ * host refuses to sign when the identifier disagrees with the URL it loaded.
+ */
+const APP_NAME = 'plaza';
 
 function App() {
   // Load deployments from JSON file
-  const { currentNetwork: deployments } = useDeployments();
+  const { currentNetwork: deployments, error: deploymentsError } = useDeployments();
 
   // Get registry address from URL parameter or deployments.json
   const urlParams = new URLSearchParams(window.location.search);
-  const registryAddress = urlParams.get('registry') || deployments?.channelRegistry || null;
-  const dmRegistryAddress = urlParams.get('dmRegistry') || deployments?.dmRegistry || null;
+
+  /**
+   * ⚠️ `channelRegistry`, `forumThread`, `userPosts` and `replies` NO LONGER EXIST as contracts.
+   * They collapsed into the one `PostRegistry`, where a room, a board, a thread and a profile feed
+   * are all just `bytes32` registry ids. So all four of these now resolve to the same address, and
+   * what used to distinguish them is a registry id passed at call time instead of a deployment.
+   *
+   * These are kept as separate names only so the not-yet-migrated views keep compiling; each one is
+   * a marker for a call site that still speaks the old per-instance ABI.
+   */
+  const postRegistryAddress = urlParams.get('registry') || deployments?.postRegistry || null;
+  const registryAddress = postRegistryAddress;
   const followRegistryAddress = urlParams.get('followRegistry') || deployments?.followRegistry || null;
-  const userPostsAddress = deployments?.userPosts || null;
-  const repliesAddress = deployments?.replies || null;
+  const userPostsAddress = postRegistryAddress;
+  const repliesAddress = postRegistryAddress;
   const votingAddress = deployments?.voting || null;
-  const forumThreadAddress = deployments?.forumThread || null;
-  const directChannelAddress = urlParams.get('channel');
-  const directDMAddress = urlParams.get('dm');
+  const forumThreadAddress = postRegistryAddress;
   const directProfileAddress = urlParams.get('profile');
   const directThreadIndex = urlParams.get('thread');
   const directPostIndex = urlParams.get('post');
@@ -62,215 +63,103 @@ function App() {
 
     const params = new URLSearchParams(window.location.search);
     const urlRegistry = params.get('registry');
-    const urlDmRegistry = params.get('dmRegistry');
 
-    // Show in URL only if user provided addresses that differ from defaults
-    const registryDiffers = urlRegistry && urlRegistry !== deployments?.channelRegistry;
-    const dmRegistryDiffers = urlDmRegistry && urlDmRegistry !== deployments?.dmRegistry;
+    // Show in URL only if user provided an address that differs from the default
+    return !!urlRegistry && urlRegistry !== deployments?.postRegistry;
+  }, [deployments?.postRegistry]);
 
-    return registryDiffers || dmRegistryDiffers;
-  }, [deployments?.channelRegistry, deployments?.dmRegistry]);
+  // ═══════════════════════════════════════════════════════════════════════════════════════════════
+  // THE HOST SESSION. One hook, replacing `useWallet` (MetaMask) and `useAppWallet` (standalone
+  // in-app wallet), both deleted: architecture.md §1 decides the host container is the only surface,
+  // so there is no wallet mode to persist, no mode to choose, and nothing to "connect".
+  //
+  // Everything the app used to derive from `walletMode` now comes from `host.capabilities`, which is
+  // the ONLY thing components should branch on. See `lib/host/types.ts`.
+  // ═══════════════════════════════════════════════════════════════════════════════════════════════
+  const host = useHostSession(APP_NAME);
 
-  // Wallet mode: 'browser' | 'standalone' | 'none'
-  // Persisted in localStorage so disconnect state survives page refresh
-  const [walletMode, setWalletMode] = useState<WalletMode>(() => {
-    const storedMode = localStorage.getItem('walletMode') as WalletMode | null;
+  /**
+   * The shim that keeps the 16 un-migrated feature hooks working unchanged.
+   *
+   * ⚠️ TRANSITIONAL, AND ITS KEY NAMES ARE THE ONLY REASON IT EXISTS. Every hook takes
+   * `{ provider, signer }` shaped like this; they get migrated onto the seam once the contract
+   * interface and Bulletin data layer land. Keeping the names means that migration touches each hook
+   * once instead of twice. New code should read `host.*` directly and ignore this object.
+   *
+   * What went away with the wallet modes:
+   *   · `browserProvider` — there is no MetaMask provider to fish a signer out of.
+   *   · `profileSigner` vs `signer` — the split existed because owner-only operations had to be
+   *     signed by the profile owner while delegatable ones could use the session wallet. Both now
+   *     resolve to the same thing: the delegate arm, which the contract records as acting FOR the
+   *     user. Host-signed owner-only calls need the prompting arm and the contract layer, which is
+   *     not wired yet (`host.signer.host.submit === null`).
+   *   · `isStandalone` / `isBrowser` — no modes left.
+   */
+  const walletConfig = useMemo(
+    () => ({
+      activeProvider: host.provider,
+      activeAddress: host.address,
+      signer: host.signer.delegateSigner,
+      profileSigner: host.signer.delegateSigner,
+      canRead: host.canRead,
+      canWrite: host.canWrite,
+      isReady: host.canWrite,
+    }),
+    [host.provider, host.address, host.signer, host.canRead, host.canWrite],
+  );
 
-    // If user explicitly disconnected (stored 'none'), respect that
-    if (storedMode === 'none') {
-      return 'none';
-    }
-
-    // If stored mode is browser, use it (MetaMask will auto-reconnect)
-    if (storedMode === 'browser') {
-      return 'browser';
-    }
-
-    // If stored mode is standalone and wallet exists, use it
-    if (storedMode === 'standalone' && hasStandaloneWallet()) {
-      return 'standalone';
-    }
-
-    // If no stored mode but wallet exists, auto-connect (first visit after creating wallet)
-    if (!storedMode && hasStandaloneWallet()) {
-      return 'standalone';
-    }
-
-    return 'none';
-  });
-
-  // Persist wallet mode changes to localStorage
-  useEffect(() => {
-    localStorage.setItem('walletMode', walletMode);
-  }, [walletMode]);
-
-  // Standalone provider (for in-app wallet mode)
-  const [standaloneProvider] = useState(() => new ethers.JsonRpcProvider(RPC_URL));
-
-  // Browser wallet state
-  const browserWallet = useWallet();
-
-  // On-chain delegate check callback - set after userRegistry initializes
-  const [checkDelegateOnChain, setCheckDelegateOnChain] = useState<
-    ((delegateAddress: string) => Promise<boolean>) | undefined
-  >(undefined);
-
-  // App wallet (supports both modes)
-  const appWallet = useAppWallet({
-    userAddress: walletMode === 'browser' ? browserWallet.address : null,
-    provider: walletMode === 'standalone' ? standaloneProvider : browserWallet.provider,
-    mode: walletMode,
-    checkDelegateOnChain,
-  });
-
-  // Centralized wallet configuration - compute all wallet-related values in one place
-  const walletConfig = useMemo(() => {
-    const isStandalone = walletMode === 'standalone';
-    const isBrowser = walletMode === 'browser';
-
-    // Always use standalone provider for reads (always available via RPC)
-    // This allows browsing without wallet connection
-    const activeProvider = standaloneProvider;
-
-    // Active address only when explicitly connected (not when walletMode is 'none')
-    // This prevents MetaMask auto-connect from showing user as connected after disconnect
-    const activeAddress = isStandalone
-      ? appWallet.appWalletAddress
-      : isBrowser
-        ? browserWallet.address
-        : null;
-
-    // Can read data (just need a provider - always true)
-    const canRead = !!standaloneProvider;
-
-    // Can write (need active address + potentially signer)
-    const canWrite = isStandalone
-      ? appWallet.isReady && !!appWallet.appWallet
-      : isBrowser
-        ? !!browserWallet.address
-        : false;
-
-    // Signer for delegatable operations (posting messages, etc.):
-    // - Standalone mode: always use in-app wallet
-    // - Browser mode + authorized: use in-app wallet (gasless)
-    // - Browser mode + NOT authorized: null (falls back to browser wallet in createWriteContract)
-    const signer = isStandalone
-      ? appWallet.appWallet
-      : (appWallet.isAuthorized ? appWallet.appWallet : null);
-
-    // Profile signer - always the profile owner (not delegate):
-    // - Standalone mode: in-app wallet IS the profile owner
-    // - Browser mode: null (falls back to browser wallet signer via browserProvider)
-    // This is needed for owner-only operations (profile creation, delegate management, display name, bio)
-    const profileSigner = isStandalone ? appWallet.appWallet : null;
-
-    // Browser provider - needed for profile operations to get browser wallet signer
-    const browserProvider = isBrowser ? browserWallet.provider : null;
-
-    return {
-      activeProvider,
-      activeAddress,
-      signer,
-      profileSigner,
-      browserProvider,
-      canRead,
-      canWrite,
-      isReady: canWrite, // Keep for backwards compat
-      isStandalone,
-      isBrowser,
-    };
-  }, [walletMode, standaloneProvider, browserWallet.address, browserWallet.provider, appWallet.appWalletAddress, appWallet.appWallet, appWallet.isReady, appWallet.isAuthorized]);
-
-  // Channel registry - enabled for reading even without wallet
-  const channelRegistry = useChannelRegistry({
-    registryAddress,
-    provider: walletConfig.activeProvider,
-    signer: walletConfig.signer,
-    enabled: !!registryAddress,
-  });
-
-  // User registry (get address from channel registry)
-  const [userRegistryAddress, setUserRegistryAddress] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (registryAddress && walletConfig.activeProvider) {
-      channelRegistry.getUserRegistryAddress().then(setUserRegistryAddress).catch(() => {});
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [registryAddress, walletConfig.activeProvider]);
+  /**
+   * The UserRegistry address, straight from deployments.json.
+   *
+   * ⚠️ This used to be discovered at runtime via `channelRegistry.getUserRegistryAddress()` — a call
+   * on `ChannelRegistry`, which no longer exists. That call could only ever fail, so
+   * `userRegistryAddress` stayed null forever and the ENTIRE profile system was disabled: no display
+   * names anywhere, and "create a profile" could not work even once writes are wired. There is also
+   * no reason to ask the chain: the three other contracts pin UserRegistry as a compile-time
+   * constant, so this address is fixed by construction and deployments.json is its record.
+   */
+  const userRegistryAddress = deployments?.userRegistry ?? null;
 
   // User registry - enabled for reading even without wallet
   const userRegistry = useUserRegistry({
     registryAddress: userRegistryAddress,
+    // `writeProvider` was the MetaMask BrowserProvider, used only to fish a signer out of the page.
+    // There is no such provider any more; the read provider is the only one.
+    writeProvider: null,
     provider: walletConfig.activeProvider,
-    writeProvider: walletConfig.browserProvider, // Use browser provider for profile writes (to get signer)
     userAddress: walletConfig.activeAddress,
-    signer: walletConfig.profileSigner, // Use profile signer (not delegate) for owner-only operations
-    delegateSigner: walletConfig.signer, // Use delegate signer for link operations (gasless)
+    signer: walletConfig.profileSigner,
+    delegateSigner: walletConfig.signer,
+    // Owner-only writes (createProfile) go through the product account, never the delegate.
+    hostWrite: host.backend?.writeContract ?? null,
     enabled: !!userRegistryAddress,
   });
 
-  // Update the on-chain delegate check when userRegistry becomes available
-  useEffect(() => {
-    if (walletMode === 'browser' && userRegistry.isDelegate) {
-      setCheckDelegateOnChain(() => userRegistry.isDelegate);
-    } else if (walletMode !== 'browser') {
-      setCheckDelegateOnChain(undefined);
-    }
-  }, [walletMode, userRegistry.isDelegate]);
-
-  // Initialize standalone wallet if mode is standalone
-  useEffect(() => {
-    if (walletMode === 'standalone' && standaloneProvider && !appWallet.appWallet) {
-      appWallet.initializeStandaloneWallet(standaloneProvider);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [walletMode, standaloneProvider, appWallet.appWallet]);
-
-  // Refresh profile when wallet mode or active address changes
+  // Refresh the profile when the account appears or changes.
   useEffect(() => {
     if (walletConfig.activeAddress && walletConfig.activeProvider) {
       userRegistry.refresh();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [walletMode, walletConfig.activeAddress, walletConfig.activeProvider]);
+  }, [walletConfig.activeAddress, walletConfig.activeProvider]);
 
-  // Selected channel - URL param takes priority, then localStorage, then first available
-  const [selectedChannel, setSelectedChannel] = useState<string | null>(() => {
-    if (directChannelAddress) return directChannelAddress;
-    return localStorage.getItem('selectedChannel');
-  });
-
-  // Use first channel if none selected and channels are available
-  useEffect(() => {
-    if (!selectedChannel && channelRegistry.channels.length > 0) {
-      setSelectedChannel(channelRegistry.channels[0].channelAddress);
-    }
-  }, [selectedChannel, channelRegistry.channels]);
-
-  // Persist selected channel
-  useEffect(() => {
-    if (selectedChannel) {
-      localStorage.setItem('selectedChannel', selectedChannel);
-    }
-  }, [selectedChannel]);
-
-  // DM-related state - URL param takes priority, then localStorage
+  /**
+   * View mode — URL param takes priority, then localStorage.
+   *
+   * ⚠️ THIS MUST NEVER RESOLVE TO THE OLD `'channels'` VALUE. Two inputs can still supply it: a
+   * `?channel=0x…` link someone shared before chat was unwired, and a `viewMode` left in
+   * localStorage by an earlier session. Both are ignored and fall through to `'forum'`, because the
+   * alternative is a returning user landing on a view that renders nothing. The stale `?channel=`
+   * param is then dropped from the URL by the navigation effect below.
+   */
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
     // URL params imply view mode
     if (directProfileAddress) return 'profile';
-    if (directDMAddress) return 'dms';
     if (directThreadIndex) return 'forum';
-    if (directChannelAddress) return 'channels';
-    const stored = localStorage.getItem('viewMode') as ViewMode | null;
-    if (stored === 'dms' || stored === 'profile' || stored === 'forum' || stored === 'channels') return stored;
-    // Default to forum for new visitors
+    const stored = localStorage.getItem('viewMode');
+    if (stored === 'profile' || stored === 'forum') return stored;
+    // Default to forum for new visitors, and for anyone arriving with a chat view persisted.
     return 'forum';
-  });
-  const [selectedConversation, setSelectedConversation] = useState<string | null>(() => {
-    // URL dm param takes priority
-    if (directDMAddress) return directDMAddress;
-    return localStorage.getItem('selectedConversation');
   });
 
   // Profile view state
@@ -314,7 +203,7 @@ function App() {
         // ignore
       }
     }
-    return { channels: true, dms: true, following: true };
+    return { following: true };
   });
 
   const handleToggleSection = (section: SidebarSection) => {
@@ -347,26 +236,15 @@ function App() {
     }
   }, [selectedProfile, userRegistry.getProfile]);
 
-  // DM other participant name for page title (also used in DM view)
-  const [dmOtherParticipantName, setDmOtherParticipantName] = useState<string | null>(null);
-
-  // Persist view mode and selected conversation
+  // Persist view mode
   useEffect(() => {
     localStorage.setItem('viewMode', viewMode);
   }, [viewMode]);
-
-  useEffect(() => {
-    if (selectedConversation) {
-      localStorage.setItem('selectedConversation', selectedConversation);
-    }
-  }, [selectedConversation]);
 
   // Handle browser back/forward navigation
   useEffect(() => {
     const handlePopState = () => {
       const urlParams = new URLSearchParams(window.location.search);
-      const channel = urlParams.get('channel');
-      const dm = urlParams.get('dm');
       const profile = urlParams.get('profile');
       const thread = urlParams.get('thread');
       const post = urlParams.get('post');
@@ -382,14 +260,9 @@ function App() {
         setViewMode('profile');
         setSelectedProfile(profile);
         setSelectedPost(post ? parseInt(post, 10) : null);
-      } else if (dm) {
-        setViewMode('dms');
-        setSelectedConversation(dm);
-      } else if (channel) {
-        setViewMode('channels');
-        setSelectedChannel(channel);
       } else {
-        // Default to forum when no specific view
+        // Default to forum when no specific view. A `?channel=` param in the history entry is
+        // deliberately not honoured — chat has no view to return to.
         setViewMode('forum');
         setSelectedThread(null);
       }
@@ -398,19 +271,6 @@ function App() {
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
-
-  const [showNewDMModal, setShowNewDMModal] = useState(false);
-  const [dmOtherParticipant, setDmOtherParticipant] = useState<string | null>(null);
-  const [dmOtherPublicKey, setDmOtherPublicKey] = useState<string | null>(null);
-
-  // DM Registry hook - enabled for reading even without wallet
-  const dmRegistry = useDMRegistry({
-    registryAddress: dmRegistryAddress,
-    provider: walletConfig.activeProvider,
-    userAddress: walletConfig.activeAddress,
-    signer: walletConfig.signer,
-    enabled: !!dmRegistryAddress,
-  });
 
   // Follow Registry hook - enabled for reading even without wallet
   const followRegistry = useFollowRegistry({
@@ -421,125 +281,16 @@ function App() {
     enabled: !!followRegistryAddress,
   });
 
-  // Session keys hook (for encrypted DMs)
-  const sessionKeys = useSessionKeys({
-    setSessionPublicKeyOnChain: userRegistry.setSessionPublicKey,
-    clearSessionPublicKeyOnChain: userRegistry.clearSessionPublicKey,
-    getOnChainPublicKey: useCallback(
-      () => userRegistry.getSessionPublicKey(walletConfig.activeAddress || ''),
-      [userRegistry.getSessionPublicKey, walletConfig.activeAddress]
-    ),
-    enabled: walletConfig.isReady && !!userRegistryAddress,
-  });
-
-  // DM Conversation hook - enabled for reading even without wallet
-  const dmConversation = useDMConversation({
-    conversationAddress: selectedConversation,
-    provider: walletConfig.activeProvider,
-    userAddress: walletConfig.activeAddress,
-    signer: walletConfig.signer,
-    theirPublicKey: dmOtherPublicKey,
-    enabled: viewMode === 'dms' && !!selectedConversation,
-  });
-
-  // Load other participant's info when conversation changes
-  useEffect(() => {
-    if (selectedConversation && dmConversation.participant1 && dmConversation.participant2) {
-      const otherParticipant = dmConversation.participant1.toLowerCase() === walletConfig.activeAddress?.toLowerCase()
-        ? dmConversation.participant2
-        : dmConversation.participant1;
-      setDmOtherParticipant(otherParticipant);
-
-      // Load their public key (empty "0x" means no key set)
-      userRegistry.getSessionPublicKey(otherParticipant)
-        .then(key => setDmOtherPublicKey(key && key.length > 2 ? key : null))
-        .catch(() => setDmOtherPublicKey(null));
-
-      // Load their display name
-      userRegistry.getProfile(otherParticipant)
-        .then(profile => setDmOtherParticipantName(profile.exists ? profile.displayName : null))
-        .catch(() => setDmOtherParticipantName(null));
-    } else {
-      setDmOtherParticipant(null);
-      setDmOtherPublicKey(null);
-      setDmOtherParticipantName(null);
-    }
-  }, [selectedConversation, dmConversation.participant1, dmConversation.participant2, walletConfig.activeAddress, userRegistry]);
-
-  // Check if current user is a participant in the selected DM conversation
-  const isCurrentUserDMParticipant = useMemo(() => {
-    if (!selectedConversation || !walletConfig.activeAddress) return true; // Default to true when no data
-    if (!dmConversation.participant1 || !dmConversation.participant2) return true; // Still loading
-    const addr = walletConfig.activeAddress.toLowerCase();
-    return (
-      dmConversation.participant1.toLowerCase() === addr ||
-      dmConversation.participant2.toLowerCase() === addr
-    );
-  }, [selectedConversation, walletConfig.activeAddress, dmConversation.participant1, dmConversation.participant2]);
-
-  // State for both participant names (when user is not a participant)
-  const [dmBothParticipantNames, setDmBothParticipantNames] = useState<{ name1: string; name2: string } | null>(null);
-
-  // Fetch both participant names when viewing DM as non-participant
-  useEffect(() => {
-    if (!isCurrentUserDMParticipant && dmConversation.participant1 && dmConversation.participant2) {
-      Promise.all([
-        userRegistry.getProfile(dmConversation.participant1),
-        userRegistry.getProfile(dmConversation.participant2)
-      ]).then(([profile1, profile2]) => {
-        setDmBothParticipantNames({
-          name1: profile1.exists ? profile1.displayName : truncateAddress(dmConversation.participant1!),
-          name2: profile2.exists ? profile2.displayName : truncateAddress(dmConversation.participant2!)
-        });
-      }).catch(() => {
-        setDmBothParticipantNames({
-          name1: truncateAddress(dmConversation.participant1!),
-          name2: truncateAddress(dmConversation.participant2!)
-        });
-      });
-    } else {
-      setDmBothParticipantNames(null);
-    }
-  }, [isCurrentUserDMParticipant, dmConversation.participant1, dmConversation.participant2, userRegistry]);
-
-  // Auto-initialize session key when entering DMs
-  useEffect(() => {
-    if (viewMode === 'dms' && walletConfig.isReady && !sessionKeys.hasLocalKey && userRegistry.profile?.exists) {
-      const toastId = toast.loading('Setting up encrypted messaging...');
-      sessionKeys.initializeSessionKey()
-        .then(() => toast.success('Encrypted messaging ready!', { id: toastId }))
-        .catch(() => toast.error('Failed to setup encryption', { id: toastId }));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewMode, walletConfig.isReady, sessionKeys.hasLocalKey, userRegistry.profile?.exists]);
-
-  // Auto-create profile + session key for standalone wallet users
-  useEffect(() => {
-    const autoCreateProfile = async () => {
-      // Only for standalone mode, when wallet is ready, and no profile exists
-      if (walletMode !== 'standalone' || !walletConfig.isReady) return;
-      if (userRegistry.isLoading) return; // Wait for profile check to complete
-      if (userRegistry.profile === null) return; // Still loading
-      if (userRegistry.profile.exists) return; // Already has profile
-
-      const toastId = toast.loading('Setting up your profile...');
-      try {
-        await userRegistry.createDefaultProfile();
-        toast.success('Profile created!', { id: toastId });
-
-        // Also initialize session key for encrypted DMs
-        if (!sessionKeys.hasLocalKey) {
-          await sessionKeys.initializeSessionKey();
-        }
-      } catch (err) {
-        toast.error('Failed to create profile', { id: toastId });
-        console.error('Auto-profile creation failed:', err);
-      }
-    };
-
-    autoCreateProfile();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [walletMode, walletConfig.isReady, userRegistry.isLoading, userRegistry.profile, sessionKeys.hasLocalKey]);
+  // ⛔ THE AUTO-PROFILE-CREATION EFFECT IS GONE, ON PURPOSE.
+  //
+  // It fired on load for standalone-wallet users and sent a profile-creation transaction without
+  // being asked. Inside a host container that is not a silent convenience: profile creation is a
+  // contract call, every contract call reaches an unconditional signing modal (architecture.md §5),
+  // and creating contract storage costs a deposit. So the old behaviour would show every new visitor a
+  // signature request they did not ask for, before they had done anything.
+  //
+  // Profile creation now happens where the user initiated something — `handleSendMessage` below, and
+  // the settings screen.
 
   // Get display name helper - depends only on getProfile to avoid frequent recreation
   const getDisplayName = useCallback(async (address: string): Promise<string> => {
@@ -570,22 +321,13 @@ function App() {
     // Only include registry if config enabled or user originally provided it
     if (showRegistryInUrl) {
       if (registryAddress) url.searchParams.set('registry', registryAddress);
-      if (dmRegistryAddress) url.searchParams.set('dmRegistry', dmRegistryAddress);
     } else {
       url.searchParams.delete('registry');
-      url.searchParams.delete('dmRegistry');
     }
 
-    // Set channel, dm, profile, or thread param based on view mode
+    // Set channel, profile, or thread param based on view mode
     if (viewMode === 'channels' && selectedChannel) {
       url.searchParams.set('channel', selectedChannel);
-      url.searchParams.delete('dm');
-      url.searchParams.delete('profile');
-      url.searchParams.delete('post');
-      url.searchParams.delete('thread');
-    } else if (viewMode === 'dms' && selectedConversation) {
-      url.searchParams.set('dm', selectedConversation);
-      url.searchParams.delete('channel');
       url.searchParams.delete('profile');
       url.searchParams.delete('post');
       url.searchParams.delete('thread');
@@ -597,7 +339,6 @@ function App() {
         url.searchParams.delete('post');
       }
       url.searchParams.delete('channel');
-      url.searchParams.delete('dm');
       url.searchParams.delete('thread');
     } else if (viewMode === 'forum') {
       if (selectedThread !== null) {
@@ -606,13 +347,11 @@ function App() {
         url.searchParams.delete('thread');
       }
       url.searchParams.delete('channel');
-      url.searchParams.delete('dm');
       url.searchParams.delete('profile');
       url.searchParams.delete('post');
     } else {
       // No selection - remove all
       url.searchParams.delete('channel');
-      url.searchParams.delete('dm');
       url.searchParams.delete('profile');
       url.searchParams.delete('post');
       url.searchParams.delete('thread');
@@ -630,10 +369,6 @@ function App() {
       title = currentChannelName
         ? `${currentChannelName} - Chat - Plaza`
         : 'Chat - Plaza';
-    } else if (viewMode === 'dms') {
-      title = dmOtherParticipantName
-        ? `${dmOtherParticipantName} - Messages - Plaza`
-        : 'Messages - Plaza';
     } else if (viewMode === 'forum') {
       title = 'Forum - Plaza';
     }
@@ -647,16 +382,12 @@ function App() {
       window.history.pushState({}, title, newUrl);
       lastUrlRef.current = newUrl;
     }
-  }, [viewMode, selectedChannel, selectedConversation, selectedProfile, selectedPost, selectedThread, currentThreadTitle, currentProfileName, currentChannelName, dmOtherParticipantName, showRegistryInUrl, registryAddress, dmRegistryAddress]);
+  }, [viewMode, selectedChannel, selectedProfile, selectedPost, selectedThread, currentThreadTitle, currentProfileName, currentChannelName, showRegistryInUrl, registryAddress]);
 
   // Modals
-  const [showCreateChannelModal, setShowCreateChannelModal] = useState(false);
   const [showModerationModal, setShowModerationModal] = useState(false);
   const [canManageChannel, setCanManageChannel] = useState(false);
-  const [showWalletChoiceModal, setShowWalletChoiceModal] = useState(false);
-  const [showInAppSetup, setShowInAppSetup] = useState(false);
-  const [showExportKeyModal, setShowExportKeyModal] = useState(false);
-  const [showLinkBrowserModal, setShowLinkBrowserModal] = useState(false);
+  const [showHostNotice, setShowHostNotice] = useState(false);
   const [tipTargetAddress, setTipTargetAddress] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
 
@@ -669,18 +400,20 @@ function App() {
     }
   }, []);
 
-  // Helper to check if wallet is connected before write actions
-  // Shows wallet modal if not connected, returns false
+  /**
+   * Gate a write action on `canWrite` and explain the refusal if it fails.
+   *
+   * ⚠️ IT CHECKS `canWrite`, NEVER `canPushLive`. An account with a Bulletin authorization and no
+   * personhood proof has `canWrite && !canPushLive` — the common case — and must be able to post. The
+   * only thing it loses is instant propagation.
+   */
   const requireWallet = useCallback((): boolean => {
-    if (!walletConfig.canWrite) {
-      setShowWalletChoiceModal(true);
+    if (!host.canWrite) {
+      setShowHostNotice(true);
       return false;
     }
     return true;
-  }, [walletConfig.canWrite]);
-
-  // Track if user explicitly initiated browser wallet connection (to avoid showing modal on page load)
-  const [pendingBrowserLink, setPendingBrowserLink] = useState(false);
+  }, [host.canWrite]);
 
   // Check if user can manage the current channel
   useEffect(() => {
@@ -708,40 +441,35 @@ function App() {
     checkManagePermission();
   }, [channel.channelInfo, walletConfig.activeAddress, channel.isAdmin]);
 
-  // Note: We no longer force the wallet modal on app load.
-  // Users can browse freely. The modal only appears when they attempt a write action.
+  // Note: the host notice is never forced on load. Users browse freely; it only appears when they
+  // attempt a write and cannot.
 
-  // Check if MetaMask is available
-  const hasMetaMask = typeof window !== 'undefined' && typeof window.ethereum !== 'undefined';
+  // No profile yet, but there is an account to make one for.
+  const showCreateProfileBanner =
+    !!host.address && userRegistry.profile !== null && !userRegistry.profile.exists;
 
-  // Show profile creation banner - browser mode, connected, but no profile yet
-  const showCreateProfileBanner = walletMode === 'browser'
-    && browserWallet.address
-    && userRegistry.profile !== null  // Done loading
-    && !userRegistry.profile.exists;   // No profile yet
+  /**
+   * The posting key is worth setting up.
+   *
+   * ⚠️ IT IS AN OFFER, NOT A REQUIREMENT, and it must read that way. Without a delegate every post
+   * still works — it just costs a signing modal each time, and some people prefer signing everything.
+   *
+   * ⚠️ SCOPED TO THE PROFILE SCREEN. It used to render on EVERY screen for as long as no delegate
+   * existed, which turns an optional convenience into nagging: a persistent bar reads as an unfinished
+   * task, not an offer, and there is no way to dismiss it by declining. On the profile screen, next to
+   * the account it concerns, it is information; everywhere else it was noise.
+   */
+  const showDelegateBanner =
+    viewMode === 'profile' &&
+    !!host.address &&
+    userRegistry.profile?.exists &&
+    !!host.delegation &&
+    !host.delegation.active;
 
-  // Show session account setup banner (optional for gasless messaging) - only in browser mode
-  // Don't show while checking authorization on-chain
-  const showAppWalletBanner = walletMode === 'browser'
-    && browserWallet.address
-    && userRegistry.profile?.exists
-    && !appWallet.isAuthorized
-    && !appWallet.isCheckingAuth;
-
-  // Show profile setup banner - standalone mode, has profile but not customized yet
-  const showSetupProfileBanner = walletMode === 'standalone'
-    && appWallet.isReady
-    && userRegistry.profile?.exists
-    && !userRegistry.profile.bio;  // Empty bio = not customized
-
-  // Detect when browser wallet connects in standalone mode (for linking)
-  // Only show modal if user explicitly initiated the connection (pendingBrowserLink)
-  useEffect(() => {
-    if (walletMode === 'standalone' && browserWallet.address && pendingBrowserLink) {
-      setShowLinkBrowserModal(true);
-      setPendingBrowserLink(false);
-    }
-  }, [walletMode, browserWallet.address, pendingBrowserLink]);
+  // ⛔ REMOVED: `showSetupProfileBanner` (`profile.exists && !profile.bio`).
+  // A missing bio is not a problem. The banner nagged permanently over a perfectly good profile that
+  // simply had no bio, and it could only be silenced by writing one — i.e. the app demanded content
+  // the user had chosen not to provide. If a profile has a display name, it is set up.
 
   // Send message handler with auto-profile creation
   const handleSendMessage = async (content: string): Promise<boolean> => {
@@ -756,11 +484,6 @@ function App() {
         try {
           await userRegistry.createDefaultProfile();
           toast.success('Profile created!', { id: toastId });
-
-          // Also initialize session key for encrypted DMs
-          if (!sessionKeys.hasLocalKey) {
-            await sessionKeys.initializeSessionKey();
-          }
         } catch (err) {
           toast.error('Failed to create profile', { id: toastId });
           throw err;
@@ -777,131 +500,31 @@ function App() {
     }
   };
 
-  // Create channel handler
-  const handleCreateChannel = async (name: string, description: string, postingMode: PostingMode) => {
-    if (!requireWallet()) throw new Error('Wallet connection required');
-    const result = await channelRegistry.createChannel(name, description, postingMode);
-    setSelectedChannel(result.channelAddress);
-    return result;
-  };
-
-  const handleCreateUnlistedChannel = async (name: string, description: string) => {
-    if (!requireWallet()) throw new Error('Wallet connection required');
-    const result = await channelRegistry.deployUnlistedChannel(name, description);
-    setSelectedChannel(result.channelAddress);
-    return result;
-  };
-
-  // Start DM conversation handler
-  const handleStartDM = async (otherUserAddress: string) => {
-    if (!requireWallet()) return;
-    if (!walletConfig.activeAddress) return;
-
-    try {
-      // Check if conversation already exists
-      const existingConv = await dmRegistry.getConversation(
-        walletConfig.activeAddress,
-        otherUserAddress
-      );
-
-      if (existingConv && existingConv !== ethers.ZeroAddress) {
-        setSelectedConversation(existingConv);
-      } else {
-        // Create new conversation
-        const toastId = toast.loading('Creating conversation...');
-        try {
-          const newConvAddress = await dmRegistry.createConversation(otherUserAddress);
-          setSelectedConversation(newConvAddress);
-          toast.success('Conversation created!', { id: toastId });
-        } catch (err) {
-          toast.error('Failed to create conversation', { id: toastId });
-          throw err;
-        }
-      }
-
-      setViewMode('dms');
-      setShowNewDMModal(false);
-    } catch (err) {
-      console.error('Failed to start DM:', err);
-    }
-  };
-
-  // Send DM message handler
-  const handleSendDMMessage = async (content: string) => {
-    if (!requireWallet()) return;
-    // Auto-create profile if user doesn't have one
-    if (!userRegistry.profile?.exists) {
-      const toastId = toast.loading('Creating profile...');
-      try {
-        await userRegistry.createDefaultProfile();
-        toast.success('Profile created!', { id: toastId });
-
-        // Also initialize session key for encrypted DMs
-        if (!sessionKeys.hasLocalKey) {
-          await sessionKeys.initializeSessionKey();
-        }
-      } catch (err) {
-        toast.error('Failed to create profile', { id: toastId });
-        throw err;
-      }
-    }
-
-    await dmConversation.sendMessage(content);
-  };
-
-  // Setup in-app wallet handler (authorize + fund)
-  const handleSetupAppWallet = async () => {
-    await appWallet.authorizeDelegate(userRegistry.addDelegate);
-  };
-
-  // Wallet choice handlers
-  const handleSelectBrowserWallet = async () => {
-    setShowWalletChoiceModal(false);
-    setWalletMode('browser');
-    await browserWallet.connect();
-  };
-
-  const handleSelectInAppWallet = () => {
-    setShowWalletChoiceModal(false);
-    setShowInAppSetup(true);
-    // Initialize the standalone wallet
-    appWallet.initializeStandaloneWallet(standaloneProvider);
-  };
-
-  const handleInAppSetupContinue = () => {
-    setShowInAppSetup(false);
-    setWalletMode('standalone');
-  };
-
-  const handleInAppSetupBack = () => {
-    setShowInAppSetup(false);
-    setShowWalletChoiceModal(true);
-  };
-
-  // Link browser wallet handlers
-  const handleAddBrowserAsDelegate = async () => {
-    if (!browserWallet.address) return;
-    await userRegistry.addDelegate(browserWallet.address);
-  };
-
-  const handleTransferOwnership = async () => {
-    if (!browserWallet.address) return;
-    await userRegistry.transferProfileOwnership(browserWallet.address);
-    // After transfer, switch to browser mode (useEffect will refresh profile)
-    setWalletMode('browser');
-    setShowLinkBrowserModal(false);
-  };
-
-  const handleSwitchToBrowser = () => {
-    // Simply switch to browser wallet mode (abandon in-app wallet)
-    setWalletMode('browser');
-    setShowLinkBrowserModal(false);
-  };
-
-  // Determine if user can post
-  const canPost = !!walletConfig.activeAddress;
+  /**
+   * ⚠️ `canWrite`, NOT `canPushLive`, AND NOT `delegation.active`.
+   *
+   * The composer is enabled whenever the session can write at all. It is deliberately NOT gated on
+   * live-update capability (see `lib/host/types.ts`) and deliberately NOT gated on having a delegate:
+   * with no delegate a post costs an extra signing prompt, which is an inconvenience, not an
+   * inability. Gating on either would disable posting for the majority of real accounts.
+   */
+  const canPost = host.canWrite;
 
   return (
+    /**
+     * The write path, provided once for the whole tree.
+     *
+     * ⚠️ CONTEXT, NOT PROPS — the composers are four and five levels down and every component in
+     * between is presentation. `null` inside means this session cannot write, which is the honest
+     * read-only state rather than an error. See `hooks/usePublisher.tsx`.
+     */
+    <PublisherProvider
+      postRegistryAddress={postRegistryAddress}
+      provider={walletConfig.activeProvider}
+      author={walletConfig.activeAddress}
+      putBlob={host.backend ? (bytes, opts) => host.backend!.putBlob(bytes, opts) : null}
+      hostWrite={host.backend?.writeContract ?? null}
+    >
     <div className="h-screen bg-black flex flex-col scanline">
       <Toaster
         position="top-right"
@@ -955,20 +578,22 @@ function App() {
               PLAZA
             </h1>
             <span className="text-sm text-accent-400 text-shadow-neon-sm font-mono">
-              DECENTRALIZED SOCIAL {walletMode === 'standalone' && '(IN-APP WALLET)'}
+              DECENTRALIZED SOCIAL
             </span>
           </button>
-          <AccountButton
-            walletAddress={walletConfig.activeAddress}
-            isConnecting={browserWallet.isConnecting}
-            onConnect={() => setShowWalletChoiceModal(true)}
+          <SessionStatus
+            isInitializing={host.isInitializing}
+            canRead={host.canRead}
+            canWrite={host.canWrite}
+            insideHost={host.capabilities.insideHost}
+            onExplain={() => setShowHostNotice(true)}
           />
         </div>
       </header>
 
       {/* Main Content */}
       <main className="flex-1 flex overflow-hidden">
-        {/* Sidebar with channels, DMs, and following */}
+        {/* Sidebar with channels and following */}
         {registryAddress && (
           <Sidebar
             channels={channelRegistry.channels}
@@ -977,17 +602,10 @@ function App() {
               setSelectedChannel(addr);
               setViewMode('channels');
             }}
-            onCreateChannel={() => setShowCreateChannelModal(true)}
             provider={walletConfig.activeProvider}
             isConnected={!!walletConfig.activeAddress}
             viewMode={viewMode}
             onViewModeChange={setViewMode}
-            dmConversations={dmRegistry.conversations}
-            selectedConversation={selectedConversation}
-            onSelectConversation={setSelectedConversation}
-            onNewDM={() => setShowNewDMModal(true)}
-            dmLoading={dmRegistry.isLoading}
-            dmRegistryAvailable={!!dmRegistryAddress}
             getDisplayName={getDisplayName}
             following={followRegistry.following}
             selectedProfile={selectedProfile}
@@ -997,7 +615,6 @@ function App() {
             onToggleSection={handleToggleSection}
             currentUserAddress={walletConfig.activeAddress}
             currentUserDisplayName={userRegistry.profile?.displayName || null}
-            onConnectWallet={() => setShowWalletChoiceModal(true)}
             forumAvailable={!!forumThreadAddress}
           />
         )}
@@ -1006,15 +623,20 @@ function App() {
         <div className="flex-1 flex relative">
           {/* Chat area */}
           <div className="flex-1 flex flex-col bg-black">
-          {/* No registry warning */}
+          {/* Contracts could not be located. This used to say "NO REGISTRY SPECIFIED / add
+              ?registry=0x… to URL", which asked the user to supply a ChannelRegistry — a contract
+              that no longer exists. Addresses now come from deployments.json, so if we get here it is
+              our configuration that is broken, not the user's URL, and the message should say so. */}
           {!registryAddress && !directChannelAddress && (
             <div className="border-b-2 border-yellow-500 bg-yellow-950 bg-opacity-20 p-4">
               <div className="flex items-center font-mono">
                 <span className="text-yellow-500 mr-3 text-xl">!</span>
                 <div>
-                  <p className="text-yellow-400 text-sm">NO REGISTRY SPECIFIED</p>
+                  <p className="text-yellow-400 text-sm">CONTRACT ADDRESSES NOT LOADED</p>
                   <p className="text-yellow-600 text-xs mt-1">
-                    Add <code className="text-yellow-400">?registry=0x...</code> to URL
+                    {deploymentsError
+                      ? deploymentsError
+                      : 'deployments.json did not provide a postRegistry address for this network.'}
                   </p>
                 </div>
               </div>
@@ -1039,50 +661,42 @@ function App() {
             </div>
           )}
 
-          {/* Session account setup banner (optional for gasless messaging) */}
-          {showAppWalletBanner && (
+          {/* Posting-key offer. Optional, and worded as one — posting works without it, at the cost
+              of one signing prompt per post. */}
+          {showDelegateBanner && (
             <div className="border-b-2 border-accent-500 bg-accent-950 bg-opacity-20 p-4">
               <div className="flex items-center justify-between font-mono">
                 <div className="flex items-center">
                   <span className="text-accent-500 mr-3">i</span>
-                  <span className="text-accent-400 text-sm">Set up session account for gasless messaging</span>
+                  <span className="text-accent-400 text-sm">
+                    Set up a posting key to stop approving every post
+                  </span>
                 </div>
                 <button
                   onClick={() => setViewMode('settings')}
                   className="px-4 py-1 bg-accent-900 text-accent-400 border border-accent-500 text-sm"
                 >
-                  SETUP SESSION ACCOUNT
+                  SET UP POSTING KEY
                 </button>
               </div>
             </div>
           )}
 
-          {/* Profile setup banner for standalone users */}
-          {showSetupProfileBanner && (
-            <div className="border-b-2 border-accent-500 bg-accent-950 bg-opacity-20 p-4">
-              <div className="flex items-center justify-between font-mono">
-                <div className="flex items-center">
-                  <span className="text-accent-500 mr-3">i</span>
-                  <span className="text-accent-400 text-sm">Set up your profile with a username and bio</span>
-                </div>
-                <button
-                  onClick={() => setViewMode('settings')}
-                  className="px-4 py-1 bg-accent-900 text-accent-400 border border-accent-500 text-sm"
-                >
-                  SET UP PROFILE
-                </button>
-              </div>
-            </div>
-          )}
+          {/* ⛔ The "Set up your profile with a username and bio" banner was deleted here — see the
+              note next to `showDelegateBanner`. A profile with a display name is set up; a missing bio
+              is a choice, not an incomplete task, and the banner could only be dismissed by writing
+              one. */}
 
-          {/* Error display */}
-          {(browserWallet.error || channel.error || userRegistry.error) && (
+          {/* Error display.
+              ⚠️ `capabilities.reason` is NOT included here on purpose. It is not an error — it is the
+              normal state of a visitor who is reading, and putting it in a red banner would tell every
+              anonymous reader that something is broken. It belongs in the host notice and the settings
+              screen, where it reads as an explanation. */}
+          {(channel.error || userRegistry.error) && (
             <div className="border-b-2 border-red-500 bg-red-950 bg-opacity-20 p-4">
               <div className="flex items-center font-mono">
                 <span className="text-red-500 mr-3">X</span>
-                <p className="text-red-400 text-sm">
-                  {browserWallet.error || channel.error || userRegistry.error}
-                </p>
+                <p className="text-red-400 text-sm">{channel.error || userRegistry.error}</p>
               </div>
             </div>
           )}
@@ -1107,13 +721,11 @@ function App() {
                 onSelectUser={openProfile}
                 getProfile={userRegistry.getProfile}
                 provider={walletConfig.activeProvider}
-                onStartDM={dmRegistryAddress ? handleStartDM : undefined}
-                canSendDM={!!userRegistry.profile && sessionKeys.hasLocalKey}
                 onFollow={followRegistry.follow}
                 onUnfollow={followRegistry.unfollow}
                 isFollowing={followRegistry.isFollowingSync}
                 onTip={setTipTargetAddress}
-                canTip={!!(walletConfig.signer || walletConfig.browserProvider)}
+                canTip={host.canWrite}
               />
 
               {/* Message input */}
@@ -1121,44 +733,15 @@ function App() {
                 onSend={handleSendMessage}
                 disabled={!canPost}
                 isSending={isSending}
-                onConnectWallet={() => setShowWalletChoiceModal(true)}
+                onExplainDisabled={() => setShowHostNotice(true)}
               />
             </>
-          ) : viewMode === 'dms' ? (
-            // DM conversation view
-            selectedConversation ? (
-              <DMConversationView
-                messages={dmConversation.messages}
-                isLoading={dmConversation.isLoading}
-                isSending={dmConversation.isSending}
-                onSendMessage={handleSendDMMessage}
-                otherParticipantName={dmOtherParticipantName}
-                otherParticipantAddress={dmOtherParticipant || ''}
-                canSend={!!dmOtherPublicKey && sessionKeys.hasLocalKey && !!walletConfig.activeAddress && isCurrentUserDMParticipant}
-                noSessionKey={!dmOtherPublicKey}
-                isParticipant={isCurrentUserDMParticipant}
-                participantNames={dmBothParticipantNames}
-              />
-            ) : (
-              <div className="flex-1 flex items-center justify-center">
-                <div className="text-center">
-                  <p className="text-primary-600 font-mono text-lg mb-2">SELECT A CONVERSATION</p>
-                  <p className="text-primary-700 font-mono text-sm">
-                    Choose a conversation from the sidebar or start a new one
-                  </p>
-                </div>
-              </div>
-            )
           ) : viewMode === 'profile' ? (
             // Profile view
             <ProfileView
               userAddress={selectedProfile}
               currentUserAddress={walletConfig.activeAddress}
               getProfile={userRegistry.getProfile}
-              onStartDM={dmRegistryAddress ? handleStartDM : undefined}
-              dmRegistryAvailable={!!dmRegistryAddress}
-              canSendDM={!!userRegistry.profile && sessionKeys.hasLocalKey}
-              hasSessionPublicKey={userRegistry.hasSessionPublicKey}
               isFollowing={selectedProfile ? followRegistry.isFollowingSync(selectedProfile) : false}
               onFollow={followRegistry.follow}
               onUnfollow={followRegistry.unfollow}
@@ -1178,14 +761,12 @@ function App() {
               onAddLink={userRegistry.addLink}
               onRemoveLink={userRegistry.removeLink}
               sessionWallet={walletConfig.signer}
-              sessionWalletAddress={appWallet.appWalletAddress}
-              sessionWalletBalance={appWallet.balance}
-              browserProvider={walletConfig.browserProvider}
-              browserWalletAddress={browserWallet.address}
+              sessionWalletAddress={host.delegation?.address ?? null}
+              sessionWalletBalance={host.delegation?.balance ?? 0n}
               isFollowingUser={followRegistry.isFollowingSync}
               onTip={setTipTargetAddress}
-              canTip={!!walletConfig.signer || !!walletConfig.browserProvider}
-              onConnectWallet={() => setShowWalletChoiceModal(true)}
+              canTip={host.canWrite}
+              onConnectWallet={() => setShowHostNotice(true)}
               selectedPostFromUrl={selectedPost}
               onPostChange={setSelectedPost}
             />
@@ -1206,42 +787,26 @@ function App() {
               onThreadChange={setSelectedThread}
               onThreadTitleChange={setCurrentThreadTitle}
               getProfile={userRegistry.getProfile}
-              onStartDM={dmRegistryAddress ? handleStartDM : undefined}
-              canSendDM={!!userRegistry.profile && sessionKeys.hasLocalKey}
               onFollow={followRegistry.follow}
               onUnfollow={followRegistry.unfollow}
               isFollowing={followRegistry.isFollowingSync}
               onTip={setTipTargetAddress}
-              canTip={!!walletConfig.signer || !!walletConfig.browserProvider}
+              canTip={host.canWrite}
             />
           ) : viewMode === 'settings' ? (
             // Settings view
             <SettingsView
-              walletAddress={walletConfig.activeAddress}
-              isConnecting={browserWallet.isConnecting}
-              onConnect={() => setShowWalletChoiceModal(true)}
-              onDisconnect={() => {
-                browserWallet.disconnect();
-                appWallet.disconnect();
-                setWalletMode('none');
-                // Switch to channels view so user can continue browsing as guest
-                setViewMode('channels');
-              }}
+              capabilities={host.capabilities}
+              label={host.label}
+              diagnostics={host.diagnostics}
               profile={userRegistry.profile}
               onCreateProfile={userRegistry.createProfile}
-              appWalletAddress={appWallet.appWalletAddress}
-              appWalletBalance={appWallet.balance}
-              isAuthorized={appWallet.isAuthorized}
-              onSetupAppWallet={handleSetupAppWallet}
-              onTopUp={appWallet.fundWallet}
-              walletMode={walletMode}
-              onExportPrivateKey={() => setShowExportKeyModal(true)}
-              onConnectBrowserWallet={() => {
-                setPendingBrowserLink(true);
-                browserWallet.connect();
-              }}
               onUpdateDisplayName={userRegistry.updateDisplayName}
               onUpdateBio={userRegistry.updateBio}
+              delegation={host.delegation}
+              onAuthorizeDelegate={host.authorizeDelegate}
+              onRevokeDelegate={host.revokeDelegate}
+              onRequestAllowanceAgain={host.requestAllowanceAgain}
             />
           ) : null}
           </div>
@@ -1255,59 +820,27 @@ function App() {
               onSelectUser={openProfile}
               getProfile={userRegistry.getProfile}
               provider={walletConfig.activeProvider}
-              onStartDM={dmRegistryAddress ? handleStartDM : undefined}
-              canSendDM={!!userRegistry.profile && sessionKeys.hasLocalKey}
               onFollow={followRegistry.follow}
               onUnfollow={followRegistry.unfollow}
               isFollowing={followRegistry.isFollowingSync}
               onTip={setTipTargetAddress}
-              canTip={!!(walletConfig.signer || walletConfig.browserProvider)}
+              canTip={host.canWrite}
             />
           )}
         </div>
       </main>
 
-      {/* Modals */}
-      <WalletChoiceModal
-        isOpen={showWalletChoiceModal}
-        onSelectBrowser={handleSelectBrowserWallet}
-        onSelectInApp={handleSelectInAppWallet}
-        hasMetaMask={hasMetaMask}
-        onClose={() => setShowWalletChoiceModal(false)}
-      />
-
-      <SessionAccountSetup
-        isOpen={showInAppSetup}
-        walletAddress={appWallet.appWalletAddress || ''}
-        balance={appWallet.balance}
-        onContinue={handleInAppSetupContinue}
-        onRefreshBalance={appWallet.refreshBalance}
-        onBack={handleInAppSetupBack}
-      />
-
-      <PrivateKeyExportModal
-        isOpen={showExportKeyModal}
-        onClose={() => setShowExportKeyModal(false)}
-        privateKey={appWallet.getPrivateKey() || ''}
-      />
-
-      <LinkBrowserWalletModal
-        isOpen={showLinkBrowserModal}
-        onClose={() => setShowLinkBrowserModal(false)}
-        inAppAddress={appWallet.appWalletAddress || ''}
-        browserAddress={browserWallet.address || ''}
-        inAppHasProfile={userRegistry.profile?.exists ?? false}
-        checkBrowserHasProfile={() => userRegistry.hasProfile(browserWallet.address || '')}
-        onAddAsDelegate={handleAddBrowserAsDelegate}
-        onTransferOwnership={handleTransferOwnership}
-        onSwitchToBrowser={handleSwitchToBrowser}
-      />
-
-      <CreateChannelModal
-        isOpen={showCreateChannelModal}
-        onClose={() => setShowCreateChannelModal(false)}
-        onCreate={handleCreateChannel}
-        onCreateUnlisted={handleCreateUnlistedChannel}
+      {/* Modals.
+          `HostNotice` replaces WalletChoiceModal, SessionAccountSetup, PrivateKeyExportModal and
+          LinkBrowserWalletModal — all four existed to manage a choice between MetaMask and an in-app
+          wallet, which architecture.md §1 removes. There is no choice to present, so what is left is
+          an explanation plus the diagnostics record. */}
+      <HostNotice
+        isOpen={showHostNotice}
+        onClose={() => setShowHostNotice(false)}
+        capabilities={host.capabilities}
+        label={host.label}
+        diagnostics={host.diagnostics}
       />
 
       <ChannelModerationModal
@@ -1323,15 +856,6 @@ function App() {
         setPostingMode={channel.setPostingMode}
       />
 
-      <NewDMModal
-        isOpen={showNewDMModal}
-        onClose={() => setShowNewDMModal(false)}
-        onCreateConversation={dmRegistry.createConversation}
-        checkConversationExists={dmRegistry.conversationExists}
-        getExistingConversation={dmRegistry.getConversation}
-        userAddress={walletConfig.activeAddress}
-      />
-
       {/* Tip Modal (triggered from tooltip) */}
       {tipTargetAddress && (
         <TipModal
@@ -1339,15 +863,14 @@ function App() {
           onClose={() => setTipTargetAddress(null)}
           recipientAddress={tipTargetAddress}
           sessionWallet={walletConfig.signer}
-          sessionWalletAddress={appWallet.appWalletAddress}
-          sessionWalletBalance={appWallet.balance}
-          browserProvider={walletConfig.browserProvider}
-          browserWalletAddress={browserWallet.address}
-          onConnectWallet={() => setShowWalletChoiceModal(true)}
+          sessionWalletAddress={host.delegation?.address ?? null}
+          sessionWalletBalance={host.delegation?.balance ?? 0n}
+          onConnectWallet={() => setShowHostNotice(true)}
         />
       )}
 
       </div>
+    </PublisherProvider>
   );
 }
 

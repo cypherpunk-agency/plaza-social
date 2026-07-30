@@ -37,7 +37,6 @@ export function FeedView({
   });
 
   const {
-    computeEntityId,
     getVoteTally,
     getUserVote,
     vote,
@@ -118,13 +117,11 @@ export function FeedView({
               <PostCard
                 key={`${post.profileOwner}-${post.index}`}
                 post={post}
-                userPostsAddress={userPostsAddress}
                 repliesAddress={repliesAddress}
                 votingAddress={votingAddress}
                 provider={provider}
                 signer={signer}
                 currentAddress={currentAddress}
-                computeEntityId={computeEntityId}
                 getVoteTally={getVoteTally}
                 getUserVote={getUserVote}
                 vote={vote}

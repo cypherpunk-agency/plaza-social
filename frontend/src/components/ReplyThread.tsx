@@ -1,17 +1,34 @@
-import { useState, useEffect, useCallback } from 'react';
-import type { Reply, VoteType, VoteTally, Profile } from '../types/contracts';
-import { useReplies, EntityType } from '../hooks/useReplies';
-import { useVoting, EntityType as VotingEntityType } from '../hooks/useVoting';
+import { useState } from 'react';
+import type { Profile } from '../types/contracts';
+import { useReplies } from '../hooks/useReplies';
+import { useVoting } from '../hooks/useVoting';
 import { ReplyItem } from './ReplyItem';
+import { entityIdOfCid } from '../lib/entity';
+import { reportError } from '../lib/reportError';
 import type { Provider, Signer } from '../utils/contracts';
 import toast from 'react-hot-toast';
 
+/**
+ * The replies under one post or thread.
+ *
+ * ⛔ **FLAT, ON PURPOSE.** There is no reply-to-a-reply control here any more, because there is no
+ * parent pointer in the wire format to carry one (`hooks/useReplies.ts` explains it in full). A
+ * button that can only produce an error is worse than no button, so the nesting affordances were
+ * removed rather than disabled.
+ *
+ * Every reply now carries a `cid`, so its vote id is `entityIdOfCid(reply.cid)` — computed during
+ * render, synchronously, cannot fail. The old async `getReplyEntityId` stub that deliberately
+ * returned `''` (and therefore rendered no vote control at all) is gone with the contract it was
+ * apologising for.
+ */
 interface ReplyThreadProps {
+  /** The PostRegistry address. Named for the deleted contract so callers need no change. */
   repliesAddress: string | null;
   votingAddress: string | null;
-  userPostsAddress: string | null;
-  postIndex: number;
-  entityType?: typeof EntityType[keyof typeof EntityType]; // Default: UserPost
+  /** The CID of the thread announcement or post being replied to. */
+  parentCid: string | null;
+  /** The board or feed this conversation hangs off, used as `HeadSet.group`. */
+  group?: string;
   provider: Provider | null;
   signer?: Signer | null;
   currentAddress: string | null;
@@ -20,8 +37,6 @@ interface ReplyThreadProps {
   disabled?: boolean;
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   isFollowing?: (address: string) => boolean;
@@ -32,9 +47,8 @@ interface ReplyThreadProps {
 export function ReplyThread({
   repliesAddress,
   votingAddress,
-  userPostsAddress,
-  postIndex,
-  entityType = EntityType.UserPost,
+  parentCid,
+  group,
   provider,
   signer,
   currentAddress,
@@ -43,36 +57,30 @@ export function ReplyThread({
   disabled = false,
   // Tooltip props
   getProfile,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing,
   onTip,
   canTip = false,
 }: ReplyThreadProps) {
-  const [replyingTo, setReplyingTo] = useState<number | null>(null); // null = new reply form hidden, 0 = top-level, 1+ = nested
+  const [isComposing, setIsComposing] = useState(false);
   const [replyContent, setReplyContent] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [childRepliesMap, setChildRepliesMap] = useState<Record<number, Reply[]>>({});
-  const [loadingChildren, setLoadingChildren] = useState<Set<number>>(new Set());
 
   const {
     replies,
     replyCount,
     isLoading,
+    canReply,
     addReply,
     editReply,
     deleteReply,
     refresh,
-    getChildReplies,
   } = useReplies({
     repliesAddress,
-    parentContract: userPostsAddress,
-    entityType,
-    entityIndex: postIndex,
+    parentCid,
+    group,
     provider,
-    signer,
     getDisplayName,
     enabled: !disabled,
   });
@@ -82,7 +90,6 @@ export function ReplyThread({
     removeVote,
     getVoteTally,
     getUserVote,
-    computeEntityId,
     isVoting,
   } = useVoting({
     votingAddress,
@@ -92,106 +99,26 @@ export function ReplyThread({
     enabled: !disabled,
   });
 
-  // Compute entity ID for a reply
-  const getReplyEntityId = useCallback(
-    async (replyIndex: number): Promise<string> => {
-      if (!repliesAddress) return '';
-      return computeEntityId(repliesAddress, VotingEntityType.Reply, replyIndex);
-    },
-    [repliesAddress, computeEntityId]
-  );
-
-  // Load child replies for a parent reply
-  const loadChildReplies = useCallback(
-    async (parentReplyIndex: number) => {
-      if (loadingChildren.has(parentReplyIndex)) return;
-
-      setLoadingChildren(prev => new Set(prev).add(parentReplyIndex));
-      try {
-        const children = await getChildReplies(parentReplyIndex);
-        setChildRepliesMap(prev => ({
-          ...prev,
-          [parentReplyIndex]: children,
-        }));
-      } catch (err) {
-        console.error('Failed to load child replies:', err);
-      } finally {
-        setLoadingChildren(prev => {
-          const next = new Set(prev);
-          next.delete(parentReplyIndex);
-          return next;
-        });
-      }
-    },
-    [getChildReplies, loadingChildren]
-  );
-
-  // Load children for all top-level replies
-  useEffect(() => {
-    replies.forEach((reply) => {
-      loadChildReplies(reply.index);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [replies]);
-
   const handleSubmitReply = async () => {
-    if (!replyContent.trim() || isSubmitting || replyingTo === null) return;
+    if (!replyContent.trim() || isSubmitting) return;
 
     setIsSubmitting(true);
     try {
-      await addReply(replyContent, replyingTo);
+      await addReply(replyContent);
       setReplyContent('');
-      setReplyingTo(null);
-      toast.success('Reply added');
+      setIsComposing(false);
+      toast.success('Reply posted');
     } catch (error) {
-      console.error('Failed to add reply:', error);
-      toast.error('Failed to add reply');
+      // `reportError`, not `toast.error('Failed…')`. The useful part of a failure here is a
+      // WireError naming the field, or an ethers cause chain naming a selector — and neither
+      // survives being flattened into one generic line. See `lib/errors.ts`.
+      reportError('post your reply', error);
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  const handleReplyClick = (parentReplyIndex: number) => {
-    setReplyingTo(parentReplyIndex);
-    setReplyContent('');
-  };
-
-  const renderReply = (reply: Reply): React.ReactNode => {
-    const children = childRepliesMap[reply.index] || [];
-
-    return (
-      <ReplyItemWithVoting
-        key={reply.index}
-        reply={reply}
-        repliesAddress={repliesAddress}
-        provider={provider}
-        currentAddress={currentAddress}
-        getReplyEntityId={getReplyEntityId}
-        getVoteTally={getVoteTally}
-        getUserVote={getUserVote}
-        vote={vote}
-        removeVote={removeVote}
-        isVoting={isVoting}
-        onReply={handleReplyClick}
-        onEdit={editReply}
-        onDelete={deleteReply}
-        onSelectUser={onSelectUser}
-        children={children}
-        renderChild={renderReply}
-        disabled={disabled}
-        getProfile={getProfile}
-        onStartDM={onStartDM}
-        canSendDM={canSendDM}
-        onFollow={onFollow}
-        onUnfollow={onUnfollow}
-        isFollowing={isFollowing}
-        onTip={onTip}
-        canTip={canTip}
-      />
-    );
-  };
-
-  if (isLoading) {
+  if (isLoading && replies.length === 0) {
     return (
       <div className="py-4 font-mono text-xs text-primary-600">
         Loading replies...
@@ -201,21 +128,20 @@ export function ReplyThread({
 
   return (
     <div className="mt-4 space-y-3">
-      {/* Reply Form */}
-      {!disabled && (
+      {/* Composer. ⚠️ Gated on `canReply` (i.e. on the PUBLISHER), never on `signer`: `signer` is the
+          delegate arm and is null on a perfectly writable session. */}
+      {canReply && (
         <div className="mb-4">
-          {replyingTo === null ? (
+          {!isComposing ? (
             <button
-              onClick={() => setReplyingTo(0)}
+              onClick={() => setIsComposing(true)}
               className="text-xs font-mono text-primary-500 hover:text-primary-400"
             >
               + ADD REPLY ({replyCount})
             </button>
           ) : (
             <div className="border border-primary-700 p-3">
-              <div className="text-xs font-mono text-primary-600 mb-2">
-                {replyingTo === 0 ? 'REPLYING TO POST' : `REPLYING TO COMMENT #${replyingTo}`}
-              </div>
+              <div className="text-xs font-mono text-primary-600 mb-2">REPLYING TO POST</div>
               <textarea
                 value={replyContent}
                 onChange={(e) => setReplyContent(e.target.value)}
@@ -234,7 +160,7 @@ export function ReplyThread({
                 </button>
                 <button
                   onClick={() => {
-                    setReplyingTo(null);
+                    setIsComposing(false);
                     setReplyContent('');
                   }}
                   disabled={isSubmitting}
@@ -248,17 +174,39 @@ export function ReplyThread({
         </div>
       )}
 
-      {/* Replies List */}
+      {/* Replies, oldest first — a conversation, not a feed. */}
       {replies.length > 0 ? (
         <div className="space-y-2">
-          {replies.map(renderReply)}
+          {replies.map((reply) => (
+            <ReplyItem
+              key={reply.cid}
+              reply={reply}
+              // Pure keccak of the CID — no round trip, no failure mode, right on the first paint.
+              entityId={entityIdOfCid(reply.cid) ?? ''}
+              currentAddress={currentAddress}
+              getVoteTally={getVoteTally}
+              getUserVote={getUserVote}
+              vote={vote}
+              removeVote={removeVote}
+              isVoting={isVoting}
+              onEdit={editReply}
+              onDelete={deleteReply}
+              onSelectUser={onSelectUser}
+              disabled={disabled}
+              getProfile={getProfile}
+              provider={provider}
+              onFollow={onFollow}
+              onUnfollow={onUnfollow}
+              isFollowing={isFollowing}
+              onTip={onTip}
+              canTip={canTip}
+            />
+          ))}
         </div>
       ) : (
-        replyCount === 0 && (
-          <div className="text-xs font-mono text-primary-700 py-2">
-            No replies yet
-          </div>
-        )
+        <div className="text-xs font-mono text-primary-700 py-2">
+          No replies yet
+        </div>
       )}
 
       {/* Refresh button */}
@@ -271,80 +219,5 @@ export function ReplyThread({
         </button>
       )}
     </div>
-  );
-}
-
-// Helper component to handle entity ID fetching for each reply
-interface ReplyItemWithVotingProps {
-  reply: Reply;
-  repliesAddress: string | null;
-  provider: Provider | null;
-  currentAddress: string | null;
-  getReplyEntityId: (replyIndex: number) => Promise<string>;
-  getVoteTally: (entityId: string) => Promise<VoteTally>;
-  getUserVote: (entityId: string) => Promise<VoteType>;
-  vote: (entityId: string, voteType: VoteType) => Promise<void>;
-  removeVote: (entityId: string) => Promise<void>;
-  isVoting: boolean;
-  onReply: (parentReplyIndex: number) => void;
-  onEdit: (replyIndex: number, newContent: string) => Promise<void>;
-  onDelete: (replyIndex: number) => Promise<void>;
-  onSelectUser?: (address: string) => void;
-  children: Reply[];
-  renderChild: (child: Reply) => React.ReactNode;
-  disabled: boolean;
-  // Tooltip props
-  getProfile?: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
-  onFollow?: (address: string) => Promise<void>;
-  onUnfollow?: (address: string) => Promise<void>;
-  isFollowing?: (address: string) => boolean;
-  onTip?: (address: string) => void;
-  canTip?: boolean;
-}
-
-function ReplyItemWithVoting({
-  reply,
-  getReplyEntityId,
-  ...props
-}: ReplyItemWithVotingProps) {
-  const [entityId, setEntityId] = useState<string>('');
-
-  useEffect(() => {
-    getReplyEntityId(reply.index).then(setEntityId);
-  }, [reply.index, getReplyEntityId]);
-
-  if (!entityId) {
-    return null;
-  }
-
-  return (
-    <ReplyItem
-      reply={reply}
-      entityId={entityId}
-      currentAddress={props.currentAddress}
-      getVoteTally={props.getVoteTally}
-      getUserVote={props.getUserVote}
-      vote={props.vote}
-      removeVote={props.removeVote}
-      isVoting={props.isVoting}
-      onReply={props.onReply}
-      onEdit={props.onEdit}
-      onDelete={props.onDelete}
-      onSelectUser={props.onSelectUser}
-      children={props.children}
-      renderChild={props.renderChild}
-      disabled={props.disabled}
-      getProfile={props.getProfile}
-      provider={props.provider}
-      onStartDM={props.onStartDM}
-      canSendDM={props.canSendDM}
-      onFollow={props.onFollow}
-      onUnfollow={props.onUnfollow}
-      isFollowing={props.isFollowing}
-      onTip={props.onTip}
-      canTip={props.canTip}
-    />
   );
 }

@@ -729,8 +729,13 @@ The standard pattern for message/chat inputs with send functionality:
 - Character count turns red near limit
 
 **Status indicators by context:**
-- `[BLOCKCHAIN STORAGE ACTIVE]` - Channel messages
-- `[ENCRYPTED MESSAGE]` - Direct messages
+- `[BULLETIN STORAGE]` — post and message bodies (immutable, retention-limited)
+- ~~`[ENCRYPTED MESSAGE]` — Direct messages~~ **removed 2026-07-30:** encrypted DMs are dropped, the
+  platform offers no 1:1 primitive. Do not reintroduce this label.
+
+⚠️ Avoid "connect" and "wallet" in user-facing copy. There is no wallet to connect — the host container
+either hands over an account or it does not, so a "connect" control promises an action that cannot
+exist. Say what state the session is in and what, if anything, the user can do.
 
 ### User Address Display
 

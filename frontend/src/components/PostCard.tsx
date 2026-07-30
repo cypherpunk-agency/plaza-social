@@ -1,25 +1,24 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useMemo } from 'react';
 import type { UserPost, VoteType, VoteTally, Profile } from '../types/contracts';
 import { VotingWidget } from './VotingWidget';
 import { ReplyThread } from './ReplyThread';
 import { UserLink } from './UserAddress';
 import { formatTimestamp } from '../utils/formatters';
 import type { Provider, Signer } from '../utils/contracts';
-import { EntityType } from '../hooks/useVoting';
+import { entityIdOfCid } from '../lib/entity';
+import { FEED_REGISTRY } from '../lib/registry';
 import toast from 'react-hot-toast';
 
 const PREVIEW_LENGTH = 300;
 
 interface PostCardProps {
   post: UserPost;
-  userPostsAddress: string | null;
   repliesAddress: string | null;
   votingAddress: string | null;
   provider: Provider | null;
   signer?: Signer | null;
   currentAddress: string | null;
   // Voting functions
-  computeEntityId: (contractAddress: string, entityType: EntityType, entityIndex: number) => Promise<string>;
   getVoteTally: (entityId: string) => Promise<VoteTally>;
   getUserVote: (entityId: string) => Promise<VoteType>;
   vote: (entityId: string, voteType: VoteType) => Promise<void>;
@@ -34,8 +33,6 @@ interface PostCardProps {
   disabled?: boolean;
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   isFollowing?: (address: string) => boolean;
@@ -46,13 +43,11 @@ interface PostCardProps {
 
 export function PostCard({
   post,
-  userPostsAddress,
   repliesAddress,
   votingAddress,
   provider,
   signer,
   currentAddress,
-  computeEntityId,
   getVoteTally,
   getUserVote,
   vote,
@@ -66,15 +61,12 @@ export function PostCard({
   disabled = false,
   // Tooltip props
   getProfile,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing,
   onTip,
   canTip = false,
 }: PostCardProps) {
-  const [entityId, setEntityId] = useState<string>('');
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(post.content);
   const [isSaving, setIsSaving] = useState(false);
@@ -83,20 +75,9 @@ export function PostCard({
 
   const isOwner = currentAddress?.toLowerCase() === post.profileOwner.toLowerCase();
 
-  // Compute entity ID for voting
-  const loadEntityId = useCallback(async () => {
-    if (!userPostsAddress) return;
-    try {
-      const id = await computeEntityId(userPostsAddress, EntityType.UserPost, post.index);
-      setEntityId(id);
-    } catch (err) {
-      console.error('Failed to compute entity ID:', err);
-    }
-  }, [userPostsAddress, post.index, computeEntityId]);
-
-  useEffect(() => {
-    loadEntityId();
-  }, [loadEntityId]);
+  // A vote is cast on the BYTES, so the tally is keyed on the CID. Pure keccak — no round trip, no
+  // failure mode, and the count is right on the first paint. See `lib/entity.ts`.
+  const entityId = useMemo(() => entityIdOfCid(post.cid) ?? '', [post.cid]);
 
   const handleSaveEdit = async () => {
     if (!editContent.trim() || isSaving) return;
@@ -148,8 +129,6 @@ export function PostCard({
             size="xs"
             getProfile={getProfile}
             provider={provider}
-            onStartDM={onStartDM}
-            canSendDM={canSendDM}
             onFollow={onFollow}
             onUnfollow={onUnfollow}
             isFollowing={isFollowing?.(post.profileOwner)}
@@ -263,13 +242,14 @@ export function PostCard({
         </div>
       )}
 
-      {/* Reply Thread */}
+      {/* Reply Thread. Keyed on the post's CID — the same identity the vote tally uses — so the
+          conversation survives the author posting again. `group` is the profile feed. */}
       {showReplies && (
         <ReplyThread
           repliesAddress={repliesAddress}
           votingAddress={votingAddress}
-          userPostsAddress={userPostsAddress}
-          postIndex={post.index}
+          parentCid={post.cid}
+          group={FEED_REGISTRY}
           provider={provider}
           signer={signer}
           currentAddress={currentAddress}
@@ -277,8 +257,6 @@ export function PostCard({
           onSelectUser={onSelectUser}
           disabled={disabled}
           getProfile={getProfile}
-          onStartDM={onStartDM}
-          canSendDM={canSendDM}
           onFollow={onFollow}
           onUnfollow={onUnfollow}
           isFollowing={isFollowing}

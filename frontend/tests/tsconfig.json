@@ -1,0 +1,22 @@
+{
+  "//": "Self-contained typecheck for the host-protocol harness. Deliberately NOT referenced from frontend/tsconfig.json — tsconfig.app.json includes only `src`, and the harness must not become part of the app build. Run with: npx tsc -p tests --noEmit",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node", "vite/client"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "resolveJsonModule": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true
+  },
+  "include": ["**/*.ts", "../playwright.config.ts"],
+  "exclude": ["fixture-app/dist", ".artifacts"]
+}

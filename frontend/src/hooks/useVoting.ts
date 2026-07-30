@@ -1,19 +1,22 @@
 import { useState, useCallback } from "react";
-import { ethers } from "ethers";
 import type { VoteType, VoteTally } from "../types/contracts";
 import { VoteType as VoteTypeEnum } from "../types/contracts";
 import VotingABI from "../contracts/Voting.json";
 import { createReadContract, createWriteContract, type Provider, type Signer } from "../utils/contracts";
 
-// Entity types for the shared Voting contract
-export const EntityType = {
-  UserPost: 0,
-  FeedItem: 1,
-  ForumThread: 2,
-  Reply: 3,
-} as const;
-
-export type EntityType = (typeof EntityType)[keyof typeof EntityType];
+/**
+ * ⛔ `EntityType` AND `computeEntityId` ARE GONE. DO NOT REINTRODUCE THEM.
+ *
+ * A votable thing used to be identified POSITIONALLY — `(contract, entityType, index)` — because
+ * every type had its own contract and its own array. Those contracts are deleted, and the deployed
+ * `Voting` has no `getEntityId`, which showed up on every card as:
+ *
+ *   Failed to compute entity ID: TypeError: T.getEntityId is not a function
+ *
+ * The identity is now the **CID**. Derive it with `entityIdOfCid` from `lib/entity.ts` — both
+ * derivations are `pure` on the contract, so they are computed locally and cannot fail or cost a
+ * round trip. Everything below takes an already-derived `bytes32`.
+ */
 
 interface UseVotingProps {
   votingAddress: string | null;
@@ -31,7 +34,6 @@ interface UseVotingReturn {
   // Queries
   getVoteTally: (entityId: string) => Promise<VoteTally>;
   getUserVote: (entityId: string, voter?: string) => Promise<VoteType>;
-  computeEntityId: (contractAddress: string, entityType: EntityType, entityIndex: number) => Promise<string>;
 
   // State
   isVoting: boolean;
@@ -55,21 +57,6 @@ export function useVoting({
   const getWriteContract = useCallback(async () => {
     return createWriteContract(votingAddress, VotingABI.abi, provider, signer ?? null);
   }, [votingAddress, provider, signer]);
-
-  const computeEntityId = useCallback(
-    async (contractAddress: string, entityType: EntityType, entityIndex: number): Promise<string> => {
-      const contract = getReadContract();
-      if (!contract) {
-        // Fallback: compute client-side using ethers
-        return ethers.solidityPackedKeccak256(
-          ["address", "uint8", "uint256"],
-          [contractAddress, entityType, entityIndex]
-        );
-      }
-      return contract.getEntityId(contractAddress, entityType, entityIndex);
-    },
-    [getReadContract]
-  );
 
   const getVoteTally = useCallback(
     async (entityId: string): Promise<VoteTally> => {
@@ -173,7 +160,6 @@ export function useVoting({
     removeVote,
     getVoteTally,
     getUserVote,
-    computeEntityId,
     isVoting,
     error,
   };

@@ -8,12 +8,16 @@ export interface ProfileTooltipProps {
   address: string;
   triggerRect: DOMRect;
   getProfile: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   onTip?: (address: string) => void;
+  /**
+   * Navigate to this user's profile. Same callback App.tsx threads everywhere else as
+   * `onSelectUser` (`openProfile`). The tooltip must be dismissed by the owner of the
+   * tooltip state before this fires — see `UserLink.handleSelectUser`.
+   */
+  onSelectUser: (address: string) => void;
   isFollowing?: boolean;
-  canSendDM?: boolean;
   canTip?: boolean;
   isOwnProfile?: boolean;
   provider?: Provider | null;
@@ -25,12 +29,11 @@ export function ProfileTooltip({
   address,
   triggerRect,
   getProfile,
-  onStartDM,
   onFollow,
   onUnfollow,
   onTip,
+  onSelectUser,
   isFollowing = false,
-  canSendDM = false,
   canTip = false,
   isOwnProfile = false,
   provider,
@@ -106,6 +109,22 @@ export function ProfileTooltip({
     }
   };
 
+  /**
+   * Open the profile.
+   *
+   * `stopPropagation` matters because a portal does NOT isolate events: React events bubble along
+   * the REACT tree, not the DOM tree, so a click in here reaches whatever contains the `UserLink`.
+   * No current consumer puts an onClick on an ancestor of `UserLink` (verified 2026-07-30:
+   * ThreadCard/PostCard hang theirs on the title element, a sibling) — so today this is defensive,
+   * matching what the TIP and FOLLOW buttons below already do. It becomes load-bearing the moment
+   * someone makes a whole card clickable.
+   */
+  const handleOpenProfile = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onSelectUser(address);
+  };
+
   const displayName = profile?.displayName || truncateAddress(address);
   const bioSnippet = profile?.bio
     ? profile.bio.length > 60
@@ -140,14 +159,25 @@ export function ProfileTooltip({
         <div className="p-3 space-y-2">
           {/* Header: Avatar + Name + Balance */}
           <div className="flex items-start gap-2">
-            <div className="w-8 h-8 border border-primary-500 bg-primary-950 flex items-center justify-center text-primary-500 text-sm font-mono flex-shrink-0">
+            <button
+              type="button"
+              onClick={handleOpenProfile}
+              title={`View ${displayName}'s profile`}
+              aria-label={`View ${displayName}'s profile`}
+              className="w-8 h-8 border border-primary-500 bg-primary-950 flex items-center justify-center text-primary-500 text-sm font-mono flex-shrink-0 cursor-pointer transition-colors hover:bg-primary-900 hover:border-primary-400 hover:text-primary-300 focus:outline-none focus-visible:border-primary-400 focus-visible:text-primary-300"
+            >
               {displayName.charAt(0).toUpperCase()}
-            </div>
+            </button>
             <div className="min-w-0 flex-1">
               <div className="flex items-baseline gap-1.5">
-                <span className="text-primary-400 font-mono text-sm font-semibold truncate">
+                <button
+                  type="button"
+                  onClick={handleOpenProfile}
+                  title={`View ${displayName}'s profile`}
+                  className="text-primary-400 font-mono text-sm font-semibold truncate text-left min-w-0 cursor-pointer transition-colors hover:text-primary-300 hover:underline focus:outline-none focus-visible:text-primary-300 focus-visible:underline"
+                >
                   {displayName}
-                </span>
+                </button>
                 <span className="text-primary-600 font-mono text-xs whitespace-nowrap">
                   {formatBalance(balance)} PAS
                 </span>
@@ -166,24 +196,8 @@ export function ProfileTooltip({
           )}
 
           {/* Action buttons */}
-          {!isOwnProfile && (onStartDM || onTip || onFollow) && (
+          {!isOwnProfile && (onTip || onFollow) && (
             <div className="flex gap-1.5 pt-1">
-              {onStartDM && (
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onStartDM(address);
-                  }}
-                  disabled={!canSendDM}
-                  className={`px-2 py-1 text-xs font-mono border transition-colors ${
-                    canSendDM
-                      ? 'bg-accent-950 border-accent-600 text-accent-400 hover:bg-accent-900'
-                      : 'bg-gray-900 border-gray-700 text-gray-600 cursor-not-allowed'
-                  }`}
-                >
-                  DM
-                </button>
-              )}
               {onTip && (
                 <button
                   onClick={(e) => {

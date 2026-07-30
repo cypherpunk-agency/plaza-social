@@ -1,23 +1,22 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useMemo } from 'react';
 import type { ForumThread, VoteType, VoteTally, Profile } from '../types/contracts';
 import { VotingWidget } from './VotingWidget';
 import { ReplyThread } from './ReplyThread';
 import { UserLink } from './UserAddress';
 import { formatTimestamp } from '../utils/formatters';
 import type { Provider, Signer } from '../utils/contracts';
-import { EntityType } from '../hooks/useVoting';
+import { entityIdOfCid } from '../lib/entity';
+import { FORUM_REGISTRY } from '../lib/registry';
 import toast from 'react-hot-toast';
 
 interface ThreadCardProps {
   thread: ForumThread;
-  forumThreadAddress: string | null;
   repliesAddress: string | null;
   votingAddress: string | null;
   provider: Provider | null;
   signer?: Signer | null;
   currentAddress: string | null;
   // Voting functions
-  computeEntityId: (contractAddress: string, entityType: EntityType, entityIndex: number) => Promise<string>;
   getVoteTally: (entityId: string) => Promise<VoteTally>;
   getUserVote: (entityId: string) => Promise<VoteType>;
   vote: (entityId: string, voteType: VoteType) => Promise<void>;
@@ -33,8 +32,6 @@ interface ThreadCardProps {
   expanded?: boolean;
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   isFollowing?: (address: string) => boolean;
@@ -44,13 +41,11 @@ interface ThreadCardProps {
 
 export function ThreadCard({
   thread,
-  forumThreadAddress,
   repliesAddress,
   votingAddress,
   provider,
   signer,
   currentAddress,
-  computeEntityId,
   getVoteTally,
   getUserVote,
   vote,
@@ -65,15 +60,12 @@ export function ThreadCard({
   expanded = false,
   // Tooltip props
   getProfile,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing,
   onTip,
   canTip = false,
 }: ThreadCardProps) {
-  const [entityId, setEntityId] = useState<string>('');
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(thread.content);
   const [isSaving, setIsSaving] = useState(false);
@@ -82,20 +74,9 @@ export function ThreadCard({
 
   const isOwner = currentAddress?.toLowerCase() === thread.author.toLowerCase();
 
-  // Compute entity ID for voting
-  const loadEntityId = useCallback(async () => {
-    if (!forumThreadAddress) return;
-    try {
-      const id = await computeEntityId(forumThreadAddress, EntityType.ForumThread, thread.index);
-      setEntityId(id);
-    } catch (err) {
-      console.error('Failed to compute entity ID:', err);
-    }
-  }, [forumThreadAddress, thread.index, computeEntityId]);
-
-  useEffect(() => {
-    loadEntityId();
-  }, [loadEntityId]);
+  // A vote is cast on the BYTES, so the tally is keyed on the CID. Pure keccak — no round trip, no
+  // failure mode, and the count is right on the first paint. See `lib/entity.ts`.
+  const entityId = useMemo(() => entityIdOfCid(thread.cid) ?? '', [thread.cid]);
 
   const handleSaveEdit = async () => {
     if (!editContent.trim() || isSaving) return;
@@ -155,8 +136,6 @@ export function ThreadCard({
             size="xs"
             getProfile={getProfile}
             provider={provider}
-            onStartDM={onStartDM}
-            canSendDM={canSendDM}
             onFollow={onFollow}
             onUnfollow={onUnfollow}
             isFollowing={isFollowing?.(thread.author)}
@@ -287,14 +266,15 @@ export function ThreadCard({
         </div>
       )}
 
-      {/* Reply Thread */}
-      {showReplies && forumThreadAddress && (
+      {/* Reply Thread. Keyed on the announcement's CID — the same identity the vote tally uses —
+          so the conversation survives everybody else posting. `group` is the board, which is what
+          `HeadSet.group` is for: one board subscription hears the board AND every reply on it. */}
+      {showReplies && (
         <ReplyThread
           repliesAddress={repliesAddress}
           votingAddress={votingAddress}
-          userPostsAddress={forumThreadAddress}
-          postIndex={thread.index}
-          entityType={EntityType.ForumThread}
+          parentCid={thread.cid}
+          group={FORUM_REGISTRY}
           provider={provider}
           signer={signer}
           currentAddress={currentAddress}
@@ -302,8 +282,6 @@ export function ThreadCard({
           onSelectUser={onSelectUser}
           disabled={disabled}
           getProfile={getProfile}
-          onStartDM={onStartDM}
-          canSendDM={canSendDM}
           onFollow={onFollow}
           onUnfollow={onUnfollow}
           isFollowing={isFollowing}

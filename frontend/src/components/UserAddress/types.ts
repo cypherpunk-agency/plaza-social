@@ -22,10 +22,6 @@ export interface UserLinkProps {
   getProfile?: (address: string) => Promise<Profile>;
   /** Provider for fetching balance */
   provider?: Provider | null;
-  /** Callback to start DM with this user */
-  onStartDM?: (address: string) => void;
-  /** Can the current user send DMs */
-  canSendDM?: boolean;
   /** Callback to follow this user */
   onFollow?: (address: string) => Promise<void>;
   /** Callback to unfollow this user */

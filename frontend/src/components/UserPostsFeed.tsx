@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { useUserPosts } from '../hooks/useUserPosts';
+import { usePublisher } from '../hooks/usePublisher';
 import { useVoting } from '../hooks/useVoting';
 import { NewPostForm } from './NewPostForm';
 import { PostCard } from './PostCard';
@@ -23,8 +24,6 @@ interface UserPostsFeedProps {
   onPostChange?: (postIndex: number | null) => void;
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   isFollowing?: (address: string) => boolean;
@@ -48,8 +47,6 @@ export function UserPostsFeed({
   onPostChange,
   // Tooltip props
   getProfile,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing,
@@ -79,7 +76,6 @@ export function UserPostsFeed({
     removeVote,
     getVoteTally,
     getUserVote,
-    computeEntityId,
     isVoting,
   } = useVoting({
     votingAddress,
@@ -89,7 +85,14 @@ export function UserPostsFeed({
     enabled: !!currentAddress,
   });
 
-  const canPost = isOwnProfile && !!signer;
+  /**
+   * ⚠️ NOT `!!signer`. `signer` is the DELEGATE arm, which is null on a perfectly writable session —
+   * posting goes through the host-signed path until a delegate is authorised, so gating on the
+   * delegate hid the composer from everyone who can actually post. The publisher is the one thing
+   * that is non-null exactly when a write can happen.
+   */
+  const publisher = usePublisher();
+  const canPost = isOwnProfile && !!publisher;
 
   // Find selected post for detail view
   const selectedPost = useMemo(() => {
@@ -114,13 +117,11 @@ export function UserPostsFeed({
     return (
       <PostDetailView
         post={selectedPost}
-        userPostsAddress={userPostsAddress}
         repliesAddress={repliesAddress}
         votingAddress={votingAddress}
         provider={provider}
         signer={signer}
         currentAddress={currentAddress}
-        computeEntityId={computeEntityId}
         getVoteTally={getVoteTally}
         getUserVote={getUserVote}
         vote={vote}
@@ -133,8 +134,6 @@ export function UserPostsFeed({
         getDisplayName={getDisplayName}
         disabled={!signer}
         getProfile={getProfile}
-        onStartDM={onStartDM}
-        canSendDM={canSendDM}
         onFollow={onFollow}
         onUnfollow={onUnfollow}
         isFollowing={isFollowing}
@@ -165,7 +164,7 @@ export function UserPostsFeed({
       {canPost && (
         <NewPostForm
           onSubmit={createPost}
-          disabled={!signer}
+          disabled={!canPost}
           placeholder="What's on your mind?"
         />
       )}
@@ -206,13 +205,11 @@ export function UserPostsFeed({
             <PostCard
               key={post.index}
               post={post}
-              userPostsAddress={userPostsAddress}
               repliesAddress={repliesAddress}
               votingAddress={votingAddress}
               provider={provider}
               signer={signer}
               currentAddress={currentAddress}
-              computeEntityId={computeEntityId}
               getVoteTally={getVoteTally}
               getUserVote={getUserVote}
               vote={vote}
@@ -225,8 +222,6 @@ export function UserPostsFeed({
               getDisplayName={getDisplayName}
               disabled={!signer}
               getProfile={getProfile}
-              onStartDM={onStartDM}
-              canSendDM={canSendDM}
               onFollow={onFollow}
               onUnfollow={onUnfollow}
               isFollowing={isFollowing}

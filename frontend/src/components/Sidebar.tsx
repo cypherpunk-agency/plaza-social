@@ -1,53 +1,36 @@
 import { useState, useEffect } from 'react';
-import { ethers } from 'ethers';
-import type { RegisteredChannel } from '../types/contracts';
-import { PostingMode } from '../types/contracts';
-import type { ConversationInfo } from '../hooks/useDMRegistry';
-import ChatChannelABI from '../contracts/ChatChannel.json';
 import { truncateAddress } from '../utils/formatters';
-
-interface ChannelListItem {
-  address: string;
-  name: string;
-  postingMode: number;
-}
-
-interface ConversationWithName extends ConversationInfo {
-  displayName: string;
-}
 
 interface FollowingUser {
   address: string;
   displayName: string;
 }
 
-export type ViewMode = 'channels' | 'dms' | 'profile' | 'settings' | 'forum';
+/**
+ * ⛔ `'channels'` IS GONE FROM THIS UNION ON PURPOSE, and removing it is what makes the removal
+ * safe: every remaining reference to the chat view is now a compile error rather than a blank
+ * screen. A persisted `viewMode: 'channels'` in localStorage, or a stale `?channel=0x…` link, must
+ * resolve to `'forum'` — see the initialiser in `App.tsx`.
+ *
+ * Chat is parked, not deleted. `useChannel`, `useChannelRegistry`, `ChatFeed`, `MessageInput`,
+ * `ChannelHeader`, `ChannelModerationModal`, `UserListPanel` and `CreateChannelModal` are still on
+ * disk, unreferenced, as the starting point for the migration onto `PostRegistry`. The UI does not
+ * offer them because they call contracts that were deleted, and an affordance that can only fail is
+ * worse than an absence.
+ */
+export type ViewMode = 'profile' | 'settings' | 'forum';
 
-export type SidebarSection = 'channels' | 'dms' | 'following';
+export type SidebarSection = 'following';
 
 interface SidebarExpanded {
-  channels: boolean;
-  dms: boolean;
   following: boolean;
 }
 
 interface SidebarProps {
-  channels: RegisteredChannel[];
-  selectedChannel: string | null;
-  onSelectChannel: (address: string) => void;
-  onCreateChannel: () => void;
-  provider: ethers.BrowserProvider | ethers.JsonRpcProvider | null;
   isConnected: boolean;
   // View mode
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
-  // DM-related props
-  dmConversations?: ConversationInfo[];
-  selectedConversation?: string | null;
-  onSelectConversation?: (address: string) => void;
-  onNewDM?: () => void;
-  dmLoading?: boolean;
-  dmRegistryAvailable?: boolean;
   getDisplayName?: (address: string) => Promise<string>;
   // Following props
   following?: string[];
@@ -60,100 +43,27 @@ interface SidebarProps {
   // Current user for My Profile
   currentUserAddress?: string | null;
   currentUserDisplayName?: string | null;
-  // Callback to trigger wallet connection (for guest mode)
-  onConnectWallet?: () => void;
   // Forum availability
   forumAvailable?: boolean;
 }
 
 export function Sidebar({
-  channels,
-  selectedChannel,
-  onSelectChannel,
-  onCreateChannel,
-  provider,
   isConnected,
   viewMode,
   onViewModeChange,
-  dmConversations = [],
-  selectedConversation,
-  onSelectConversation,
-  onNewDM,
-  dmLoading = false,
-  dmRegistryAvailable = false,
   getDisplayName,
   following = [],
   selectedProfile,
   onSelectProfile,
   followRegistryAvailable = false,
-  sidebarExpanded = { channels: true, dms: true, following: true },
+  sidebarExpanded = { following: true },
   onToggleSection,
   currentUserAddress,
   currentUserDisplayName,
-  onConnectWallet,
   forumAvailable = false,
 }: SidebarProps) {
-  const [channelNames, setChannelNames] = useState<ChannelListItem[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [conversationsWithNames, setConversationsWithNames] = useState<ConversationWithName[]>([]);
-  const [loadingDMNames, setLoadingDMNames] = useState(false);
   const [followingWithNames, setFollowingWithNames] = useState<FollowingUser[]>([]);
   const [loadingFollowingNames, setLoadingFollowingNames] = useState(false);
-
-  // Load channel names
-  useEffect(() => {
-    if (!provider || channels.length === 0) {
-      setChannelNames([]);
-      return;
-    }
-
-    const loadChannelNames = async () => {
-      setIsLoading(true);
-      try {
-        const names = await Promise.all(
-          channels.map(async (ch) => {
-            try {
-              const contract = new ethers.Contract(
-                ch.channelAddress,
-                ChatChannelABI.abi,
-                provider
-              );
-              const [name, postingMode] = await Promise.all([
-                contract.name(),
-                contract.postingMode(),
-              ]);
-              return { address: ch.channelAddress, name, postingMode: Number(postingMode) };
-            } catch {
-              return { address: ch.channelAddress, name: 'Unknown', postingMode: 0 };
-            }
-          })
-        );
-        setChannelNames(names);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    loadChannelNames();
-  }, [channels, provider]);
-
-  // Load DM conversation display names
-  useEffect(() => {
-    if (dmConversations.length === 0 || !getDisplayName) {
-      setConversationsWithNames([]);
-      return;
-    }
-
-    setLoadingDMNames(true);
-    Promise.all(
-      dmConversations.map(async (conv) => {
-        const displayName = await getDisplayName(conv.otherParticipant);
-        return { ...conv, displayName };
-      })
-    )
-      .then(setConversationsWithNames)
-      .finally(() => setLoadingDMNames(false));
-  }, [dmConversations, getDisplayName]);
 
   // Load following display names
   useEffect(() => {
@@ -175,16 +85,6 @@ export function Sidebar({
 
   const handleToggle = (section: SidebarSection) => {
     onToggleSection?.(section);
-  };
-
-  const handleChannelClick = (address: string) => {
-    onSelectChannel(address);
-    onViewModeChange('channels');
-  };
-
-  const handleDMClick = (address: string) => {
-    onSelectConversation?.(address);
-    onViewModeChange('dms');
   };
 
   const handleProfileClick = (address: string) => {
@@ -245,109 +145,15 @@ export function Sidebar({
         </div>
       )}
 
-      {/* Collapsible Sections */}
+      {/* Collapsible Sections.
+          ⛔ THE CHANNELS SECTION WAS HERE, and its removal is deliberate. Every part of it — the
+          list, the per-channel name lookup against `ChatChannel`, the "+ New Channel" button —
+          spoke to contracts that no longer exist. Creating a room is not a deployment on this
+          platform: an open room is `keccak256(name)` and costs no transaction, a moderated one is
+          `PostRegistry.claimRegistry(salt, policy)`. There is nothing per-room to deploy, so the
+          old control could only ever fail. Chat returns when the reading pattern from
+          `useForumThread` is applied to `useChannel`. */}
       <div className="flex-1 overflow-y-auto">
-        {/* Channels Section */}
-        <div className="border-b border-primary-800">
-          <button
-            onClick={() => handleToggle('channels')}
-            className="w-full text-left px-4 py-2 flex items-center gap-2 text-sm text-primary-600 hover:bg-primary-950"
-          >
-            <span className={`text-xs transition-transform ${sidebarExpanded.channels ? 'rotate-90' : ''}`}>
-              &#9654;
-            </span>
-            <span className="font-bold">Channels</span>
-            <span className="text-primary-700 text-xs ml-auto">{channelNames.length}</span>
-          </button>
-
-          {sidebarExpanded.channels && (
-            <div className="pl-4">
-              {isLoading ? (
-                <div className="px-4 py-2 text-primary-600 font-mono text-sm">
-                  Loading...
-                </div>
-              ) : channelNames.length === 0 ? (
-                <div className="px-4 py-2 text-primary-700 font-mono text-sm">
-                  No channels
-                </div>
-              ) : (
-                channelNames.map((ch) => (
-                  <button
-                    key={ch.address}
-                    onClick={() => handleChannelClick(ch.address)}
-                    className={`w-full text-left px-4 py-1.5 flex items-center gap-2 text-sm transition-all ${
-                      viewMode === 'channels' && selectedChannel === ch.address
-                        ? 'bg-primary-900 text-primary-300 border-l-2 border-primary-400'
-                        : 'text-primary-500 hover:bg-primary-950'
-                    }`}
-                  >
-                    <span className="text-center">
-                      {ch.postingMode === PostingMode.Permissioned ? (
-                        <span className="text-yellow-500 text-xs">&#x1F512;</span>
-                      ) : (
-                        <span className="text-accent-500">#</span>
-                      )}
-                    </span>
-                    {ch.name}
-                  </button>
-                ))
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* DMs Section */}
-        {dmRegistryAvailable && (
-          <div className="border-b border-primary-800">
-            <button
-              onClick={() => handleToggle('dms')}
-              className="w-full text-left px-4 py-2 flex items-center gap-2 text-sm text-primary-600 hover:bg-primary-950"
-            >
-              <span className={`text-xs transition-transform ${sidebarExpanded.dms ? 'rotate-90' : ''}`}>
-                &#9654;
-              </span>
-              <span className="font-bold">DMs</span>
-              <span className="text-primary-700 text-xs ml-auto">{conversationsWithNames.length}</span>
-            </button>
-
-            {sidebarExpanded.dms && (
-              <div className="pl-4">
-                {dmLoading || loadingDMNames ? (
-                  <div className="px-4 py-2 text-primary-600 font-mono text-sm">
-                    Loading...
-                  </div>
-                ) : conversationsWithNames.length === 0 ? (
-                  <div className="px-4 py-2 text-primary-700 font-mono text-sm">
-                    No conversations
-                  </div>
-                ) : (
-                  conversationsWithNames.map((conv) => (
-                    <button
-                      key={conv.address}
-                      onClick={() => handleDMClick(conv.address)}
-                      className={`w-full text-left px-4 py-1.5 flex items-center gap-2 text-sm transition-all ${
-                        viewMode === 'dms' && selectedConversation === conv.address
-                          ? 'bg-accent-900 text-accent-300 border-l-2 border-accent-400'
-                          : 'text-primary-500 hover:bg-primary-950'
-                      }`}
-                    >
-                      <span className="text-accent-400">@</span>
-                      <span className="truncate">
-                        {conv.displayName || truncateAddress(conv.otherParticipant)}
-                      </span>
-                      {conv.messageCount > 0 && (
-                        <span className="ml-auto px-1.5 py-0.5 bg-primary-900 text-primary-500 text-xs">
-                          {conv.messageCount}
-                        </span>
-                      )}
-                    </button>
-                  ))
-                )}
-              </div>
-            )}
-          </div>
-        )}
-
         {/* Following Section */}
         {followRegistryAvailable && (
           <div className="border-b border-primary-800">
@@ -393,24 +199,6 @@ export function Sidebar({
               </div>
             )}
           </div>
-        )}
-      </div>
-
-      {/* Action Buttons - shown for all users, triggers wallet connection if not connected */}
-      <div className="p-3 border-t border-primary-800 space-y-2">
-        <button
-          onClick={isConnected ? onCreateChannel : onConnectWallet}
-          className="w-full py-1.5 text-xs text-primary-600 hover:text-primary-400 hover:bg-primary-950 text-left px-2 transition-colors"
-        >
-          + New Channel
-        </button>
-        {dmRegistryAvailable && (
-          <button
-            onClick={isConnected ? onNewDM : onConnectWallet}
-            className="w-full py-1.5 text-xs text-primary-600 hover:text-primary-400 hover:bg-primary-950 text-left px-2 transition-colors"
-          >
-            + New DM
-          </button>
         )}
       </div>
 

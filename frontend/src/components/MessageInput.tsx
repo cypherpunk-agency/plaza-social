@@ -5,10 +5,17 @@ interface MessageInputProps {
   onSend: (message: string) => Promise<boolean>;
   disabled: boolean;
   isSending: boolean;
-  onConnectWallet?: () => void;
+  /**
+   * Opens the panel that explains why posting is unavailable.
+   *
+   * ⚠️ Was `onConnectWallet`. There is no wallet to connect — the host container is the only surface
+   * and it either grants a writable account or it does not. The composer's job when disabled is to
+   * explain, not to offer an action that cannot exist.
+   */
+  onExplainDisabled?: () => void;
 }
 
-export function MessageInput({ onSend, disabled, isSending, onConnectWallet }: MessageInputProps) {
+export function MessageInput({ onSend, disabled, isSending, onExplainDisabled }: MessageInputProps) {
   const [message, setMessage] = useState('');
 
   const handleSubmit = async (e: FormEvent) => {
@@ -29,10 +36,10 @@ export function MessageInput({ onSend, disabled, isSending, onConnectWallet }: M
     }
   };
 
-  // Handle click on disabled input area - prompt wallet connection
+  // Clicking a disabled composer asks "why can't I type here?" — so answer that.
   const handleDisabledClick = () => {
-    if (disabled && onConnectWallet) {
-      onConnectWallet();
+    if (disabled && onExplainDisabled) {
+      onExplainDisabled();
     }
   };
 
@@ -43,21 +50,21 @@ export function MessageInput({ onSend, disabled, isSending, onConnectWallet }: M
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-primary-500 font-mono text-sm">
             &gt;
           </span>
-          {disabled && onConnectWallet ? (
-            // Clickable overlay when disabled - triggers wallet connection
+          {disabled && onExplainDisabled ? (
+            // Clickable overlay when disabled — opens the explanation, not a wallet chooser.
             <button
               type="button"
               onClick={handleDisabledClick}
               className="w-full pl-8 pr-4 py-3 bg-black border-2 border-primary-600 text-primary-600 font-mono text-sm text-left cursor-pointer hover:border-primary-500 hover:text-primary-500 transition-all"
             >
-              [CONNECT WALLET TO POST]
+              [POSTING UNAVAILABLE — TAP FOR DETAILS]
             </button>
           ) : (
             <input
               type="text"
               value={message}
               onChange={(e) => setMessage(e.target.value)}
-              placeholder={disabled ? '[CONNECT WALLET TO TRANSMIT]' : '[ENTER MESSAGE]'}
+              placeholder={disabled ? '[POSTING UNAVAILABLE]' : '[ENTER MESSAGE]'}
               disabled={disabled || isSending}
               className="w-full pl-8 pr-4 py-3 bg-black border-2 border-primary-500 text-primary-400 font-mono text-sm focus:outline-none focus:border-primary-400 disabled:border-gray-700 disabled:text-gray-600 disabled:shadow-none placeholder-primary-800 transition-all shadow-neon-input"
               maxLength={500}

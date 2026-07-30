@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import toast from 'react-hot-toast';
+import { reportError } from '../lib/reportError';
 
 interface NewPostFormProps {
   onSubmit: (content: string) => Promise<number>;
@@ -29,7 +30,7 @@ export function NewPostForm({
       toast.success('Post created!');
     } catch (error) {
       console.error('Failed to create post:', error);
-      toast.error('Failed to create post');
+      reportError('create post', error);
     } finally {
       setIsSubmitting(false);
     }
@@ -44,7 +45,7 @@ export function NewPostForm({
         <textarea
           value={content}
           onChange={(e) => setContent(e.target.value)}
-          placeholder={disabled ? '[CONNECT WALLET TO POST]' : placeholder}
+          placeholder={disabled ? '[POSTING UNAVAILABLE]' : placeholder}
           disabled={disabled || isSubmitting}
           className="w-full min-h-[100px] pl-8 pr-4 py-3 bg-black border-2 border-primary-600 text-primary-400 font-mono text-sm focus:outline-none focus:border-primary-400 disabled:border-gray-700 disabled:text-gray-600 disabled:shadow-none placeholder-primary-800 transition-all resize-y"
           maxLength={maxLength}

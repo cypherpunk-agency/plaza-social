@@ -3,8 +3,21 @@ export function truncateAddress(address: string): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
-export function formatTimestamp(timestamp: number): string {
-  const date = new Date(timestamp * 1000);
+/**
+ * Format an epoch timestamp in **MILLISECONDS**.
+ *
+ * ⚠️ IT USED TO TAKE SECONDS AND MULTIPLY BY 1000. That was right when every timestamp came from a
+ * Solidity `block.timestamp`; it is wrong now, and it failed loudly enough to be caught only because
+ * the number is absurd — the first real thread rendered as **58548-06-08**, i.e. epoch-ms fed to a
+ * seconds formatter.
+ *
+ * The migrated data layer is milliseconds throughout: `lib/wire.ts` stores `t` as epoch ms, and
+ * `PostRegistry.HeadRef.movedAt` is converted at the hook boundary (`movedAt * 1000`). Callers still
+ * holding a Solidity seconds value must convert AT THE CALL SITE, visibly — a formatter that guesses
+ * the unit from the magnitude would be right until the day it was not.
+ */
+export function formatTimestamp(epochMs: number): string {
+  const date = new Date(epochMs);
 
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');

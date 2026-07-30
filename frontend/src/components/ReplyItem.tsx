@@ -3,9 +3,17 @@ import type { Reply, VoteType, VoteTally, Profile } from '../types/contracts';
 import { VotingWidget } from './VotingWidget';
 import { UserLink } from './UserAddress';
 import { formatTimestamp } from '../utils/formatters';
+import { reportError } from '../lib/reportError';
 import type { Provider } from '../utils/contracts';
 import toast from 'react-hot-toast';
 
+/**
+ * One reply.
+ *
+ * ⛔ **NO `onReply`, NO `children`, NO `renderChild`.** Replies are flat: the wire format has no
+ * parent pointer, so a reply-to-a-reply cannot be written or read back. The control was removed
+ * rather than left to throw. See `hooks/useReplies.ts`.
+ */
 interface ReplyItemProps {
   reply: Reply;
   entityId: string;
@@ -17,19 +25,13 @@ interface ReplyItemProps {
   removeVote: (entityId: string) => Promise<void>;
   isVoting: boolean;
   // Actions
-  onReply?: (parentReplyIndex: number) => void;
   onEdit?: (replyIndex: number, newContent: string) => Promise<void>;
   onDelete?: (replyIndex: number) => Promise<void>;
   onSelectUser?: (address: string) => void;
-  // Children
-  children?: Reply[];
-  renderChild?: (child: Reply) => React.ReactNode;
   disabled?: boolean;
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
   provider?: Provider | null;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   isFollowing?: (address: string) => boolean;
@@ -46,18 +48,13 @@ export function ReplyItem({
   vote,
   removeVote,
   isVoting,
-  onReply,
   onEdit,
   onDelete,
   onSelectUser,
-  children,
-  renderChild,
   disabled = false,
   // Tooltip props
   getProfile,
   provider,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing,
@@ -69,7 +66,7 @@ export function ReplyItem({
   const [isDeleting, setIsDeleting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
-  const isOwner = currentAddress?.toLowerCase() === reply.profileOwner.toLowerCase();
+  const isOwner = currentAddress?.toLowerCase() === reply.author.toLowerCase();
 
   const handleSaveEdit = async () => {
     if (!editContent.trim() || isSaving) return;
@@ -80,8 +77,9 @@ export function ReplyItem({
       setIsEditing(false);
       toast.success('Reply updated');
     } catch (error) {
-      console.error('Failed to edit reply:', error);
-      toast.error('Failed to update reply');
+      // Editing currently REFUSES with an explanation (a Bulletin object cannot change), and that
+      // explanation is the whole value of the failure — do not flatten it into "Failed to update".
+      reportError('edit your reply', error);
     } finally {
       setIsSaving(false);
     }
@@ -95,8 +93,7 @@ export function ReplyItem({
       await onDelete?.(reply.index);
       toast.success('Reply deleted');
     } catch (error) {
-      console.error('Failed to delete reply:', error);
-      toast.error('Failed to delete reply');
+      reportError('delete your reply', error);
       setIsDeleting(false);
     }
   };
@@ -115,22 +112,22 @@ export function ReplyItem({
       <div className="flex items-center gap-2 font-mono text-xs">
         {onSelectUser && (
           <UserLink
-            address={reply.profileOwner}
+            address={reply.author}
             displayName={reply.displayName}
             onSelectUser={onSelectUser}
             size="xs"
             getProfile={getProfile}
             provider={provider}
-            onStartDM={onStartDM}
-            canSendDM={canSendDM}
             onFollow={onFollow}
             onUnfollow={onUnfollow}
-            isFollowing={isFollowing?.(reply.profileOwner)}
+            isFollowing={isFollowing?.(reply.author)}
             onTip={onTip}
             canTip={canTip}
           />
         )}
         <span className="text-primary-600">
+          {/* ⚠️ NO `* 1000`. `Reply.timestamp` is epoch MILLISECONDS now, like every other migrated
+              surface, and `formatTimestamp` takes ms. Multiplying again rendered the year 58548. */}
           {formatTimestamp(reply.timestamp)}
         </span>
         {reply.editedAt && (
@@ -188,14 +185,8 @@ export function ReplyItem({
             compact
           />
 
-          {onReply && !disabled && (
-            <button
-              onClick={() => onReply(reply.index + 1)} // 1-indexed for nested replies
-              className="text-xs font-mono text-primary-600 hover:text-primary-400"
-            >
-              REPLY
-            </button>
-          )}
+          {/* ⛔ NO "REPLY" BUTTON. A reply to a reply has nowhere to record its parent, so this
+              control could only ever produce an error. Removed, not disabled. */}
 
           {isOwner && onEdit && !disabled && (
             <button
@@ -215,13 +206,6 @@ export function ReplyItem({
               {isDeleting ? 'DELETING...' : 'DELETE'}
             </button>
           )}
-        </div>
-      )}
-
-      {/* Nested Replies */}
-      {children && children.length > 0 && (
-        <div className="mt-3 ml-2 space-y-2">
-          {children.map((child) => renderChild?.(child))}
         </div>
       )}
     </div>

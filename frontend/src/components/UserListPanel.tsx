@@ -18,8 +18,6 @@ interface UserListPanelProps {
   // Tooltip props
   getProfile?: (address: string) => Promise<Profile>;
   provider?: Provider | null;
-  onStartDM?: (address: string) => void;
-  canSendDM?: boolean;
   onFollow?: (address: string) => Promise<void>;
   onUnfollow?: (address: string) => Promise<void>;
   isFollowing?: (address: string) => boolean;
@@ -34,8 +32,6 @@ export function UserListPanel({
   onSelectUser,
   getProfile,
   provider,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing,
@@ -118,8 +114,6 @@ export function UserListPanel({
                       isCurrentUser={isCurrentUser}
                       getProfile={getProfile}
                       provider={provider}
-                      onStartDM={onStartDM}
-                      canSendDM={canSendDM}
                       onFollow={onFollow}
                       onUnfollow={onUnfollow}
                       isFollowing={isFollowing?.(user.address)}

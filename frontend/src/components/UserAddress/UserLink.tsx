@@ -21,8 +21,6 @@ export function UserLink({
   // Tooltip props
   getProfile,
   provider,
-  onStartDM,
-  canSendDM = false,
   onFollow,
   onUnfollow,
   isFollowing = false,
@@ -93,6 +91,18 @@ export function UserLink({
     }
   }, []);
 
+  /**
+   * Navigate to the profile AND tear the tooltip down first, otherwise it hangs over the profile
+   * view it just opened: the pointer never leaves it (the profile renders underneath), so no
+   * mouseleave ever fires and `showTooltip` would stay true.
+   */
+  const handleSelectUser = useCallback((target: string) => {
+    cancelTimers();
+    isOverTooltipRef.current = false;
+    setShowTooltip(false);
+    onSelectUser(target);
+  }, [cancelTimers, onSelectUser]);
+
   const handleTooltipMouseLeave = useCallback(() => {
     isOverTooltipRef.current = false;
     setShowTooltip(false);
@@ -103,7 +113,7 @@ export function UserLink({
     <span className={`inline-flex items-center gap-1 ${className}`}>
       <button
         ref={buttonRef}
-        onClick={() => onSelectUser(address)}
+        onClick={() => handleSelectUser(address)}
         onMouseEnter={handleMouseEnter}
         onMouseLeave={handleMouseLeave}
         className={`
@@ -127,12 +137,11 @@ export function UserLink({
           triggerRect={triggerRect}
           getProfile={getProfile}
           provider={provider}
-          onStartDM={onStartDM}
-          canSendDM={canSendDM}
           onFollow={onFollow}
           onUnfollow={onUnfollow}
           isFollowing={isFollowing}
           onTip={onTip}
+          onSelectUser={handleSelectUser}
           canTip={canTip}
           isOwnProfile={isCurrentUser}
           onMouseEnter={handleTooltipMouseEnter}

@@ -1,0 +1,3 @@
+# Harness artefacts — never committed
+.artifacts/
+fixture-app/dist/

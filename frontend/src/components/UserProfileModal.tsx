@@ -11,10 +11,6 @@ interface UserProfileModalProps {
   userAddress: string | null;
   currentUserAddress?: string | null;
   getProfile: (address: string) => Promise<Profile>;
-  onStartDM?: (address: string) => void;
-  dmRegistryAvailable?: boolean;
-  canSendDM?: boolean;
-  hasSessionPublicKey?: (address: string) => Promise<boolean>;
   // Follow functionality
   isFollowing?: boolean;
   onFollow?: (address: string) => Promise<void>;
@@ -26,8 +22,9 @@ interface UserProfileModalProps {
   sessionWallet?: Signer | null;
   sessionWalletAddress?: string | null;
   sessionWalletBalance?: bigint;
-  browserProvider?: Provider | null;
-  browserWalletAddress?: string | null;
+  // Was `browserProvider` (MetaMask), used only to READ a balance — so it never needed a wallet
+  // at all. Now the anonymous read provider. `browserWalletAddress` is gone with the MetaMask path.
+  provider?: Provider | null;
 }
 
 export function UserProfileModal({
@@ -36,10 +33,6 @@ export function UserProfileModal({
   userAddress,
   currentUserAddress,
   getProfile,
-  onStartDM,
-  dmRegistryAvailable = false,
-  canSendDM = false,
-  hasSessionPublicKey,
   isFollowing = false,
   onFollow,
   onUnfollow,
@@ -48,8 +41,7 @@ export function UserProfileModal({
   sessionWallet,
   sessionWalletAddress,
   sessionWalletBalance,
-  browserProvider,
-  browserWalletAddress,
+  provider,
 }: UserProfileModalProps) {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [links, setLinks] = useState<Link[]>([]);
@@ -58,7 +50,6 @@ export function UserProfileModal({
   const [followActionLoading, setFollowActionLoading] = useState(false);
   const [showTipModal, setShowTipModal] = useState(false);
   const [profileBalance, setProfileBalance] = useState<bigint>(0n);
-  const [targetHasSessionKey, setTargetHasSessionKey] = useState<boolean | null>(null);
 
   const isOwnProfile = userAddress?.toLowerCase() === currentUserAddress?.toLowerCase();
 
@@ -113,29 +104,14 @@ export function UserProfileModal({
 
   // Fetch profile balance
   useEffect(() => {
-    if (isOpen && userAddress && browserProvider) {
-      browserProvider.getBalance(userAddress)
+    if (isOpen && userAddress && provider) {
+      provider.getBalance(userAddress)
         .then(setProfileBalance)
         .catch(() => setProfileBalance(0n));
     } else {
       setProfileBalance(0n);
     }
-  }, [isOpen, userAddress, browserProvider]);
-
-  // Check if target user has session key for encrypted DMs
-  useEffect(() => {
-    if (isOpen && userAddress && hasSessionPublicKey) {
-      hasSessionPublicKey(userAddress)
-        .then(setTargetHasSessionKey)
-        .catch(() => setTargetHasSessionKey(false));
-    } else {
-      setTargetHasSessionKey(null);
-    }
-  }, [isOpen, userAddress, hasSessionPublicKey]);
-
-  // Compute DM disabled state and reason
-  const dmDisabled = !canSendDM || !profile?.exists || targetHasSessionKey === false;
-  const dmDisabledReason = dmDisabled ? "Both users need a profile to send DMs" : undefined;
+  }, [isOpen, userAddress, provider]);
 
   if (!isOpen || !userAddress) return null;
 
@@ -250,31 +226,7 @@ export function UserProfileModal({
           <div className="space-y-2 mt-4">
             {!isOwnProfile && (
               <>
-                {dmRegistryAvailable && onStartDM && userAddress && (
-                  <div className="relative group">
-                    <button
-                      onClick={() => {
-                        onStartDM(userAddress);
-                        onClose();
-                      }}
-                      disabled={dmDisabled}
-                      className={`w-full py-2 border-2 font-mono text-sm transition-all ${
-                        !dmDisabled
-                          ? 'bg-accent-950 hover:bg-accent-900 border-accent-500 text-accent-400 hover:border-accent-400'
-                          : 'bg-gray-900 border-gray-700 text-gray-500 cursor-not-allowed'
-                      }`}
-                    >
-                      SEND DM
-                    </button>
-                    {dmDisabled && (
-                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 bg-black border border-primary-700 text-primary-500 font-mono text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-10">
-                        {dmDisabledReason}
-                        <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-primary-700" />
-                      </div>
-                    )}
-                  </div>
-                )}
-                {(sessionWallet || browserProvider) && userAddress && (
+                {sessionWallet && userAddress && (
                   <button
                     onClick={() => setShowTipModal(true)}
                     className="w-full py-2 bg-yellow-950 hover:bg-yellow-900 border-2 border-yellow-500 text-yellow-400 font-mono text-sm hover:border-yellow-400 transition-all"
@@ -325,8 +277,6 @@ export function UserProfileModal({
           sessionWallet={sessionWallet}
           sessionWalletAddress={sessionWalletAddress}
           sessionWalletBalance={sessionWalletBalance}
-          browserProvider={browserProvider}
-          browserWalletAddress={browserWalletAddress}
         />
       )}
     </div>

@@ -34,10 +34,19 @@ lerna-debug.log*
 .DS_Store
 Thumbs.db
 
-# Hardhat
+# Hardhat — two builds, two output directories (see contracts/CLAUDE.md § Configuration)
 contracts/cache/
 contracts/artifacts/
+contracts/cache-evm/
+contracts/artifacts-evm/
 contracts/typechain-types/
+
+# cdm build output. `.cdm/solidity/` looks like source but is regenerated on every build and can come
+# back with ADDRESS = 0x0000…0000 for anything not in that build — it is NOT an address record.
+# deployments.json is. Never commit these.
+contracts/.cdm/
+contracts/target/
+contracts/meta.json
 
 # Misc
 *.tsbuildinfo

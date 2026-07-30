@@ -1,11 +1,16 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { ethers } from 'ethers';
 import toast from 'react-hot-toast';
 import { truncateAddress, formatBalance } from '../utils/formatters';
-import type { Signer, Provider } from '../utils/contracts';
+import type { Signer } from '../utils/contracts';
 
+// The BROWSER-WALLET ARM IS GONE (architecture.md §1: the host container is the only surface).
+// What is left is one option, the posting key, so the picker below collapses to a single row.
+// The `WalletOption[]` shape is kept rather than flattened because a second option is coming back:
+// once the host arm can submit (see `lib/host/types.ts`, `SignerSeam.host.submit`), "tip from your
+// own account, with a prompt" belongs beside "tip from the posting key, prompt-free".
 interface WalletOption {
-  id: 'session' | 'browser';
+  id: 'session';
   label: string;
   address: string;
   signer: Signer | null;
@@ -17,14 +22,11 @@ interface TipModalProps {
   onClose: () => void;
   recipientAddress: string;
   recipientName?: string;
-  // Session/in-app wallet
+  /** The posting key (delegate). Prompt-free, which is why it is the tipping account. */
   sessionWallet?: Signer | null;
   sessionWalletAddress?: string | null;
   sessionWalletBalance?: bigint;
-  // Browser wallet
-  browserProvider?: Provider | null;
-  browserWalletAddress?: string | null;
-  // Connect wallet callback (when no wallet connected)
+  /** Opens the host notice when there is nothing to tip from. */
   onConnectWallet?: () => void;
 }
 
@@ -36,67 +38,28 @@ export function TipModal({
   sessionWallet,
   sessionWalletAddress,
   sessionWalletBalance = 0n,
-  browserProvider,
-  browserWalletAddress,
   onConnectWallet,
 }: TipModalProps) {
   const [amount, setAmount] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedWallet, setSelectedWallet] = useState<'session' | 'browser'>('browser');
-  const [browserBalance, setBrowserBalance] = useState<bigint>(0n);
-  const [browserSigner, setBrowserSigner] = useState<Signer | null>(null);
 
-  // Build wallet options
+  // One option: the posting key. The browser-wallet entry and the `useEffect` that fetched its
+  // balance and signer out of `provider.getSigner()` are gone with the MetaMask path.
   const walletOptions: WalletOption[] = [];
-
-  if (browserWalletAddress && browserProvider) {
-    walletOptions.push({
-      id: 'browser',
-      label: 'Browser Wallet',
-      address: browserWalletAddress,
-      signer: browserSigner,
-      balance: browserBalance,
-    });
-  }
 
   if (sessionWalletAddress && sessionWallet) {
     walletOptions.push({
       id: 'session',
-      label: 'Session Wallet',
+      label: 'Posting Key',
       address: sessionWalletAddress,
       signer: sessionWallet,
       balance: sessionWalletBalance,
     });
   }
 
-  const selectedOption = walletOptions.find(w => w.id === selectedWallet) || walletOptions[0];
+  const selectedOption = walletOptions[0];
   const canSend = walletOptions.length > 0 && selectedOption;
-
-  // Fetch browser wallet balance and signer when modal opens
-  useEffect(() => {
-    if (isOpen && browserProvider && browserWalletAddress && 'getSigner' in browserProvider) {
-      const browserProv = browserProvider as ethers.BrowserProvider;
-
-      // Get signer
-      browserProv.getSigner().then(setBrowserSigner).catch(() => setBrowserSigner(null));
-
-      // Get balance
-      browserProv.getBalance(browserWalletAddress).then(setBrowserBalance).catch(() => setBrowserBalance(0n));
-    }
-  }, [isOpen, browserProvider, browserWalletAddress]);
-
-  // Default to browser wallet if available, otherwise session
-  useEffect(() => {
-    if (isOpen && walletOptions.length > 0) {
-      // Prefer browser wallet as default
-      if (walletOptions.some(w => w.id === 'browser')) {
-        setSelectedWallet('browser');
-      } else {
-        setSelectedWallet('session');
-      }
-    }
-  }, [isOpen, walletOptions.length]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -119,11 +82,7 @@ export function TipModal({
         throw new Error('Insufficient balance in selected wallet');
       }
 
-      // Get signer
-      let activeSigner = selectedOption.signer;
-      if (!activeSigner && selectedOption.id === 'browser' && browserProvider && 'getSigner' in browserProvider) {
-        activeSigner = await (browserProvider as ethers.BrowserProvider).getSigner();
-      }
+      const activeSigner = selectedOption.signer;
       if (!activeSigner) {
         throw new Error('No wallet available to sign transaction');
       }
@@ -200,48 +159,6 @@ export function TipModal({
             </div>
           </div>
 
-          {/* Wallet Selection */}
-          {walletOptions.length > 1 && (
-            <div>
-              <label className="block text-primary-600 font-mono text-xs mb-2">
-                PAY FROM
-              </label>
-              <div className="space-y-2">
-                {walletOptions.map((wallet) => (
-                  <button
-                    key={wallet.id}
-                    type="button"
-                    onClick={() => setSelectedWallet(wallet.id)}
-                    disabled={isLoading}
-                    className={`w-full p-3 border text-left transition-colors ${
-                      selectedWallet === wallet.id
-                        ? 'border-yellow-500 bg-yellow-950/30'
-                        : 'border-primary-700 bg-primary-950 hover:border-primary-500'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="text-primary-300 font-mono text-sm">
-                          {wallet.label}
-                        </div>
-                        <div className="text-primary-600 font-mono text-xs mt-0.5">
-                          {truncateAddress(wallet.address)}
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <div className={`font-mono text-sm ${
-                          selectedWallet === wallet.id ? 'text-yellow-400' : 'text-primary-400'
-                        }`}>
-                          {formatBalance(wallet.balance)} PAS
-                        </div>
-                      </div>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
           {/* Single wallet display */}
           {walletOptions.length === 1 && selectedOption && (
             <div>
@@ -270,7 +187,7 @@ export function TipModal({
           {walletOptions.length === 0 && (
             <div className="text-center py-4">
               <p className="text-primary-400 font-mono text-sm mb-4">
-                Connect a wallet to send tips
+                Tipping needs a posting key, which needs the Polkadot app
               </p>
               {onConnectWallet && (
                 <button
@@ -281,7 +198,7 @@ export function TipModal({
                   }}
                   className="px-6 py-2 border-2 border-yellow-500 bg-yellow-950 text-yellow-500 font-mono text-sm hover:bg-yellow-900 transition-colors"
                 >
-                  CONNECT WALLET
+                  WHY NOT?
                 </button>
               )}
             </div>

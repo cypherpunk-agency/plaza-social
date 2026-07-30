@@ -11,8 +11,26 @@ interface UseUserRegistryProps {
   userAddress: string | null;
   signer?: Signer | null; // Signer for owner-only operations (profile creation, delegate management)
   delegateSigner?: Signer | null; // Signer for delegate-capable operations (links) - uses session wallet
+  /**
+   * Host-signed contract write. **Owner-only calls MUST use this, not `signer`.**
+   *
+   * `createProfile` records `msg.sender` as the owner, so signing it with the delegate would create a
+   * profile owned by a throwaway per-device key. The delegate is also unfunded, which surfaced as
+   * `code 1012 "Transaction is temporarily banned"` — the node rejects the unpayable transaction and
+   * the txpool then bans its hash, which reads like a mysterious ban rather than "no money".
+   */
+  hostWrite?: HostWrite | null;
   enabled?: boolean;
 }
+
+/** See `lib/host/types.ts` — `HostBackend.writeContract`. */
+type HostWrite = (
+  address: string,
+  abi: Record<string, unknown>[],
+  method: string,
+  args: unknown[],
+  label: string,
+) => Promise<{ txHash: string }>;
 
 interface UseUserRegistryReturn {
   // State
@@ -38,12 +56,6 @@ interface UseUserRegistryReturn {
   removeDelegate: (delegateAddress: string) => Promise<void>;
   isDelegate: (delegateAddress: string) => Promise<boolean>;
 
-  // Session key actions (for ECDH encryption)
-  setSessionPublicKey: (sessionPubKey: Uint8Array) => Promise<void>;
-  clearSessionPublicKey: () => Promise<void>;
-  getSessionPublicKey: (address: string) => Promise<string>;
-  hasSessionPublicKey: (address: string) => Promise<boolean>;
-
   // Lookup
   resolveToOwner: (address: string) => Promise<string>;
   getProfile: (address: string) => Promise<Profile>;
@@ -61,6 +73,7 @@ export function useUserRegistry({
   userAddress,
   signer,
   delegateSigner,
+  hostWrite,
   enabled = true,
 }: UseUserRegistryProps): UseUserRegistryReturn {
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -136,17 +149,68 @@ export function useUserRegistry({
     }
   }, [enabled, userAddress, registryAddress, provider, loadProfile]);
 
-  const createProfile = useCallback(
-    async (displayName: string, bio: string) => {
-      if (!enabled) throw new Error("Wallet not ready");
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      const tx = await contract.createProfile(displayName, bio);
-      await tx.wait();
+  /**
+   * Re-read the profile until it reports `exists`, or give up.
+   *
+   * Giving up is NOT an error: the write already succeeded, and the reader may simply be further
+   * behind than we are willing to wait. The next natural refresh will pick it up — so this resolves
+   * either way and never throws.
+   */
+  const waitForProfile = useCallback(
+    async (timeoutMs = 30_000, intervalMs = 1_500) => {
+      const contract = getReadContract();
+      const deadline = Date.now() + timeoutMs;
+      while (contract && Date.now() < deadline) {
+        try {
+          const data = await contract.getProfile(userAddress);
+          if (data?.exists) break;
+        } catch {
+          /* a transient read failure is not a reason to stop waiting */
+        }
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
       await loadProfile();
     },
-    [enabled, getWriteContract, loadProfile]
+    [getReadContract, userAddress, loadProfile]
+  );
+
+  const createProfile = useCallback(
+    async (displayName: string, bio: string) => {
+      if (!registryAddress) throw new Error("Contract not available");
+
+      // ⚠️ OWNER-ONLY — MUST be host-signed. `createProfile` records `msg.sender` as the owner, so
+      // the delegate path would create a profile owned by the per-device key rather than by the user,
+      // and the delegate is unfunded besides (that is the `code 1012 "Transaction is temporarily
+      // banned"` a user hit: the node rejects an unpayable tx, then the pool bans its hash).
+      if (!hostWrite) {
+        throw new Error(
+          "Creating a profile has to be signed by your Polkadot account, and this session cannot " +
+            "reach it. Open Plaza inside the Polkadot app and try again.",
+        );
+      }
+
+      await hostWrite(
+        registryAddress,
+        UserRegistryABI.abi as unknown as Record<string, unknown>[],
+        "createProfile",
+        [displayName, bio],
+        "createProfile",
+      );
+
+      /**
+       * ⚠️ POLL UNTIL THE PROFILE IS VISIBLE. One read here is not enough and the failure is silent.
+       *
+       * The write is submitted by the HOST and settles at best-block, but we read through a SEPARATE
+       * public RPC. That reader can trail the block the host just saw, so an immediate `getProfile`
+       * returns `exists: false` — the profile is created, the UI believes it is not, and the
+       * "set up your profile" banner stays up over a profile that plainly exists. Observed
+       * 2026-07-30. Events are no help: `eth_getLogs` cannot see host-submitted contract calls at
+       * all (architecture §8), so polling the view function is the correct mechanism, not a
+       * workaround.
+       */
+      await waitForProfile();
+    },
+    [registryAddress, hostWrite, waitForProfile]
   );
 
   const createDefaultProfile = useCallback(async () => {
@@ -322,48 +386,6 @@ export function useUserRegistry({
     [getReadContract]
   );
 
-  // Session key functions for ECDH encryption
-  const setSessionPublicKey = useCallback(
-    async (sessionPubKey: Uint8Array) => {
-      if (!enabled) throw new Error("Wallet not ready");
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      const tx = await contract.setSessionPublicKey(sessionPubKey);
-      await tx.wait();
-    },
-    [enabled, getWriteContract]
-  );
-
-  const clearSessionPublicKeyFn = useCallback(async () => {
-    if (!enabled) throw new Error("Wallet not ready");
-    const contract = await getWriteContract();
-    if (!contract) throw new Error("Contract not available");
-
-    const tx = await contract.clearSessionPublicKey();
-    await tx.wait();
-  }, [enabled, getWriteContract]);
-
-  const getSessionPublicKey = useCallback(
-    async (address: string): Promise<string> => {
-      const contract = getReadContract();
-      if (!contract) return "";
-
-      return contract.getSessionPublicKey(address);
-    },
-    [getReadContract]
-  );
-
-  const hasSessionPublicKeyFn = useCallback(
-    async (address: string): Promise<boolean> => {
-      const contract = getReadContract();
-      if (!contract) return false;
-
-      return contract.hasSessionPublicKey(address);
-    },
-    [getReadContract]
-  );
-
   return {
     profile,
     links,
@@ -380,10 +402,6 @@ export function useUserRegistry({
     addDelegate,
     removeDelegate,
     isDelegate,
-    setSessionPublicKey,
-    clearSessionPublicKey: clearSessionPublicKeyFn,
-    getSessionPublicKey,
-    hasSessionPublicKey: hasSessionPublicKeyFn,
     resolveToOwner,
     getProfile: getProfileFn,
     getLinks: getLinksFn,

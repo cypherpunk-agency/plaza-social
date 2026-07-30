@@ -1,9 +1,52 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { UserPost } from "../types/contracts";
-import UserPostsABI from "../contracts/UserPosts.json";
-import { createReadContract, createWriteContract, type Provider, type Signer } from "../utils/contracts";
+import PostRegistryABI from "../contracts/PostRegistry.json";
+import { createReadContract, type Provider, type Signer } from "../utils/contracts";
+import { createBlobCache, browserPersistence } from "../lib/blob-cache";
+import { walkChain } from "../lib/walk";
+import { encodePost, validatePostDraft } from "../lib/wire";
+import { FEED_REGISTRY } from "../lib/registry";
+import { NO_WRITE_SESSION } from "../lib/publish";
+import { usePublisher } from "./usePublisher";
+import { gatewayFetcher } from "../lib/gateways";
+
+/**
+ * A user's own post feed, on the migrated content model.
+ *
+ * ⚠️ `UserPosts.sol` IS DELETED. This hook used to call `getUserPostCount(address)` and
+ * `getLatestUserPosts(address, n)` on a per-user contract. Aliased onto `PostRegistry` during the
+ * migration those calls hit a contract with no such functions, and surfaced on the profile screen as:
+ *
+ *   execution reverted (no data present; likely require(false) occurred …
+ *   data="0x00a09832…18773c30d65de35027ac8cd19e98c0ddb9c44ef9"   ← getUserPostCount(address)
+ *
+ * A selector that decodes to a function the target does not have is the signature of an un-migrated
+ * hook, not of a broken contract.
+ *
+ * The model now: a profile feed is a `bytes32` registry id inside the one `PostRegistry`, and a user's
+ * posts are the chain hanging off THEIR head in that registry. So it is one `headOf` read plus a walk,
+ * and the cost does not grow with the number of authors or posts.
+ */
+
+/**
+ * Well-known open registry id for profile feeds. Open ids are `keccak256(name)`.
+ *
+ * Defined in `lib/registry.ts` and re-exported here so existing importers need no change.
+ */
+export { FEED_REGISTRY } from "../lib/registry";
+
+/** Matches PostRegistry's `HeadRef` tuple. */
+interface OnChainHead {
+  cid: string;
+  prev: string;
+  storeBlock: bigint;
+  movedAt: bigint;
+  by: string;
+  allowed: boolean;
+}
 
 interface UseUserPostsProps {
+  /** The PostRegistry address. Named for the old contract so callers need no change. */
   userPostsAddress: string | null;
   userAddress: string | null; // Profile owner whose posts to load
   provider: Provider | null;
@@ -13,84 +56,46 @@ interface UseUserPostsProps {
 }
 
 interface UseUserPostsReturn {
-  // State
   posts: UserPost[];
   isLoading: boolean;
   error: string | null;
 
-  // Actions
   createPost: (content: string) => Promise<number>;
   editPost: (postIndex: number, newContent: string) => Promise<void>;
   deletePost: (postIndex: number) => Promise<void>;
   refresh: () => Promise<void>;
 
-  // Metadata
   postCount: number;
-}
-
-// Raw post from contract
-interface RawPost {
-  profileOwner: string;
-  sender: string;
-  content: string;
-  timestamp: bigint;
-  editedAt: bigint;
-  isDeleted: boolean;
 }
 
 export function useUserPosts({
   userPostsAddress,
   userAddress,
   provider,
-  signer,
   getDisplayName,
-  enabled = true,
 }: UseUserPostsProps): UseUserPostsReturn {
+  // `null` when this session cannot write. Not an error — see `usePublisher`.
+  const publisher = usePublisher();
   const [posts, setPosts] = useState<UserPost[]>([]);
-  const [postCount, setPostCount] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
   const pollIntervalRef = useRef<number | null>(null);
 
-  const getReadContract = useCallback(() => {
-    return createReadContract(userPostsAddress, UserPostsABI.abi, provider);
-  }, [userPostsAddress, provider]);
+  // Bodies are immutable and content-addressed, so a cache hit can never be stale — only absent.
+  const cache = useMemo(
+    () => createBlobCache({ fetcher: gatewayFetcher(), persist: browserPersistence() }),
+    []
+  );
 
-  const getWriteContract = useCallback(async () => {
-    return createWriteContract(userPostsAddress, UserPostsABI.abi, provider, signer ?? null);
-  }, [userPostsAddress, provider, signer]);
-
-  const formatPost = useCallback(
-    async (raw: RawPost, index: number): Promise<UserPost> => {
-      let displayName: string | undefined;
-      if (getDisplayName) {
-        try {
-          displayName = await getDisplayName(raw.profileOwner);
-        } catch {
-          displayName = undefined;
-        }
-      }
-
-      return {
-        index,
-        profileOwner: raw.profileOwner,
-        sender: raw.sender,
-        content: raw.content,
-        timestamp: Number(raw.timestamp),
-        editedAt: raw.editedAt > 0n ? Number(raw.editedAt) : null,
-        isDeleted: raw.isDeleted,
-        displayName,
-      };
-    },
-    [getDisplayName]
+  const getReadContract = useCallback(
+    () => createReadContract(userPostsAddress, PostRegistryABI.abi, provider),
+    [userPostsAddress, provider]
   );
 
   const loadPosts = useCallback(async () => {
     const contract = getReadContract();
     if (!contract || !userAddress) {
       setPosts([]);
-      setPostCount(0);
       return;
     }
 
@@ -98,133 +103,154 @@ export function useUserPosts({
       setIsLoading(true);
       setError(null);
 
-      // Get post count for this user
-      const count = await contract.getUserPostCount(userAddress);
-      setPostCount(Number(count));
+      // ONE read: this user's head in the feed registry. There is exactly one head per
+      // (registry, writer), so this is O(1) no matter how much they have posted.
+      const head = (await contract.headOf(FEED_REGISTRY, userAddress)) as OnChainHead;
 
-      if (count === 0n) {
+      if (!head?.cid) {
         setPosts([]);
         return;
       }
 
-      // Load latest 50 posts for this user (newest first)
-      const limit = count > 50n ? 50n : count;
-      const [rawPosts, indices] = await contract.getLatestUserPosts(userAddress, limit);
+      const page = await walkChain({
+        heads: [
+          {
+            cid: head.cid,
+            prev: head.prev || null,
+            at: head.movedAt > 0n ? Number(head.movedAt) * 1000 : null,
+            by: head.by,
+            block: head.storeBlock > 0n ? Number(head.storeBlock) : null,
+            index: null,
+          },
+        ],
+        cache,
+        limit: 50,
+      });
 
-      // Format posts with display names
-      const formatted: UserPost[] = await Promise.all(
-        rawPosts.map((raw: RawPost, i: number) => formatPost(raw, Number(indices[i])))
+      let displayName: string | undefined;
+      if (getDisplayName) {
+        try {
+          displayName = await getDisplayName(userAddress);
+        } catch {
+          displayName = undefined;
+        }
+      }
+
+      setPosts(
+        page.entries.map((entry, index) => {
+          const decoded = entry.object;
+          // A hole: the body expired from Bulletin, or no gateway would serve it. The pointer is still
+          // on chain, so the post is real — it is the CONTENT that is gone, and calling that "deleted"
+          // would be wrong. Retention expiry is the only deletion mechanism this design has.
+          const content = !decoded
+            ? "(this post's body has expired from Bulletin storage)"
+            : decoded.kind === "post" || decoded.kind === "msg"
+              ? decoded.body
+              : decoded.kind === "thread"
+                ? decoded.excerpt
+                : "";
+
+          return {
+            index,
+            cid: entry.cid,
+            profileOwner: userAddress,
+            sender: decoded?.author || entry.author || userAddress,
+            content,
+            timestamp: decoded?.at ?? entry.at ?? 0,
+            editedAt: null,
+            isDeleted: false,
+            displayName,
+          } as UserPost;
+        })
       );
-
-      setPosts(formatted);
     } catch (err) {
-      console.error("Failed to load posts:", err);
+      console.error("Failed to load user posts:", err);
       setError(err instanceof Error ? err.message : "Failed to load posts");
     } finally {
       setIsLoading(false);
     }
-  }, [getReadContract, userAddress, formatPost]);
+  }, [getReadContract, userAddress, cache, getDisplayName]);
 
   const createPost = useCallback(
     async (content: string): Promise<number> => {
-      if (!enabled) throw new Error("Wallet not ready");
-      if (!content.trim()) throw new Error("Post content cannot be empty");
+      if (!publisher) throw new Error(NO_WRITE_SESSION);
 
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      try {
-        const tx = await contract.createPost(content);
-        const receipt = await tx.wait();
-
-        // Extract post index from event
-        const event = receipt.logs.find((log: { topics: readonly string[]; data: string }) => {
-          try {
-            const parsed = contract.interface.parseLog(log);
-            return parsed?.name === "PostCreated";
-          } catch {
-            return false;
-          }
-        });
-
-        let postIndex = 0;
-        if (event) {
-          const parsed = contract.interface.parseLog(event);
-          postIndex = Number(parsed?.args?.postIndex ?? 0);
-        }
-
-        await loadPosts();
-        return postIndex;
-      } catch (err) {
-        throw err instanceof Error ? err : new Error("Failed to create post");
+      /**
+       * ⚠️ A FEED WRITE ALWAYS LANDS IN THE SIGNER'S OWN ROW. `setHead` writes `_heads[FEED][sender]`,
+       * so publishing while looking at somebody else's profile would silently file the post under
+       * OUR feed and then not show it here — a post that vanishes. Refuse instead.
+       */
+      if (userAddress && publisher.author.toLowerCase() !== userAddress.toLowerCase()) {
+        throw new Error("You can only post to your own feed.");
       }
+
+      // Validated before anything is stored, so an over-long post is refused at the field that can
+      // fix it rather than after a Bulletin write.
+      const draft = validatePostDraft({ body: content });
+
+      const { confirmed } = await publisher.publish({
+        registry: FEED_REGISTRY,
+        cache,
+        label: "post",
+        build: (link) =>
+          encodePost({
+            ...link,
+            author: publisher.author,
+            body: draft.body,
+            attachments: draft.attachments,
+            // `i` lets a reply count be read from the head object alone, without walking the chain.
+            index: posts.length,
+            registry: FEED_REGISTRY,
+          }),
+      });
+
+      await loadPosts();
+      if (!confirmed) {
+        throw new Error(
+          "Your post was submitted, but it has not shown up in a read yet. It should appear within " +
+            "a minute; the feed refreshes on its own."
+        );
+      }
+      return 0;
     },
-    [enabled, getWriteContract, loadPosts]
+    [publisher, userAddress, cache, posts.length, loadPosts]
   );
 
-  const editPost = useCallback(
-    async (postIndex: number, newContent: string): Promise<void> => {
-      if (!enabled) throw new Error("Wallet not ready");
-      if (!newContent.trim()) throw new Error("Post content cannot be empty");
+  const editPost = useCallback(async (): Promise<void> => {
+    // Bodies are immutable Bulletin objects. An "edit" is a NEW object with a new CID — and therefore
+    // a new, empty vote tally, deliberately: a tally belongs to the bytes people actually voted on.
+    throw new Error(
+      "Editing is not wired up yet. A Bulletin object cannot be changed, so an edit publishes a " +
+        "replacement — and what that should do to existing replies and votes is not decided."
+    );
+  }, []);
 
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
+  const deletePost = useCallback(async (): Promise<void> => {
+    throw new Error(
+      "Deleting is not available, and will not work the way it used to: freeing storage refunds " +
+        "whoever freed it, so a moderated delete would hand an admin the author's deposit. Content " +
+        "goes away by stopping renewal instead."
+    );
+  }, []);
 
-      try {
-        const tx = await contract.editPost(postIndex, newContent);
-        await tx.wait();
-        await loadPosts();
-      } catch (err) {
-        throw err instanceof Error ? err : new Error("Failed to edit post");
-      }
-    },
-    [enabled, getWriteContract, loadPosts]
-  );
-
-  const deletePost = useCallback(
-    async (postIndex: number): Promise<void> => {
-      if (!enabled) throw new Error("Wallet not ready");
-
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      try {
-        const tx = await contract.deletePost(postIndex);
-        await tx.wait();
-        await loadPosts();
-      } catch (err) {
-        throw err instanceof Error ? err : new Error("Failed to delete post");
-      }
-    },
-    [enabled, getWriteContract, loadPosts]
-  );
-
-  // Load posts when user changes or getDisplayName becomes available
   useEffect(() => {
     if (userPostsAddress && provider && userAddress) {
       loadPosts();
     } else {
       setPosts([]);
-      setPostCount(0);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userPostsAddress, provider, userAddress, getDisplayName]);
+  }, [userPostsAddress, provider, userAddress]);
 
-  // Poll for new posts every 30 seconds
+  // Polling, NOT log subscriptions: `eth_getLogs` cannot see events from host-submitted contract
+  // calls (architecture §8). Do not "modernise" this.
   useEffect(() => {
     if (!userPostsAddress || !provider || !userAddress) return;
-
-    pollIntervalRef.current = window.setInterval(() => {
-      loadPosts();
-    }, 30000);
-
+    pollIntervalRef.current = window.setInterval(() => void loadPosts(), 30000);
     return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-      }
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userPostsAddress, provider, userAddress]);
+  }, [userPostsAddress, provider, userAddress, loadPosts]);
 
   return {
     posts,
@@ -234,6 +260,6 @@ export function useUserPosts({
     editPost,
     deletePost,
     refresh: loadPosts,
-    postCount,
+    postCount: posts.length,
   };
 }

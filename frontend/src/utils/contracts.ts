@@ -1,10 +1,29 @@
 import { ethers } from 'ethers';
 
-export type Provider = ethers.BrowserProvider | ethers.JsonRpcProvider;
-export type Signer = ethers.Wallet | ethers.Signer;
+// Contract factories, host-only.
+//
+// WHAT WAS REMOVED AND WHY. This file used to carry the wallet-mode fork:
+//
+//   · `createWriteContract` took a `provider` and, when no external signer was supplied, called
+//     `provider.getSigner()` to fish a signer out of MetaMask. That was the browser-wallet path, and
+//     architecture.md §1 deletes it — the host container is the only surface.
+//   · `isBrowserProvider` existed solely to decide which branch to take. Nothing else used it.
+//   · The `externalSigner instanceof ethers.Wallet` special case connected a standalone in-app wallet
+//     to a provider. The delegate signer arrives already connected (see `lib/host/delegate.ts`), so
+//     there is nothing to reconnect.
+//
+// ⚠️ A SIGNER IS NOW ALWAYS EXPLICIT. `createWriteContract` returns `null` rather than reaching into
+// the environment for one, because there is nowhere left to reach: the two arms of the signer seam are
+// the derived delegate key (an ordinary `ethers.Signer`) and the host, which signs native Revive
+// extrinsics and therefore cannot be an `ethers.Signer` at all. Silently falling back to "whatever is
+// in the page" is how the browser-wallet path survived the decision to delete it.
+
+export type Provider = ethers.JsonRpcProvider | ethers.Provider;
+export type Signer = ethers.Signer;
 
 /**
- * Creates a read-only contract instance
+ * A read-only contract instance. Needs no wallet, no container and no permission — which is why the
+ * whole app can render for a visitor who has nothing.
  */
 export function createReadContract(
   address: string | null,
@@ -16,8 +35,20 @@ export function createReadContract(
 }
 
 /**
- * Creates a contract instance for writing (with signer)
- * Handles both BrowserProvider (can get signer) and JsonRpcProvider (needs external signer)
+ * A contract instance for writing.
+ *
+ * `externalSigner` is the delegate arm of the signer seam
+ * (`useHostSession().signer.delegateSigner`). `null` in, `null` out: no signer means no write, and
+ * the caller must present that as a capability (`capabilities.reason`) rather than as an error.
+ *
+ * ⚠️ THE SIGNATURE AND THE `Promise` ARE KEPT DELIBERATELY, even though nothing in here is
+ * asynchronous any more. Sixteen feature hooks call this as
+ * `await createWriteContract(addr, ABI, provider, signer)` and they are scheduled for migration onto
+ * the seam AFTER the contract interface and Bulletin data layer land. Changing the shape now would
+ * mean touching all sixteen twice. When they are migrated, drop the `async` and reorder at will.
+ *
+ * `provider` is used only when the signer is not already bound to one. The delegate signer normally
+ * is, so that is a safety net rather than the usual path.
  */
 export async function createWriteContract(
   address: string | null,
@@ -25,43 +56,11 @@ export async function createWriteContract(
   provider: Provider | null,
   externalSigner: Signer | null
 ): Promise<ethers.Contract | null> {
-  if (!address) return null;
-
-  // Prefer external signer (required for JsonRpcProvider / standalone mode)
-  if (externalSigner) {
-    // Connect wallet to provider if it's not already connected
-    if (externalSigner instanceof ethers.Wallet && provider) {
-      return new ethers.Contract(address, abi, externalSigner.connect(provider));
-    }
-    return new ethers.Contract(address, abi, externalSigner);
-  }
-
-  // Fall back to getting signer from provider (only works with BrowserProvider)
-  if (!provider) return null;
-
-  // Check if provider can give us a signer (BrowserProvider has getSigner, JsonRpcProvider doesn't)
-  if (isBrowserProvider(provider)) {
-    try {
-      const signer = await provider.getSigner();
-      return new ethers.Contract(address, abi, signer);
-    } catch {
-      return null;
-    }
-  }
-
-  return null;
-}
-
-/**
- * Type guard to check if provider is BrowserProvider (has getSigner method)
- */
-export function isBrowserProvider(
-  provider: Provider | null
-): provider is ethers.BrowserProvider {
-  if (!provider) return false;
-  // BrowserProvider has getSigner method that returns a promise
-  // JsonRpcProvider doesn't have getSigner as a callable method
-  // Note: Don't use constructor.name as it gets mangled in production builds
-  return 'getSigner' in provider &&
-         typeof (provider as ethers.BrowserProvider).getSigner === 'function';
+  if (!address || !externalSigner) return null;
+  const bound = externalSigner.provider
+    ? externalSigner
+    : provider
+      ? externalSigner.connect(provider)
+      : externalSigner;
+  return new ethers.Contract(address, abi, bound);
 }
