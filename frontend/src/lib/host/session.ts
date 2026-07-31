@@ -29,25 +29,30 @@
 //    never posts must never see an allowance dialog. See `allowance.ts`.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-import { ethers } from 'ethers'
-
 import { createAllowanceGate } from './allowance'
 import { createCapabilityStore, READ_ONLY } from './capabilities'
 import { insideContainer, productIdentifier } from './container'
-import { createHostContractWriter } from './contracts'
+import { assetHub, createHostContractWriter, createSdkChainReader } from './contracts'
 import { createDelegate } from './delegate'
 import { createDiagnostics } from './diagnostics'
 import { classifyWriteFailure, isAllowanceFailure } from './errors'
+import { setBulletinSource } from '../bulletin'
 import { destinationFromPublicKey, normaliseH160 } from '../recipient'
-import { loadAddress, loadAssetHubDescriptor, loadChainClient, loadCloudStorage, loadHost, loadStatementStore, loadTx, loadWallet, sdkAvailable } from './sdk'
-import type { HostAccount, HostBackend, PaymentsSeam, PutBlobOptions, RecipientResolution, SignerSeam, TipOutcome } from './types'
+import { loadAddress, loadCloudStorage, loadHost, loadStatementStore, loadTx, loadWallet, sdkAvailable } from './sdk'
+import type { ChainReader, HostAccount, HostBackend, PaymentsSeam, PutBlobOptions, RecipientResolution, SignerSeam, TipOutcome } from './types'
 import { describe, TIMEOUTS, unwrapParity, withTimeout, type ParityResult } from './util'
 
 export interface HostSessionOptions {
   /** Product/topic name the statement store publishes under. */
   appName: string
-  /** ETH-RPC endpoint for anonymous reads. Reads never touch the host. */
-  rpcUrl: string
+  /**
+   * Open the SDK chain-read path at all.
+   *
+   * ⚠️ IT IS A SWITCH, NOT AN ENDPOINT, AND IT USED TO BE A URL. `rpcUrl` took a third-party HTTP
+   * origin — see `backend.ts` and `utils/contracts.ts`. `false` here means "no chain reads", which
+   * exists only so a screen can be proved to degrade honestly with no chain at all (`?rpc=off`).
+   */
+  chainReads?: boolean
   /**
    * Which Bulletin network preset to use.
    *
@@ -70,18 +75,26 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
   const diag = createDiagnostics()
   const capabilities = createCapabilityStore(READ_ONLY)
 
-  /* -- reads, first and unconditionally ------------------------------------ */
-  // Built before anything host-shaped is touched, so a total host failure still leaves a readable
-  // app. This provider is anonymous: no wallet, no container, no permission.
-  let provider: ethers.JsonRpcProvider | null = null
-  try {
-    provider = new ethers.JsonRpcProvider(options.rpcUrl)
-    diag.step('chain', 'ok', options.rpcUrl)
-  } catch (error) {
-    diag.step('chain', 'fail', describe(error))
-  }
+  /* -- chain reads --------------------------------------------------------- */
+  //
+  // ⛔ DELIBERATELY NOT BUILT YET. This block used to sit HERE, above the container check, and read:
+  //
+  //     provider = new ethers.JsonRpcProvider('https://paseo-assethub-rpc.laissez-faire.trade')
+  //
+  // — unconditionally, for every visitor, before we even knew whether there was a host. It was the
+  // same violation the IPFS gateways were (`gotchas.md` § THE SDK PATH IS THE ONLY PATH) and it fired
+  // earlier and more often: every board head, profile, vote tally, follow edge, 30-second poll and
+  // read-after-write confirmation loop was external-origin HTTP from a domain that is neither
+  // Parity's nor the community foundation's.
+  //
+  // The reader is now created BELOW the container check, because the SDK path needs the host and
+  // there is no second path to fall back to. See `contracts.ts` `createSdkChainReader`.
+  let chainReader: ChainReader | null = null
+  let chainReadsServed = 0
+  let chainReadsFailed = 0
+  let lastChainEmit = 0
 
-  const delegate = createDelegate({ diagnostics: diag, provider: () => provider })
+  const delegate = createDelegate({ diagnostics: diag })
 
   let account: HostAccount | null = null
   // Typed loosely on purpose: the SDK bindings are `any` until the `@parity/*` packages are
@@ -103,7 +116,11 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
    * open a Bulletin client at all. See the long note in `putBlob`. Kept separate from `storage`
    * because `canWrite` must be true when EITHER exists.
    */
-  let preimages: { submit?: (bytes: Uint8Array) => Promise<unknown> } | null = null
+  let preimages: {
+    submit?: (bytes: Uint8Array) => Promise<unknown>
+    /** The READ half of the same channel. See `installBulletinReader`. */
+    lookup?: (key: string, onValue: (preimage: Uint8Array | null) => void) => unknown
+  } | null = null
 
   const allowance = createAllowanceGate({
     address: () => capabilities.get().address,
@@ -128,18 +145,112 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
   diag.step('sdk', hasSdk ? 'ok' : 'skip', hasSdk ? productIdentifier() : 'not installed')
 
   if (!inside) {
+    /**
+     * ⛔ NO CONTAINER MEANS NO BULLETIN READS AT ALL, AND THAT IS REPORTED, NOT ROUTED AROUND.
+     *
+     * Until 2026-07-31 this case was covered by racing four public IPFS gateways over plain `fetch`.
+     * That is what made the host prompt a real user for permission to reach
+     * `devnet-ipfs.api.polkadotcommunity.foundation`, and the alternative path has been removed —
+     * see `lib/bulletin.ts` for the whole argument. The honest consequence is that a plain browser
+     * tab can read the CHAIN (heads, profiles, vote tallies, all via `eth_call`) but cannot load a
+     * single post BODY, and it says so here instead of pretending.
+     */
+    setBulletinSource(null)
+    diag.step(
+      'read',
+      'fail',
+      hasSdk
+        ? 'post bodies are read through the Polkadot app, so nothing can be loaded outside it. ' +
+          'Open Plaza from the Polkadot app, or use ?backend=fake for local development.'
+        : 'the Products SDK is not installed in this build, so there is no way to read post bodies.',
+    )
+    /**
+     * ⛔ AND NEITHER IS THERE A CHAIN READ. NEW 2026-07-31, AND IT IS A CORRECTION.
+     *
+     * The old text here promised "reading works anywhere", because chain reads went over a public
+     * HTTP RPC. They do not any more, and there is no fallback to route around it by design. So this
+     * branch now says the same thing about heads, profiles and tallies that it already said about
+     * post bodies, and `canRead` is `false` — which is what makes `SessionStatus` show its honest
+     * "Plaza could not reach the chain" header instead of an app that renders an empty board as if
+     * the board were empty.
+     */
+    diag.step(
+      'chain',
+      'fail',
+      hasSdk
+        ? 'chain reads go through the Polkadot app (product-sdk-contracts .query over the host ' +
+          'provider), so threads, profiles and vote tallies cannot load outside it. Open Plaza from ' +
+          'the Polkadot app, or use ?backend=fake for local development.'
+        : 'the Products SDK is not installed in this build, so there is no way to read the chain.',
+    )
     capabilities.set({
-      canRead: !!provider,
+      canRead: false,
       canWrite: false,
       canPushLive: false,
       address: null,
       insideHost: false,
       reason:
-        'Plaza posts through the Polkadot app. Open it from there to write; reading works anywhere. ' +
-        'For local development use ?backend=fake.',
+        'Plaza runs inside the Polkadot app: both its content and its chain data are read through ' +
+        'the app, so open it from there. For local development use ?backend=fake.',
     })
     return assemble()
   }
+
+  /* -- chain reads, before the wallet and unconditionally ------------------- */
+  //
+  // ⭐ EVERY CONTRACT READ IN THE APP GOES THROUGH THIS OBJECT, AND IT NEEDS NO ACCOUNT.
+  //
+  // Placed here for the same reason `installBulletinReader` is placed here: an anonymous reader
+  // inside the host must get a full timeline, and every failure below this line returns early.
+  // Reading has never depended on an account and must not start now — `.query()`'s origin resolution
+  // ends in a pallet-revive account fallback, so there is nothing to wait for.
+  //
+  // Construction is synchronous and cannot fail: the chain client is built lazily on the FIRST read
+  // (see `contracts.ts` `assetHub()`), so a read-only session that never renders a list never opens
+  // a connection, and a connection failure surfaces on the read that needed it rather than as a
+  // session that would not start.
+  if (options.chainReads === false) {
+    // `?rpc=off`. The one legitimate way to have no chain: proving a screen degrades honestly.
+    diag.step('chain', 'skip', 'chain reads disabled with ?rpc=off — nothing may crash')
+  } else {
+    chainReader = createSdkChainReader({
+      environment: options.bulletinNetwork === 'paseo' ? 'paseo' : 'devnet',
+      onRead: reportChainRead,
+    })
+    diag.step(
+      'chain',
+      'ok',
+      `${chainReader.label} — reads dry-run through the host with product-sdk-contracts .query(), ` +
+        'no external RPC and therefore no permission prompt. The connection opens on the first read.',
+    )
+  }
+
+  /* -- bulletin READS, before the wallet and unconditionally ---------------- */
+  //
+  // ⭐ THE ONE PATH POST BODIES ARE READ THROUGH, AND IT NEEDS NO WALLET AND NO CHAIN CLIENT.
+  //
+  // Placed HERE, above the wallet block, for the same reason the chain reader is built above it: an
+  // anonymous reader inside the host must get a full timeline, and every failure below this line
+  // returns early. Reading has never depended on an account and must not start now.
+  //
+  // ⚠️ AND IT DOES NOT DEPEND ON `storage` EITHER. This is the finding that makes the whole change
+  // work, and it is the opposite of what the CloudStorage README implies:
+  //
+  //   `CloudStorageClient.fetchBytes(cid, opts)` is, verbatim in the shipped
+  //   `dist/index.js`, `executeQuery(await this.resolveQuery(), cid, opts)`, and `resolveQuery()`
+  //   is `resolveQueryStrategy()`, which is `await getPreimageManager()` and nothing else.
+  //
+  // So the read path touches NO chain client, NO genesis hash and NO
+  // `system.featureSupported({ tag: 'Chain' })` probe — which is precisely the probe that stops
+  // `CloudStorageClient.create()` from ever succeeding on a host in `rpc-gateway` chain-backend
+  // mode (see the long note above `bulletinCandidates`). `storage` being null on a real phone is
+  // the NORMAL case, and it does not disable reads: the module-level `resolveQueryStrategy` /
+  // `executeQuery` pair reaches the same host preimage subscription the write path already uses,
+  // and that channel carried a real write on 2026-07-30.
+  //
+  // `executeQuery` also reassembles chunked DAG-PB manifest CIDs (manifest lookup, then every child
+  // chunk under one `Promise.all`), which is work we would otherwise have had to write ourselves.
+  await installBulletinReader()
 
   /* -- wallet -------------------------------------------------------------- */
   diag.step('connect', 'running')
@@ -184,7 +295,8 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
     }
     manager = null
     capabilities.set({
-      canRead: !!provider,
+      // Unaffected by a failed wallet: `.query()` needs no account. This is the anonymous reader.
+      canRead: !!chainReader,
       canWrite: false,
       canPushLive: false,
       address: null,
@@ -423,7 +535,7 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
   // is enough, and it does not affect posting". Advisory only; it must NEVER gate a write, and LITE
   // COUNTS (`status === 1 || status === 2`; there is no `=== 2` test anywhere and there must not be).
   capabilities.set({
-    canRead: !!provider,
+    canRead: !!chainReader,
     // ⚠️ EITHER write path is enough. `storage` (CloudStorage) is unavailable on a host in
     // `rpc-gateway` chain-backend mode, where posting still works through the preimage channel — so
     // requiring `storage` here reported "posting is off" to users who could in fact post.
@@ -454,6 +566,110 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
   return assemble()
 
   /* ====================================================================== */
+
+  /**
+   * Counters for the chain-read path, THROTTLED for the same reason the Bulletin one is: every
+   * `diagnostics.step` notifies every subscriber and `useHostSession` pipes that straight into React
+   * state, so one emit per read would re-render the whole app dozens of times during a single poll —
+   * the exact flicker `lib/poll.ts` was rewritten to remove.
+   *
+   * The first success and the first failure always land, so "is the native read route working at
+   * all?" is answerable immediately, which is the question this step exists for.
+   */
+  function reportChainRead(ok: boolean, detail: string): void {
+    if (ok) chainReadsServed += 1
+    else chainReadsFailed += 1
+    const first = ok ? chainReadsServed === 1 : chainReadsFailed === 1
+    const now = Date.now()
+    if (!first && now - lastChainEmit < 2_000) return
+    lastChainEmit = now
+    diag.step(
+      'chain',
+      chainReadsFailed > 0 && chainReadsServed === 0 ? 'fail' : 'ok',
+      `${chainReadsServed} read${chainReadsServed === 1 ? '' : 's'} served, ${chainReadsFailed} failed · last ${detail}`,
+    )
+  }
+
+  /**
+   * Resolve the host's preimage query strategy once and install it as THE Bulletin read path.
+   *
+   * A failure here is reported as a failure, not smoothed over: with no gateway fallback left,
+   * "the read path did not open" is the difference between a working app and a board of holes, and
+   * the diagnostics panel is the only debugger available on a phone.
+   */
+  async function installBulletinReader(): Promise<void> {
+    diag.step('read', 'running')
+    try {
+      const cloud = await loadCloudStorage()
+      const strategy = await withTimeout(
+        Promise.resolve(cloud.resolveQueryStrategy()),
+        TIMEOUTS.connect,
+        'Bulletin read path',
+      )
+      if (!strategy || typeof strategy.lookup !== 'function') {
+        throw new Error('the host offered no preimage lookup')
+      }
+
+      /**
+       * Counters rather than a line per read, and THROTTLED, because `diagnostics.step` notifies
+       * every subscriber and `useHostSession` pipes that straight into React state. One emit per
+       * body would re-render the whole app twenty times during a single page walk — the exact
+       * flicker `lib/poll.ts` was just rewritten to remove. The first event of each kind always
+       * lands, so "is the native route working at all?" is answerable immediately.
+       */
+      let served = 0
+      let unavailable = 0
+      let lastEmit = 0
+      const report = (detail: string, force: boolean) => {
+        const now = Date.now()
+        if (!force && now - lastEmit < 2_000) return
+        lastEmit = now
+        diag.step('read', unavailable > 0 && served === 0 ? 'skip' : 'ok', detail)
+      }
+
+      setBulletinSource({
+        label: `host ${String(strategy.kind ?? 'lookup')}`,
+        async read(cid, { timeoutMs }) {
+          const startedAt = Date.now()
+          try {
+            const bytes = unwrapParity<Uint8Array>(
+              (await cloud.executeQuery(strategy, cid, { lookupTimeoutMs: timeoutMs })) as ParityResult<Uint8Array>,
+              'Bulletin read',
+            )
+            served += 1
+            report(
+              `${served} served, ${unavailable} unavailable · last ${Date.now() - startedAt} ms ` +
+                'via the host preimage lookup — no external gateway is contacted',
+              served === 1,
+            )
+            return bytes
+          } catch (error) {
+            unavailable += 1
+            report(
+              `${served} served, ${unavailable} unavailable · last failure: ${describe(error)}`,
+              unavailable === 1,
+            )
+            throw error
+          }
+        },
+      })
+      diag.step(
+        'read',
+        'ok',
+        `${String(strategy.kind ?? 'lookup')} ready — post bodies load through the host, with no ` +
+          'external gateway and therefore no permission prompt',
+      )
+    } catch (error) {
+      // ⛔ No second path. Say what broke and what it costs, in that order.
+      setBulletinSource(null)
+      diag.step(
+        'read',
+        'fail',
+        `${describe(error)} — post bodies cannot be loaded in this session. Chain reads ` +
+          '(threads, profiles, vote tallies) are unaffected; the words are what is missing.',
+      )
+    }
+  }
 
   function assemble(): HostBackend {
     // Owner-only writes go through the product account, never the delegate — see `contracts.ts` for
@@ -514,9 +730,10 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
         }
       : null
 
+    // ⚠️ ONE ARM. `delegateSigner` was removed 2026-07-31 — see `types.ts` `SignerSeam` for the two
+    // independent reasons it could never have worked, and `delegate.ts` for what is left of it.
     const seam: SignerSeam = {
       host: { account, signer: hostSigner, submit },
-      delegateSigner: delegate.signer(),
     }
 
     return {
@@ -576,19 +793,38 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
       // exists but can only fail is worse than an honest null.
       payments: inside ? createPayments() : null,
 
-      readProvider: () => provider,
-      signer: () => ({ ...seam, delegateSigner: delegate.signer() }),
+      chainReader: () => chainReader,
+      signer: () => seam,
 
       delegation: () => (capabilities.get().canWrite ? delegate.state() : null),
       onDelegation: (listener) =>
         delegate.subscribe((state) => listener(capabilities.get().canWrite ? state : null)),
+      /**
+       * ⛔ THIS WRITES NOTHING. IT IS A STUB, AND `App.tsx` STILL WIRES "SET UP POSTING KEY" TO IT.
+       *
+       * The on-chain half is injected by whoever owns the contract (`delegate.authorize({
+       * authorizeOnChain })`), so this seam does not grow an ABI dependency. Nobody injects it.
+       *
+       * ⭐ THE WORKING IMPLEMENTATION ALREADY EXISTS ELSEWHERE: `hooks/useUserRegistry.ts`
+       * `authorizeDelegate(delegateAddress, expiryUnixSeconds)` is host-signed and polls
+       * `delegateExpiry` until the chain agrees. Wiring the two together is not a rename — the
+       * clock-skew clamp and `MAX_DELEGATION_SECONDS` read live in `delegate.ts` `authorize()`,
+       * which this method does not call, so a caller has to supply `authorizeOnChain` rather than
+       * replace this function.
+       *
+       * ⚠️ It resolves rather than throwing because `HostBackend.authorizeDelegate` is documented
+       * "never throws" and the settings screen already degrades correctly: with no confirmed expiry
+       * from `onConfirmDelegate` it says "sent, watch the line above" instead of claiming success.
+       * That is the one thing that must not regress — a stub that reported success is exactly the
+       * failure a user hit on a real phone.
+       */
       authorizeDelegate: async () => {
-        // The on-chain half is injected by whoever owns the contract, so the seam does not grow an
-        // ABI dependency. Until that lands this is honest about doing nothing rather than pretending.
         diag.step(
           'delegate',
           'skip',
-          'authorising a delegate needs the contract layer, which is not wired into this seam yet',
+          'NOTHING WAS WRITTEN. This seam has no contract layer injected, so it cannot authorise a ' +
+            'delegate. The working call is useUserRegistry.authorizeDelegate(address, expiry); it ' +
+            'is host-signed and confirms on chain. See the note in session.ts.',
         )
         return delegate.state()
       },
@@ -600,6 +836,9 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
       requestAllowanceAgain: allowance.requestAgain,
 
       destroy() {
+        // Cleared first: a source left installed would keep answering reads from a torn-down host,
+        // and the next backend to open would not be able to tell it apart from its own.
+        setBulletinSource(null)
         for (const close of [
           () => statements?.destroy?.(),
           () => storage?.destroy?.(),
@@ -708,12 +947,13 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
           return { status: 'unavailable', reason: `"${h160Address}" is not a 20-byte address.` }
         }
         try {
-          const [mod, descriptor, address] = await Promise.all([
-            loadChainClient(),
-            loadAssetHubDescriptor(options.bulletinNetwork === 'paseo' ? 'paseo' : 'devnet'),
+          // ⚠️ THE SHARED CLIENT (`contracts.ts` `assetHub()`), not a second one. This used to call
+          // `createChainClient` itself, which opened a third chainHead subscription for the same
+          // chain the reader and the writer were already on.
+          const [{ client }, address] = await Promise.all([
+            assetHub(options.bulletinNetwork === 'paseo' ? 'paseo' : 'devnet'),
             loadAddress(),
           ])
-          const client = await mod.createChainClient({ chains: { assetHub: descriptor } })
 
           // `StorageDescriptor<[Key: SizedHex<20>], SS58String, true, never>` — `SizedHex` is a
           // branded plain string, so the bare `0x…` goes in as-is. (The old comment claiming the

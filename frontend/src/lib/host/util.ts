@@ -19,6 +19,17 @@ export function withTimeout<T>(promise: PromiseLike<T>, ms: number, label: strin
 
 export const TIMEOUTS = {
   connect: 20_000,
+  /**
+   * One contract `.query()` dry-run.
+   *
+   * ⚠️ THE FIRST READ OF A SESSION PAYS FOR THE CHAIN CLIENT TOO — the Asset Hub descriptor chunk
+   * plus the chainHead subscription — so this is deliberately generous rather than tuned to the
+   * steady-state cost, which is one JSON-RPC message on an already-open host socket. A read that
+   * takes longer than this is a hung host call, and a hung host call on a phone is the worst
+   * failure mode available to us; better to surface it as a failed poll (the last good list stays
+   * on screen — see `lib/poll.ts`) than to wait for ever.
+   */
+  read: 20_000,
   permission: 30_000,
   allowance: 30_000,
   statements: 30_000,

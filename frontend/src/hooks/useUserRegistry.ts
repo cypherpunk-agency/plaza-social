@@ -2,22 +2,30 @@ import { useState, useCallback, useEffect } from "react";
 import { ethers } from "ethers";
 import type { Profile, Link } from "../types/contracts";
 import UserRegistryABI from "../contracts/UserRegistry.json";
-import { createReadContract, createWriteContract, type Provider, type Signer } from "../utils/contracts";
+import { createReadContract, type Provider, type Signer } from "../utils/contracts";
+import { useHostWrite } from "./usePublisher";
 
 interface UseUserRegistryProps {
   registryAddress: string | null;
   provider: Provider | null;
-  writeProvider?: Provider | null; // Optional separate provider for write operations (e.g., BrowserProvider for signing)
+  /** @deprecated ⛔ IGNORED. There is no separate write provider; there is no browser wallet. */
+  writeProvider?: Provider | null;
   userAddress: string | null;
-  signer?: Signer | null; // Signer for owner-only operations (profile creation, delegate management)
-  delegateSigner?: Signer | null; // Signer for delegate-capable operations (links) - uses session wallet
+  /** @deprecated ⛔ IGNORED, and always `null`. See the note above the hook. */
+  signer?: Signer | null;
+  /** @deprecated ⛔ IGNORED, and always `null`. See the note above the hook. */
+  delegateSigner?: Signer | null;
   /**
-   * Host-signed contract write. **Owner-only calls MUST use this, not `signer`.**
+   * ⭐ THE ONLY WRITE PATH. Host-signed, one prompt per call.
    *
    * `createProfile` records `msg.sender` as the owner, so signing it with the delegate would create a
    * profile owned by a throwaway per-device key. The delegate is also unfunded, which surfaced as
    * `code 1012 "Transaction is temporarily banned"` — the node rejects the unpayable transaction and
    * the txpool then bans its hash, which reads like a mysterious ban rather than "no money".
+   *
+   * ⚠️ There is a CONTEXT fallback (`useHostWrite()`) for a future caller mounted inside
+   * `PublisherProvider`. Today the only caller is `App`, which sits ABOVE that provider and must
+   * therefore pass the prop — the prop wins whenever both exist.
    */
   hostWrite?: HostWrite | null;
   enabled?: boolean;
@@ -89,14 +97,20 @@ interface UseUserRegistryReturn {
   refresh: () => Promise<void>;
 }
 
+/**
+ * (See the props above.) EVERY WRITE IN THIS HOOK IS HOST-SIGNED, 2026-07-31 — one prompt per call.
+ *
+ * `createDefaultProfile`, `setDisplayName`, `setBio`, `transferProfileOwnership`, `addLink`,
+ * `removeLink` and `clearLinks` used to go out through `signer` / `delegateSigner` and could never
+ * have worked: the delegate H160 is unfunded (`code 1012`, [V] 2026-07-30), and the first four are
+ * `onlyProfileOwner` / `msg.sender`-keyed anyway, so a delegate-signed call would have edited a
+ * profile owned by the throwaway key. See `lib/host/types.ts` `SignerSeam`.
+ */
 export function useUserRegistry({
   registryAddress,
   provider,
-  writeProvider,
   userAddress,
-  signer,
-  delegateSigner,
-  hostWrite,
+  hostWrite: hostWriteProp,
   enabled = true,
 }: UseUserRegistryProps): UseUserRegistryReturn {
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -108,23 +122,40 @@ export function useUserRegistry({
     return createReadContract(registryAddress, UserRegistryABI.abi, provider);
   }, [registryAddress, provider]);
 
-  const getWriteContract = useCallback(async () => {
-    // Use writeProvider if provided (e.g., BrowserProvider for browser wallet signing)
-    // Falls back to regular provider
-    const providerToUse = writeProvider ?? provider;
-    return createWriteContract(registryAddress, UserRegistryABI.abi, providerToUse, signer ?? null);
-  }, [registryAddress, provider, writeProvider, signer]);
+  // Prop first, context second. ⚠️ TODAY ONLY THE PROP FIRES: the sole caller is `App`, which
+  // renders `PublisherProvider` and is therefore above `HostWriteContext`. The fallback is for a
+  // caller mounted inside it — do not delete the prop on the assumption that context will cover.
+  const contextWrite = useHostWrite();
+  const hostWrite = hostWriteProp ?? contextWrite;
 
-  // Write contract for delegate-capable operations (links)
-  // Uses delegateSigner if available, otherwise falls back to getWriteContract behavior
-  const getDelegateWriteContract = useCallback(async () => {
-    if (delegateSigner) {
-      // Use delegate signer directly with regular provider
-      return createWriteContract(registryAddress, UserRegistryABI.abi, provider, delegateSigner);
-    }
-    // Fall back to regular write contract (owner signer)
-    return getWriteContract();
-  }, [registryAddress, provider, delegateSigner, getWriteContract]);
+  /**
+   * The ONE write path. Host-signed, one prompt each.
+   *
+   * NO `tx.wait()`, AND THERE CANNOT BE ONE: `writeContract` returns a SUBSTRATE EXTRINSIC HASH,
+   * already watched to best-block by the host, with no Ethereum receipt to await
+   * (`lib/host/contracts.ts`). Callers re-read instead — `loadProfile()` for the cheap cases and
+   * `waitForProfile()` / `confirmDelegate()` where a stale read would be misreported as failure.
+   */
+  const submit = useCallback(
+    async (method: string, args: unknown[]) => {
+      if (!enabled) throw new Error("Wallet not ready");
+      if (!registryAddress) throw new Error("Contract not available");
+      if (!hostWrite) {
+        throw new Error(
+          "Changing your profile has to be signed by your Polkadot account, and this session " +
+            "cannot reach it. Open Plaza inside the Polkadot app and try again.",
+        );
+      }
+      return hostWrite(
+        registryAddress,
+        UserRegistryABI.abi as unknown as Record<string, unknown>[],
+        method,
+        args,
+        method,
+      );
+    },
+    [enabled, registryAddress, hostWrite]
+  );
 
   const loadProfile = useCallback(async () => {
     if (!userAddress) {
@@ -199,26 +230,9 @@ export function useUserRegistry({
 
   const createProfile = useCallback(
     async (displayName: string, bio: string) => {
-      if (!registryAddress) throw new Error("Contract not available");
-
-      // ⚠️ OWNER-ONLY — MUST be host-signed. `createProfile` records `msg.sender` as the owner, so
-      // the delegate path would create a profile owned by the per-device key rather than by the user,
-      // and the delegate is unfunded besides (that is the `code 1012 "Transaction is temporarily
-      // banned"` a user hit: the node rejects an unpayable tx, then the pool bans its hash).
-      if (!hostWrite) {
-        throw new Error(
-          "Creating a profile has to be signed by your Polkadot account, and this session cannot " +
-            "reach it. Open Plaza inside the Polkadot app and try again.",
-        );
-      }
-
-      await hostWrite(
-        registryAddress,
-        UserRegistryABI.abi as unknown as Record<string, unknown>[],
-        "createProfile",
-        [displayName, bio],
-        "createProfile",
-      );
+      // OWNER-ONLY, and `submit` is host-signed, so `msg.sender` is the user. (`submit` already
+      // refuses when there is no address or no writer — one guard, in one place.)
+      await submit("createProfile", [displayName, bio]);
 
       /**
        * ⚠️ POLL UNTIL THE PROFILE IS VISIBLE. One read here is not enough and the failure is silent.
@@ -233,96 +247,80 @@ export function useUserRegistry({
        */
       await waitForProfile();
     },
-    [registryAddress, hostWrite, waitForProfile]
+    [submit, waitForProfile]
   );
 
   const createDefaultProfile = useCallback(async () => {
-    if (!enabled) throw new Error("Wallet not ready");
-    const contract = await getWriteContract();
-    if (!contract) throw new Error("Contract not available");
-
-    const tx = await contract.createDefaultProfile();
-    await tx.wait();
-    await loadProfile();
-  }, [enabled, getWriteContract, loadProfile]);
+    await submit("createDefaultProfile", []);
+    // Same reason as `createProfile`: one immediate read can trail the block the host just saw.
+    await waitForProfile();
+  }, [submit, waitForProfile]);
 
   const transferProfileOwnership = useCallback(
     async (newOwner: string) => {
-      if (!enabled) throw new Error("Wallet not ready");
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      const tx = await contract.transferProfileOwnership(newOwner);
-      await tx.wait();
+      await submit("transferProfileOwnership", [newOwner]);
       // After transfer, the current user no longer has a profile
       setProfile(null);
       setLinks([]);
     },
-    [enabled, getWriteContract]
+    [submit]
   );
 
   const updateDisplayName = useCallback(
     async (displayName: string) => {
-      if (!enabled) throw new Error("Wallet not ready");
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      const tx = await contract.setDisplayName(displayName);
-      await tx.wait();
+      await submit("setDisplayName", [displayName]);
       await loadProfile();
     },
-    [enabled, getWriteContract, loadProfile]
+    [submit, loadProfile]
   );
 
   const updateBio = useCallback(
     async (bio: string) => {
-      if (!enabled) throw new Error("Wallet not ready");
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      const tx = await contract.setBio(bio);
-      await tx.wait();
+      await submit("setBio", [bio]);
       await loadProfile();
     },
-    [enabled, getWriteContract, loadProfile]
+    [submit, loadProfile]
   );
 
-  // Link operations use delegate signer (gasless via session wallet)
+  /**
+   * THE LINK CALLS NAME THEIR PRINCIPAL, AND THEY ALWAYS DID.
+   *
+   * The contract is `addLink(address owner, string, string)`, `removeLink(address, uint256)` and
+   * `clearLinks(address)` — every one NAMES its principal, because that is the shape a delegated
+   * call has to have (`_requireCanActAs(owner)`; there is no reverse lookup from a delegate to an
+   * owner). This hook was calling `addLink(name, url)`: two arguments to a three-argument function,
+   * which cannot even be encoded. Same class as the four in `frontend/CLAUDE.md`'s table, and it was
+   * hidden because the delegate signer was `null`, so "Contract not available" fired first and
+   * nobody ever reached the real error.
+   *
+   * `_requireCanActAs(owner)` accepts the owner themselves and the host submits AS the owner, so
+   * passing `userAddress` is exactly right.
+   */
+  const requireUser = useCallback(() => {
+    if (!userAddress) throw new Error("No account — sign in to the Polkadot app to edit your links.");
+    return userAddress;
+  }, [userAddress]);
+
   const addLink = useCallback(
     async (name: string, url: string) => {
-      if (!enabled) throw new Error("Wallet not ready");
-      const contract = await getDelegateWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      const tx = await contract.addLink(name, url);
-      await tx.wait();
+      await submit("addLink", [requireUser(), name, url]);
       await loadProfile();
     },
-    [enabled, getDelegateWriteContract, loadProfile]
+    [submit, requireUser, loadProfile]
   );
 
   const removeLink = useCallback(
     async (index: number) => {
-      if (!enabled) throw new Error("Wallet not ready");
-      const contract = await getDelegateWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      const tx = await contract.removeLink(index);
-      await tx.wait();
+      await submit("removeLink", [requireUser(), BigInt(index)]);
       await loadProfile();
     },
-    [enabled, getDelegateWriteContract, loadProfile]
+    [submit, requireUser, loadProfile]
   );
 
   const clearLinks = useCallback(async () => {
-    if (!enabled) throw new Error("Wallet not ready");
-    const contract = await getDelegateWriteContract();
-    if (!contract) throw new Error("Contract not available");
-
-    const tx = await contract.clearLinks();
-    await tx.wait();
+    await submit("clearLinks", [requireUser()]);
     await loadProfile();
-  }, [enabled, getDelegateWriteContract, loadProfile]);
+  }, [submit, requireUser, loadProfile]);
 
   /* ------------------------------------------------------------------ delegation - */
 
@@ -353,11 +351,14 @@ export function useUserRegistry({
   );
 
   /**
-   * ⚠️ POLL UNTIL THE CHAIN AGREES. Same rule, and the same reason, as `waitForProfile` above: the
-   * host submits at best-block while we read through a SEPARATE public RPC that can trail it, so one
-   * read straight after the write returns the OLD value and the failure is silent. `eth_getLogs`
-   * cannot see host-submitted contract calls at all (architecture §8), so `DelegateAuthorized` is no
-   * help and polling the view function is the correct mechanism rather than a workaround.
+   * ⚠️ POLL UNTIL THE CHAIN AGREES. Same rule, and the same reason, as `waitForProfile` above.
+   *
+   * ⚠️ CORRECTED 2026-07-31: this used to blame "a SEPARATE public RPC that can trail" the host. That
+   * reader no longer exists — reads and writes share one chain client and `.query()` targets `best`
+   * on purpose. The reason that survives is the one that never depended on it: `eth_getLogs` cannot
+   * see host-submitted contract calls at all (architecture §8), and a native extrinsic gives no
+   * receipt to await, so `DelegateAuthorized` is no help and polling the view function is the
+   * correct mechanism rather than a workaround. A write can also still be in flight when we look.
    *
    * Returns the LAST OBSERVED expiry — so a caller can distinguish "confirmed authorised" (a number)
    * from "we never saw it" (`null`). Giving up is not an error and this never throws, but ⛔ `null`
@@ -403,49 +404,19 @@ export function useUserRegistry({
    */
   const authorizeDelegate = useCallback(
     async (delegateAddress: string, expiryUnixSeconds: number): Promise<number | null> => {
-      if (!registryAddress) throw new Error("Contract not available");
-      if (!hostWrite) {
-        throw new Error(
-          "Authorising a posting key has to be signed by your Polkadot account, and this session " +
-            "cannot reach it. Open Plaza inside the Polkadot app and try again.",
-        );
-      }
-
-      await hostWrite(
-        registryAddress,
-        UserRegistryABI.abi as unknown as Record<string, unknown>[],
-        "authorizeDelegate",
-        [delegateAddress, BigInt(Math.floor(expiryUnixSeconds))],
-        "authorizeDelegate",
-      );
-
+      await submit("authorizeDelegate", [delegateAddress, BigInt(Math.floor(expiryUnixSeconds))]);
       return confirmDelegate(delegateAddress, "authorised");
     },
-    [registryAddress, hostWrite, confirmDelegate]
+    [submit, confirmDelegate]
   );
 
   /** Owner-only for the same reasons, and `revokeDelegate` is idempotent on chain. */
   const revokeDelegate = useCallback(
     async (delegateAddress: string): Promise<number | null> => {
-      if (!registryAddress) throw new Error("Contract not available");
-      if (!hostWrite) {
-        throw new Error(
-          "Revoking a posting key has to be signed by your Polkadot account, and this session " +
-            "cannot reach it. Open Plaza inside the Polkadot app and try again.",
-        );
-      }
-
-      await hostWrite(
-        registryAddress,
-        UserRegistryABI.abi as unknown as Record<string, unknown>[],
-        "revokeDelegate",
-        [delegateAddress],
-        "revokeDelegate",
-      );
-
+      await submit("revokeDelegate", [delegateAddress]);
       return confirmDelegate(delegateAddress, "revoked");
     },
-    [registryAddress, hostWrite, confirmDelegate]
+    [submit, confirmDelegate]
   );
 
   /**

@@ -70,7 +70,7 @@ export type HeadInput = string | (Partial<HeadRef> & { cid: string });
 export type UnavailableReason =
   /** Older than the retention window — almost certainly gone for good. */
   | "expired"
-  /** Written minutes ago; public gateways have probably not seen it yet. Retry is worthwhile. */
+  /** Written minutes ago; the host has probably not resolved it yet. Retry is worthwhile. */
   | "pending"
   /** No timestamp to reason from, or an age that explains nothing. */
   | "unknown";
@@ -276,7 +276,8 @@ interface ResolvedNode {
 async function resolveSlot(slot: Slot, cache: Pick<BlobCache, "get">): Promise<ResolvedNode> {
   const text = await cache.get(slot.cid);
   // A CID that resolves to bytes we cannot decode is treated exactly like one that does not
-  // resolve: a gateway can serve anything, and a stranger's chain is untrusted input.
+  // resolve: a stranger's chain is untrusted input, and content-addressing proves only that the
+  // bytes are the ones the CID names — never that they are one of ours.
   return { slot, object: text === null ? null : decodeObject(text) };
 }
 
@@ -399,16 +400,16 @@ export type BodyState = "loaded" | "unavailable";
 export type AttachmentState =
   /** We uploaded these bytes this session — renders immediately, even mid-propagation. */
   | "local"
-  /** Fetch it from a gateway. Not yet known to be missing. */
+  /** Not yet known to be missing. Needs a read through the host to become renderable. */
   | "remote"
-  /** A gateway race already failed for this CID within the miss ttl. */
+  /** A read already failed for this CID within the miss ttl. */
   | "unavailable";
 
 export interface AttachmentView extends Attachment {
   state: AttachmentState;
   /** The URL to put in `src` now. Null only when there is nothing to try. */
   url: string | null;
-  /** Every gateway URL, in measured order — an `<img>` onError retry ladder. */
+  /** Alternative URLs to try, in order. Empty since the gateway ladder was removed — see above. */
   urls: string[];
   /** When these bytes stop being servable absent a renewal, or null if unknown. */
   expiresAt: number | null;
@@ -430,7 +431,22 @@ export interface EntryView {
 export interface DescribeOptions {
   cache?: Pick<BlobCache, "knownMissing">;
   localBlobs?: Pick<LocalBlobStore, "url">;
-  /** Gateway URL builder — inject `blobUrl`/`blobUrls` from gateways.ts. */
+  /**
+   * ⚠️ NOTHING SUPPLIES THESE ANY MORE, AND THAT IS A KNOWN GAP RATHER THAN AN OVERSIGHT.
+   *
+   * They used to be `blobUrl`/`blobUrls` from `lib/gateways.ts`, which built public IPFS gateway
+   * URLs an `<img src>` could consume directly. That module is deleted (see `lib/bulletin.ts`):
+   * Bulletin content is now read as BYTES through the host's preimage lookup, and there is no URL
+   * for a host subscription — so a remote attachment has no `src` to point at.
+   *
+   * Consequence: only attachments THIS session uploaded render, via `localBlobs`. Making a remote
+   * one renderable means reading its bytes through the same fetcher the bodies use and wrapping
+   * them in an object URL — a change in the attachment component, not here. Left as optional
+   * parameters rather than removed so that change has somewhere to plug in.
+   *
+   * ⛔ Do not "fix" this by reintroducing a gateway URL builder. That is exactly the HTTP path
+   * whose removal this whole change is about.
+   */
   urlFor?: (cid: string) => string | null;
   urlsFor?: (cid: string) => string[];
   now?: () => number;

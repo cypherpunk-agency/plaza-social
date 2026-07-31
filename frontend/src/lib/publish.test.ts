@@ -36,7 +36,7 @@ function harness(options: { head?: HeadRow | null; confirmAfter?: number; cache?
       rec.calls.push("readHead");
       reads += 1;
       // The head the chain reports lags the write by `confirmAfter` reads — the real behaviour, where
-      // the host settles at best-block and we read through a separate RPC that trails it.
+      // the host settles at best-block and a native extrinsic returns no receipt to await.
       if (pending && reads > confirmAfter) {
         head = pending;
         pending = null;

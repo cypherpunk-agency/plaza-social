@@ -14,12 +14,12 @@
 // testing the real one.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ethers } from 'ethers'
 
 import {
   openBackend,
   READ_ONLY,
   type Capabilities,
+  type ChainReader,
   type DelegationState,
   type DiagnosticStep,
   type HostBackend,
@@ -36,19 +36,22 @@ export interface HostSession {
   diagnostics: DiagnosticStep[]
 
   /**
-   * Anonymous read provider. `null` only if constructing it threw.
+   * The anonymous CHAIN READER — `product-sdk-contracts` `.query()` over the host provider.
    *
-   * ⚠️ This is what every feature hook should take for READS. It needs no wallet, no container and no
-   * permission, which is why the app can render a full timeline for a visitor who has nothing.
+   * ⚠️ THE FIELD IS STILL CALLED `provider` AND IT IS NOT AN ETHERS PROVIDER. A dozen components
+   * declare `provider: Provider | null` and only pass it down; keeping the name kept the change
+   * inside the data layer. See `utils/contracts.ts`.
+   *
+   * ⚠️ `null` OUTSIDE THE HOST CONTAINER, and that is the whole point of the 2026-07-31 change: it
+   * needs no wallet and no account, but it does need the host, because the SDK is the only path.
    */
-  provider: ethers.Provider | null
+  provider: ChainReader | null
 
   /**
-   * The two-arm signer seam. See `lib/host/types.ts`.
+   * The signer seam. ONE arm. See `lib/host/types.ts`.
    *
-   * `signer.delegateSigner` is an ordinary `ethers.Signer` and is what the existing feature hooks
-   * consume today. `signer.host` is the prompting arm and is NOT an ethers signer — it cannot be,
-   * because the host signs native Revive extrinsics rather than Ethereum transactions.
+   * `signer.host` is the prompting arm and is NOT an ethers signer — it cannot be, because the host
+   * signs native Revive extrinsics rather than Ethereum transactions. ⛔ `delegateSigner` is gone.
    */
   signer: SignerSeam
 
@@ -69,7 +72,6 @@ export interface HostSession {
 
 const EMPTY_SEAM: SignerSeam = {
   host: { account: null, signer: null, submit: null },
-  delegateSigner: null,
 }
 
 export function useHostSession(appName: string): HostSession {
@@ -132,8 +134,9 @@ export function useHostSession(appName: string): HostSession {
     // cannot become a dependency and cannot trigger a re-open.
   }, [])
 
-  // The provider is built once, when the backend opens, so `backend` is the only dependency.
-  const provider = useMemo(() => backend?.readProvider() ?? null, [backend])
+  // The reader is built once, when the backend opens, so `backend` is the only dependency. It is a
+  // plain object; the chain client behind it connects lazily on the first actual read.
+  const provider = useMemo(() => backend?.chainReader() ?? null, [backend])
 
   const signer = useMemo(
     () => backend?.signer() ?? EMPTY_SEAM,

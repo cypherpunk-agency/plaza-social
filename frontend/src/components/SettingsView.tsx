@@ -243,7 +243,10 @@ export function SettingsView({
       const result = await action();
 
       // The chain read, when we have one. `confirmDelegate` polls, because the host settles at
-      // best-block and we read through a separate RPC that trails it — one read is not evidence.
+      // best-block and a native extrinsic gives no receipt to await — one read is not evidence.
+      // (This used to also blame "a separate RPC that trails it". That RPC is gone as of 2026-07-31 —
+      // reads and writes now share one SDK chain client reading at `best` — but the poll stays: the
+      // reason that survives is that `eth_getLogs` cannot see host-submitted calls at all.)
       if (onConfirmDelegate && address) {
         const onChain = await onConfirmDelegate(address);
         const settled = expect === 'authorised' ? onChain !== null : onChain === null;

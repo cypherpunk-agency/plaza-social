@@ -9,7 +9,7 @@ import { FEED_REGISTRY } from "../lib/registry";
 import { POLL_INTERVAL_MS, createRefreshGate, refresh, startPolling, type RefreshMode } from "../lib/poll";
 import { NO_WRITE_SESSION } from "../lib/publish";
 import { usePublisher } from "./usePublisher";
-import { gatewayFetcher } from "../lib/gateways";
+import { bulletinFetcher } from "../lib/bulletin";
 
 /**
  * A user's own post feed, on the migrated content model.
@@ -112,7 +112,9 @@ export function useUserPosts({
 
   // Bodies are immutable and content-addressed, so a cache hit can never be stale — only absent.
   const cache = useMemo(
-    () => createBlobCache({ fetcher: gatewayFetcher(), persist: browserPersistence() }),
+    // ⚠️ `bulletinFetcher()` reads through the HOST, not over HTTP — see `lib/bulletin.ts`. It
+    // resolves the installed source per call, so building it before the handshake finishes is safe.
+    () => createBlobCache({ fetcher: bulletinFetcher(), persist: browserPersistence() }),
     []
   );
 

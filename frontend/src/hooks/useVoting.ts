@@ -2,7 +2,8 @@ import { useState, useCallback } from "react";
 import type { VoteType, VoteTally } from "../types/contracts";
 import { VoteType as VoteTypeEnum } from "../types/contracts";
 import VotingABI from "../contracts/Voting.json";
-import { createReadContract, createWriteContract, type Provider, type Signer } from "../utils/contracts";
+import { createReadContract, type Provider, type Signer } from "../utils/contracts";
+import { useHostWrite } from "./usePublisher";
 
 /**
  * ⛔ `EntityType` AND `computeEntityId` ARE GONE. DO NOT REINTRODUCE THEM.
@@ -18,9 +19,27 @@ import { createReadContract, createWriteContract, type Provider, type Signer } f
  * round trip. Everything below takes an already-derived `bytes32`.
  */
 
+/**
+ * ⭐ VOTES ARE HOST-SIGNED NOW, 2026-07-31. ONE PROMPT PER VOTE, AND THAT IS THE HONEST STATE.
+ *
+ * They used to go out through `signer` — the delegate arm — which meant pressing UPVOTE did an
+ * `ethers` round trip to a third-party public RPC and failed, every time, for two independent
+ * reasons: the delegate H160 is unfunded (`code 1012`, **[V]** 2026-07-30) and this hook called
+ * `vote(…)`, which credits `msg.sender`, so even a funded delegate would have recorded the throwaway
+ * key as the voter. See `lib/host/types.ts` `SignerSeam`.
+ *
+ * ⭐ AND `vote(…)` IS NOW THE CORRECT FUNCTION, not a leftover. `writeContract` submits as the
+ * PRODUCT ACCOUNT, so `msg.sender` IS the user. `voteFor(voter, …)` is the delegate's form and
+ * exists for the day a delegate can actually sign; ⛔ do not switch to it while writes are
+ * host-signed — it would only add a `canActAs` check that must pass trivially.
+ */
 interface UseVotingProps {
   votingAddress: string | null;
   provider: Provider | null;
+  /**
+   * @deprecated ⛔ IGNORED, and always `null`. The delegate arm is gone (see above). Kept because
+   * four components declare the prop and pass it down; it is not read here.
+   */
   signer?: Signer | null;
   userAddress: string | null;
   enabled?: boolean;
@@ -43,20 +62,18 @@ interface UseVotingReturn {
 export function useVoting({
   votingAddress,
   provider,
-  signer,
   userAddress,
   enabled = true,
 }: UseVotingProps): UseVotingReturn {
   const [isVoting, setIsVoting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /** ⭐ The host-signed write arm, out of context rather than a prop. See `usePublisher.tsx`. */
+  const hostWrite = useHostWrite();
+
   const getReadContract = useCallback(() => {
     return createReadContract(votingAddress, VotingABI.abi, provider);
   }, [votingAddress, provider]);
-
-  const getWriteContract = useCallback(async () => {
-    return createWriteContract(votingAddress, VotingABI.abi, provider, signer ?? null);
-  }, [votingAddress, provider, signer]);
 
   const getVoteTally = useCallback(
     async (entityId: string): Promise<VoteTally> => {
@@ -100,59 +117,58 @@ export function useVoting({
     [getReadContract, userAddress]
   );
 
-  const vote = useCallback(
-    async (entityId: string, voteType: VoteType): Promise<void> => {
+  /**
+   * The one write path. ⚠️ NO `tx.wait()` AND THERE CANNOT BE ONE: `writeContract` returns a
+   * SUBSTRATE EXTRINSIC HASH, already watched to best-block by the host, and there is no Ethereum
+   * receipt to await (`lib/host/contracts.ts`). The tally the UI shows is re-read by the caller.
+   */
+  const submit = useCallback(
+    async (method: string, args: unknown[], failure: string): Promise<void> => {
       if (!enabled) throw new Error("Wallet not ready");
-      if (voteType === VoteTypeEnum.None) {
-        throw new Error("Cannot vote with VoteType.None, use removeVote instead");
-      }
-
-      const contract = await getWriteContract();
-      if (!contract) {
-        throw new Error("Contract not available");
+      if (!votingAddress) throw new Error("Contract not available");
+      if (!hostWrite) {
+        throw new Error(
+          "Voting has to be signed by your Polkadot account, and this session cannot reach it. " +
+            "Open Plaza inside the Polkadot app and try again.",
+        );
       }
 
       setIsVoting(true);
       setError(null);
-
       try {
-        const tx = await contract.vote(entityId, voteType);
-        await tx.wait();
+        await hostWrite(
+          votingAddress,
+          VotingABI.abi as unknown as Record<string, unknown>[],
+          method,
+          args,
+          method,
+        );
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Failed to vote";
-        setError(message);
+        setError(err instanceof Error ? err.message : failure);
         throw err;
       } finally {
         setIsVoting(false);
       }
     },
-    [enabled, getWriteContract]
+    [enabled, votingAddress, hostWrite]
+  );
+
+  const vote = useCallback(
+    async (entityId: string, voteType: VoteType): Promise<void> => {
+      if (voteType === VoteTypeEnum.None) {
+        throw new Error("Cannot vote with VoteType.None, use removeVote instead");
+      }
+      // `vote`, not `voteFor` — the host submits as the product account, so `msg.sender` is the user.
+      await submit("vote", [entityId, voteType], "Failed to vote");
+    },
+    [submit]
   );
 
   const removeVote = useCallback(
     async (entityId: string): Promise<void> => {
-      if (!enabled) throw new Error("Wallet not ready");
-
-      const contract = await getWriteContract();
-      if (!contract) {
-        throw new Error("Contract not available");
-      }
-
-      setIsVoting(true);
-      setError(null);
-
-      try {
-        const tx = await contract.removeVote(entityId);
-        await tx.wait();
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Failed to remove vote";
-        setError(message);
-        throw err;
-      } finally {
-        setIsVoting(false);
-      }
+      await submit("removeVote", [entityId], "Failed to remove vote");
     },
-    [enabled, getWriteContract]
+    [submit]
   );
 
   return {

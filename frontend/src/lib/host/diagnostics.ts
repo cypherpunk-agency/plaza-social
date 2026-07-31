@@ -29,9 +29,36 @@ export const STEP_LABELS: Record<string, string> = {
   bulletin: 'Bulletin write path',
   // The fallback that carries the bytes when the host will not open a Bulletin chain client at all.
   preimage: 'Bulletin preimage channel (fallback write path)',
+  /**
+   * ⭐ THE READ PATH, AND THERE IS ONLY ONE. Post bodies are fetched through the host's preimage
+   * lookup subscription (`@parity/product-sdk-cloud-storage`), never over HTTP.
+   *
+   * This step exists because the alternative was invisible: until 2026-07-31 bodies came from four
+   * public IPFS gateways, which made the host prompt a real user for permission to reach
+   * `devnet-ipfs.api.polkadotcommunity.foundation`. The gateways are gone (`lib/bulletin.ts`), so
+   * `fail` here means NO post body will load — a state that must be legible on a phone, since it is
+   * indistinguishable on screen from "all this content expired".
+   *
+   * The detail column carries running counters rather than a line per read; see `session.ts`
+   * `installBulletinReader` for why that is throttled.
+   */
+  read: 'Bulletin content reads (host preimage lookup — no external gateway)',
   bulletinAuth: 'Bulletin authorization (quota)',
   statements: 'Statement store connected (live updates only)',
-  chain: 'Asset Hub read provider ready',
+  /**
+   * ⭐ THE CHAIN READ PATH, AND THERE IS ONLY ONE — the SDK's. Heads, profiles, vote tallies and the
+   * follow graph are `product-sdk-contracts` `.query()` dry runs routed through the host provider.
+   *
+   * ⚠️ THIS STEP IS THE SOURCE OF TRUTH FOR `capabilities.canRead`, and it changed meaning on
+   * 2026-07-31. It used to read "Asset Hub read provider ready" and reported nothing more than
+   * "an `ethers.JsonRpcProvider` was constructed" — against a third-party HTTP endpoint, for every
+   * visitor, before the container check. `fail` here now means NO list in the app will populate,
+   * which is the normal state OUTSIDE the Polkadot app and an error inside it.
+   *
+   * The detail column carries running counters rather than a line per read; see `session.ts`
+   * `reportChainRead` for why that is throttled.
+   */
+  chain: 'Chain reads (product-sdk-contracts .query — no external RPC)',
   // "Announcing", not "posting": storing the words is a separate signature. The delegate key only
   // removes the head write's prompt.
   delegate: 'Posting key (delegate) — announcing costs one prompt per 90 days, not one per post',

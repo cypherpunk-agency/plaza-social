@@ -11,8 +11,8 @@
 //   openBackend({ appName })            → HostBackend      real host, or the fake if ?backend=fake
 //   backend.capabilities()              → { canRead, canWrite, canPushLive, address, reason }
 //   backend.onCapabilities(cb)          → unsubscribe
-//   backend.readProvider()              → ethers.Provider | null      anonymous, never gated
-//   backend.signer()                    → { host: {...}, delegateSigner }   the two arms
+//   backend.chainReader()               → ChainReader | null   anonymous, SDK-only, host-only
+//   backend.signer()                    → { host: {...} }      ONE arm; the delegate arm is gone
 //   backend.delegation() / .onDelegation(cb) / .authorizeDelegate() / .revokeDelegate()
 //   backend.putBlob(bytes, { contentType })  → cid          ⭐ also the lazy-allowance trigger
 //   backend.ensureAllowance()           → never call from a read path
@@ -31,10 +31,13 @@
 //   3. `AutoSigning` is never requested. It does nothing in this host and it was the sole reason the
 //      latch could not be persisted.                            (allowance.ts, PLAZA_RESOURCES)
 //   4. The delegate key is DERIVED (`deriveEntropy`, RFC-0007), never randomly generated and never
-//      written to disk.                                          (delegate.ts)
+//      written to disk — and it does NOT sign. See `delegate.ts`.               (delegate.ts)
+//   5. ⛔ THE SDK IS THE ONLY PATH, FOR READS AS WELL AS WRITES. No ethers provider, no HTTP RPC, no
+//      gateway, no "fallback in case the SDK is unavailable". An unavailable SDK capability is an
+//      error to SURFACE.                              (contracts.ts, utils/contracts.ts, bulletin.ts)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-export { openBackend, parseBackendSelection, DEFAULT_RPC_URL, FAKE_SCENARIOS } from './backend'
+export { openBackend, parseBackendSelection, FAKE_SCENARIOS } from './backend'
 export type { BackendSelection, OpenBackendOptions } from './backend'
 
 export { createFakeBackend, FAKE_SELF_H160, FAKE_SELF_SS58 } from './fake'
@@ -60,9 +63,13 @@ export type { WriteClassification, WriteExplanation, WriteFailureCode } from './
 
 export { describe, describeAge } from './util'
 
+export { createSdkChainReader } from './contracts'
+
 export type {
+  AbiEntry,
   AllocationOutcome,
   Capabilities,
+  ChainReader,
   DelegationState,
   Diagnostics,
   DiagnosticStatus,

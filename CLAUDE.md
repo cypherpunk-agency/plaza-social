@@ -96,6 +96,21 @@ recompile, redeploy — and keep `deployments.json` in agreement.
 **Deleted:** `ChatChannel`, `ChannelRegistry`, `DMConversation`, `DMRegistry`, `OnChainChat`,
 `lib/Moderation`, `posts/{ForumThread,UserPosts,Replies}`.
 
+## ⛔ The SDK path is the only path
+
+**If the platform provides a capability, use it and build nothing beside it.** No second
+implementation, no HTTP substitute, no "fallback in case the SDK is unavailable" — an unavailable SDK
+capability is an error to **surface**, not a branch to route around. The word "fallback" is the tell
+that you are about to break this.
+
+Learned twice on 2026-07-31: post bodies were read over public IPFS gateways (which made the host
+prompt the user to approve an external origin) when `CloudStorageClient.fetchBytes`/`fetchJson` read
+them through the host itself; and the first proposed fix — "prefer the SDK, fall back to gateways" —
+was the same bug again. **"Anonymous reading, everywhere, needing nothing" means no wallet and no
+sign-in. It does not mean no host.** Local development uses the fake backend (`?backend=fake`), never
+a resurrected HTTP path. Full detail and the current audit list: gotchas.md § *THE SDK PATH IS THE
+ONLY PATH*.
+
 ## Core concepts
 
 **Storage does not accumulate.** One head per (registry, writer); the deposit is paid once and reused

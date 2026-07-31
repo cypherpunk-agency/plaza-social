@@ -112,7 +112,7 @@ export const NO_GROUP = `0x${"0".repeat(64)}`;
  * How long to poll for our own write before giving up and refreshing anyway.
  *
  * ⚠️ POLLING IS THE CORRECT MECHANISM HERE, NOT A WORKAROUND. The host submits at best-block and we
- * read through a SEPARATE public RPC that trails it, so one immediate read returns the OLD head —
+ * gives back no receipt to await, so one immediate read can still return the OLD head —
  * which is exactly how a created profile spent 30 seconds looking like it had failed. Events cannot
  * help: `eth_getLogs` cannot see host-submitted contract calls at all (architecture §8).
  */

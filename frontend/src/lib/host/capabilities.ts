@@ -12,14 +12,25 @@
 
 import type { Capabilities } from './types'
 
-/** The honest default: anyone can read, nobody can write until proven otherwise. */
+/**
+ * The honest default: NOTHING is known yet.
+ *
+ * ⚠️ `canRead` WAS `true` HERE AND THAT IS NO LONGER HONEST. It encoded "anyone can read", which was
+ * true only while chain state came over a public HTTP RPC. Since 2026-07-31 chain reads go through
+ * the SDK over the host provider and there is no substitute, so reading is something a session has
+ * to EARN by opening a reader — `session.ts` sets it once it has one. Claiming it up front would
+ * make a browser tab render an empty board as though the board were empty.
+ *
+ * ⚠️ Nothing flashes because of this: `useHostSession` reports `isInitializing` until the backend
+ * opens, and `SessionStatus` renders nothing at all while it is true.
+ */
 export const READ_ONLY: Capabilities = {
-  canRead: true,
+  canRead: false,
   canWrite: false,
   canPushLive: false,
   address: null,
   insideHost: false,
-  reason: 'No account is connected, so this session can read but not post.',
+  reason: 'The session has not finished opening, so nothing can be read or posted yet.',
 }
 
 export interface CapabilityStore {

@@ -12,14 +12,23 @@
 //              that blocks both. A cache that cannot write is slow, not broken.
 //
 // Negative results are cached too, with a SHORT ttl. An expired body will not come back, and
-// re-racing four gateways for it on every scroll is wasted time and a wasted spinner. The ttl is
-// short because the other reason a CID does not resolve is that we wrote it 30 seconds ago.
+// re-asking the host for it on every scroll is wasted time and a wasted spinner. The ttl is short
+// because the other reason a CID does not resolve is that we wrote it 30 seconds ago.
+//
+// ⭐ THE MISS TTL IS NOW THE APP'S ONLY RETRY MECHANISM. `lib/bulletin.ts` makes exactly one attempt
+// against exactly one source and has no ladder of its own, deliberately — a retry here is shared by
+// every reader of the same CID, whereas a retry inside the fetcher is multiplied by them.
 //
 // ── SEEDING OUR OWN WRITES IS NOT AN OPTIMISATION ──────────────────────────────────────────────
-// A freshly stored CID takes MINUTES to propagate to public gateways. Without `put`, a user's own
-// post reliably renders as unavailable for its first few minutes — the single worst first-run
-// impression the app can make. The write path must call `put(cid, text)` with the exact bytes it
-// stored, and `rememberBlob(cid, blob)` for each attachment it uploaded.
+// A freshly stored CID takes MINUTES to become fetchable. Without `put`, a user's own post reliably
+// renders as unavailable for its first few minutes — the single worst first-run impression the app
+// can make. The write path must call `put(cid, text)` with the exact bytes it stored, and
+// `rememberBlob(cid, blob)` for each attachment it uploaded.
+//
+// ⚠️ THAT MATTERS MORE SINCE THE GATEWAYS WERE REMOVED (2026-07-31). A post body written through
+// the host preimage channel gets no block receipt and is not on any public network yet; the host's
+// own lookup is the only thing that can serve it back, and it may take a moment to. The seed is
+// what stands between the author and their own post reading as expired.
 
 const DEFAULT_MEMORY_LIMIT = 600;
 const DEFAULT_MISS_TTL_MS = 45_000;
@@ -115,7 +124,13 @@ export function memoryPersistence(): Persistence {
 }
 
 export interface BlobCacheOptions {
-  /** Throws (BlobUnavailableError) when no gateway can serve the CID. */
+  /**
+   * Throws (`BlobUnavailableError`) when the CID cannot be read.
+   *
+   * In the app this is always `bulletinFetcher()` from `lib/bulletin.ts` — the host preimage
+   * lookup, and the only read path there is. It stays INJECTED rather than imported so this module
+   * remains pure and testable, not so that a second transport can be slotted in.
+   */
   fetcher: (cid: string) => Promise<Uint8Array>;
   persist?: Persistence;
   memoryLimit?: number;

@@ -1,8 +1,77 @@
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 @import "tailwindcss";
+
+/*
+ * ⚠️ THE FONT IS BUNDLED, NOT FETCHED. DO NOT REPLACE THIS WITH AN `@import` FROM GOOGLE.
+ *
+ * Line 1 of this file used to be:
+ *   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+ *
+ * Plaza runs inside the Polkadot host container, in a sandboxed iframe, and **the host prompts the
+ * user to approve every external origin** — that is exactly why the IPFS gateways were deleted
+ * (gotchas.md § "THE SDK PATH IS THE ONLY PATH"). A stylesheet `@import` is the worst version of it:
+ * it is render-blocking, it is on the FIRST PAINT path, and it leaked every reader's IP and
+ * user-agent to Google before a single glyph appeared. Self-hosting removes the origin entirely.
+ *
+ * The files are in `public/fonts/`, so they are copied VERBATIM into `dist/fonts/`. Write the `src`
+ * as a `/`-rooted PUBLIC path: with the mandatory relative base (`./`, see vite.config.ts) Vite
+ * rewrites it in the built stylesheet to `url(../fonts/…)` — relative to `dist/assets/index-*.css`,
+ * which is what has to be true inside a CID-addressed iframe. **[V] 2026-07-31**, read out of
+ * `dist/assets/*.css` after a build. Do not "fix" it to a literal `../fonts/` here: that is relative
+ * to `src/`, where there is no such directory, and Vite would fail to resolve it.
+ *
+ * `font-display: swap` is not decoration — it is the `&display=swap` that was in the old URL's query
+ * string. Without it text is INVISIBLE for up to 3s while the font loads.
+ *
+ * Weights: **400 and 600, latin subset only.** `font-medium` (500) has zero uses in `src/`, so the
+ * 500 face the old URL requested was dead weight and is not bundled. `font-bold` (700) has 33 uses
+ * and resolves to the 600 face — unchanged, since the Google request never asked for 700 either.
+ * The whole bundle is re-uploaded to Bulletin on every deploy, so a weight nobody renders costs real
+ * bytes forever.
+ */
+/*
+ * IBM Plex Mono. Copyright © 2017 IBM Corp. with Reserved Font Name "Plex".
+ * Licensed under the SIL Open Font License, Version 1.1. The full text is `public/fonts/OFL.txt`,
+ * which is why the licence sits in `public/` next to the .woff2 files rather than in `src/`: the OFL
+ * requires the notice to travel WITH the font, and only `public/` guarantees it lands in `dist/`.
+ * (A `/*!` legal comment here would not do the job — esbuild's CSS minifier drops it. Checked.)
+ */
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/ibm-plex-mono-latin-400.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/ibm-plex-mono-latin-600.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
 
 /* Custom font sizes - larger defaults */
 @theme {
+  /**
+   * ⚠️ WITHOUT THIS LINE, `.font-mono` IS NOT IBM PLEX MONO.
+   *
+   * `.font-mono` compiles to `font-family: var(--font-mono)`, and Tailwind v4's stock value for that
+   * variable is `ui-monospace, SFMono-Regular, Menlo, …` — a system stack that does not contain our
+   * bundled face at all. The `body` rule below sets IBM Plex Mono, but any element carrying
+   * `font-mono` OVERRIDES it. That utility appears **297 times across 32 files**, so most of the UI
+   * was rendering in the system monospace, and had been since long before the font was self-hosted
+   * (measured on a live element, 2026-07-31 — not seen; nobody has ever seen this app).
+   *
+   * Same trap as the palette immediately below: a Tailwind theme variable you do not declare does
+   * not fall through to your CSS, it falls through to Tailwind's default. Declaring it here is what
+   * makes the bundled `@font-face` actually reach the screen.
+   */
+  --font-mono: 'IBM Plex Mono', 'Courier New', monospace;
+
   --text-xs: 13px;
   --text-xs--line-height: 1.4;
   --text-sm: 16px;

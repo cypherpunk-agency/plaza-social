@@ -235,7 +235,7 @@ deploy to see. `hooks/usePublisher.tsx` is the ethers/ABI half.
 |---|---|
 | **Body first, pointer second. Always.** | A failed pointer write orphans a body, which expires harmlessly. The other order moves a head to a CID no gateway can serve — a permanent hole every later reader walks into. |
 | **`store()` seeds the blob cache with the exact bytes.** | A fresh CID takes MINUTES to reach public gateways. Without it a user's own post reads as "(content no longer available)" for its first few minutes. |
-| **`publish()` polls until the read RPC sees the new head**, and returns `confirmed: false` rather than claiming success. | The host settles at best-block; we read through a separate RPC that trails it. Events cannot substitute — `eth_getLogs` cannot see host-submitted calls. |
+| **`publish()` polls until the read RPC sees the new head**, and returns `confirmed: false` rather than claiming success. | A native extrinsic returns no receipt to await. Events cannot substitute — `eth_getLogs` cannot see host-submitted calls. (The old reason, "a separate RPC that trails it", died 2026-07-31 — reads and writes now share one SDK chain client reading at `best`.) |
 | **`storeBlock` is `0`.** | It is the Bulletin block of the store extrinsic, and the preimage channel returns no block receipt. A fabricated number would produce a confidently wrong expiry countdown; 0 produces none, which is true. |
 | **`usePublisher()` returning `null` means "cannot write"** — gate composers on it, not on `signer`. | `signer` is the DELEGATE arm and is null on a perfectly writable session. Gating on it hid the composer from everyone who could actually post. |
 
@@ -427,7 +427,7 @@ any of this.
 | Signer seam | `types.ts` (`SignerSeam`) | Arm 1 host-signed, prompts every time. Arm 2 delegate-signed, prompt-free. Arm 1 is NOT an `ethers.Signer` and cannot be. |
 | Host contract writes | `contracts.ts` (`HostBackend.writeContract`) | **Owner-only calls MUST use this.** The delegate would be recorded as `msg.sender` AND is unfunded — that combination produced `code 1012 "Transaction is temporarily banned"`. |
 | Bulletin writes | `session.ts` `putBlob` | Try CloudStorage, **fall back to the host preimage channel**. On an `rpc-gateway`-mode host the fallback is the only path that works. Returns a locally computed CID, since the preimage channel returns a hex key. |
-| Read-after-write | anywhere calling `writeContract` | **Poll the view function.** The host settles at best-block but we read via a separate RPC that trails it, so one immediate read returns the OLD state. Events cannot help: `eth_getLogs` cannot see host-submitted calls. |
+| Read-after-write | anywhere calling `writeContract` | **Poll the view function.** A native extrinsic returns no receipt to await, so one immediate read can still return the OLD state. Events cannot help: `eth_getLogs` cannot see host-submitted calls. |
 | Delegate key | `delegate.ts` | Derived via `deriveEntropy` (RFC-0007). Never `Wallet.createRandom()`, never written to disk. |
 | Fake backend | `fake.ts`, `backend.ts` | Required infrastructure — the SDK throws outside a container. `?backend=fake&caps=write` is the scenario that matters most. Its `writeContract` **refuses rather than being null**: null would remove the publisher and silently un-render the composer that scenario exists to test, and a stub that "succeeded" would be followed by a read of the REAL chain that never shows the write. |
 | SDK imports | `sdk.ts` | The ONLY module importing `@parity/*`. Keep it that way. |

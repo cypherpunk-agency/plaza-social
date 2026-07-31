@@ -147,23 +147,30 @@ function App() {
    * What went away with the wallet modes:
    *   · `browserProvider` — there is no MetaMask provider to fish a signer out of.
    *   · `profileSigner` vs `signer` — the split existed because owner-only operations had to be
-   *     signed by the profile owner while delegatable ones could use the session wallet. Both now
-   *     resolve to the same thing: the delegate arm, which the contract records as acting FOR the
-   *     user. Host-signed owner-only calls need the prompting arm and the contract layer, which is
-   *     not wired yet (`host.signer.host.submit === null`).
+   *     signed by the profile owner while delegatable ones could use the session wallet.
    *   · `isStandalone` / `isBrowser` — no modes left.
+   *
+   * ⛔ AND `signer` IS NOW PERMANENTLY `null`, 2026-07-31. It was `host.signer.delegateSigner`, an
+   * `ethers.Wallet` on a public RPC that could never have worked — unfunded key, and every call site
+   * naming `vote(…)`/`follow(…)` instead of `voteFor(…)`/`followFor(…)`. See `lib/host/types.ts`
+   * `SignerSeam`. Contract writes go through `host.backend.writeContract`, which the hooks reach via
+   * `useHostWrite()` (see `hooks/usePublisher.tsx`) rather than through a prop.
+   *
+   * The key is kept in the object, still passed down, still `null`: about ten presentation
+   * components declare a `signer` prop and only forward it. Removing it means editing all of them to
+   * delete a word, and they are not this change's business.
    */
   const walletConfig = useMemo(
     () => ({
       activeProvider: host.provider,
       activeAddress: host.address,
-      signer: host.signer.delegateSigner,
-      profileSigner: host.signer.delegateSigner,
+      signer: null,
+      profileSigner: null,
       canRead: host.canRead,
       canWrite: host.canWrite,
       isReady: host.canWrite,
     }),
-    [host.provider, host.address, host.signer, host.canRead, host.canWrite],
+    [host.provider, host.address, host.canRead, host.canWrite],
   );
 
   /**
@@ -417,7 +424,9 @@ function App() {
     registryAddress: followRegistryAddress,
     provider: walletConfig.activeProvider,
     userAddress: walletConfig.activeAddress,
-    signer: walletConfig.signer,
+    // ⚠️ THE PROP, NOT THE CONTEXT. `App` renders `PublisherProvider`, so it is ABOVE
+    // `HostWriteContext` and `useHostWrite()` would be null here. See the hook's `hostWrite` doc.
+    hostWrite: host.backend?.writeContract ?? null,
     enabled: !!followRegistryAddress,
   });
 
@@ -935,9 +944,16 @@ function App() {
                * Without it the screen can never reach its confirmed outcome and falls back to a
                * neutral "sent, check the line above" — because the seam resolving is NOT evidence
                * the chain agrees. `confirmDelegate` polls `delegateExpiry`, which is the same
-               * poll-until-visible rule every host-signed write in this app obeys: the host settles
-               * at best-block, we read through a separate public RPC that trails it, and
-               * `eth_getLogs` cannot see host-submitted calls at all. See gotchas.md.
+               * poll-until-visible rule every host-signed write in this app obeys.
+               *
+               * ⚠️ CORRECTED 2026-07-31 — HALF OF THE OLD REASON IS DEAD, THE OTHER HALF IS NOT.
+               * This used to say the poll was needed because "we read through a separate public RPC
+               * that trails" the host. That reader is gone: reads and writes now share one chain
+               * client and `.query()` defaults to `at: "best"`, deliberately so reads observe the
+               * same state `.tx()` resolved against. What survives, and is enough on its own, is
+               * that a host-submitted call emits `Revive.ContractEmitted` into `System.Events` and
+               * NOTHING into the ETH log index — so `eth_getLogs` cannot see it and there is no
+               * receipt to await. Poll the view function. See gotchas.md.
                */
               onConfirmDelegate={(address) => userRegistry.confirmDelegate(address, 'authorised')}
             />

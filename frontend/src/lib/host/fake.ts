@@ -32,13 +32,12 @@
 // Deterministic by default: the same seed produces the same jitter and the same delegate clock on
 // every reload, because a UI you cannot reproduce is a UI you cannot debug.
 
-import { ethers } from 'ethers'
-
 import { createCapabilityStore } from './capabilities'
 import { createDelegate } from './delegate'
 import { createDiagnostics } from './diagnostics'
+import { setBulletinSource } from '../bulletin'
 import { normaliseH160 } from '../recipient'
-import type { HostBackend, PutBlobOptions, RecipientResolution } from './types'
+import type { AbiEntry, ChainReader, HostBackend, PutBlobOptions, RecipientResolution } from './types'
 import { sleep } from './util'
 
 const MINUTE = 60_000
@@ -86,15 +85,90 @@ export interface FakeOptions {
   failRate?: number
   seed?: number
   /**
-   * ETH-RPC URL for reads, or `null` for no read provider at all.
+   * Whether to offer a chain reader at all. `false` (i.e. `?rpc=off`) offers none.
    *
-   * Defaulting to a REAL endpoint is deliberate: the 16 feature hooks have not been migrated onto
-   * this seam yet, so they still read chain state directly through ethers. Handing them a live
-   * provider means `?backend=fake` exercises the real read path against real data while faking
-   * exactly the parts that need a phone. `?rpc=off` drops it, to see how the app behaves with no
-   * chain at all.
+   * ⚠️ THIS USED TO BE `rpcUrl`, DEFAULTING TO A REAL PUBLIC ENDPOINT, and that default was itself a
+   * violation: `?backend=fake` constructed an `ethers.JsonRpcProvider` against
+   * `paseo-assethub-rpc.laissez-faire.trade` and read the LIVE chain. It was justified by the
+   * feature hooks not being migrated yet — they are now — and it had a second, uglier consequence:
+   * the fake served real heads whose bodies it could not produce, so a preview rendered real
+   * people's threads as "(content no longer available)". See `chainReader` below.
    */
-  rpcUrl?: string | null
+  chainReads?: boolean
+}
+
+/**
+ * The fake chain. ⛔ IT ANSWERS STRUCTURALLY, AND IT ANSWERS EMPTY.
+ *
+ * Every method is decoded from the ABI's declared outputs and answered with that type's zero: an
+ * empty `tuple[]`, `0n`, `false`, the zero address, `""`. Three properties make that the right
+ * choice rather than a cop-out:
+ *
+ *  1. **It invents no content.** The preceding version read the REAL chain, so a fake session showed
+ *     real threads by real authors with bodies it could not serve. `fake.ts` already refuses to
+ *     synthesise bodies for CIDs it did not write (see the Bulletin read path below); this is the
+ *     same refusal for the other half.
+ *  2. **The composer path still runs end to end.** `publish()` reads `headOf` first — an empty head
+ *     means `prev: null`, which is exactly a first post — then stores the body, then hits the fake's
+ *     deliberate `writeContract` refusal. That is the ⭐ `?caps=write` scenario, unchanged.
+ *  3. **A method the ABI does not have still fails loudly**, in JS, naming the method — the
+ *     friendliest disguise of this codebase's most common bug.
+ *
+ * ⚠️ An empty board is therefore what `?backend=fake` looks like until you post in it. That is a
+ * real cost of having no second read path, and it is the honest one.
+ */
+function createFakeChainReader(latency: () => Promise<void>): ChainReader {
+  const zero = (type: string | undefined, components: readonly AbiEntry[] | undefined): unknown => {
+    const t = type ?? ''
+    if (t.endsWith('[]')) return []
+    if (t === 'bool') return false
+    if (t === 'string') return ''
+    if (t === 'address') return '0x0000000000000000000000000000000000000000'
+    if (t.startsWith('bytes')) {
+      const size = Number(t.slice(5))
+      return Number.isFinite(size) && size > 0 ? `0x${'00'.repeat(size)}` : '0x'
+    }
+    if (/^u?int(\d+)?$/.test(t)) {
+      // viem hands back a `number` for widths it can hold exactly and a `bigint` above that. The
+      // hooks call `Number(...)` either way, but `ref.movedAt > 0n` does NOT survive a number, so
+      // the boundary has to be reproduced rather than approximated.
+      const bits = Number(/^u?int(\d+)?$/.exec(t)?.[1] ?? '256')
+      return bits <= 48 ? 0 : 0n
+    }
+    if (t === 'tuple') {
+      const out: Record<string, unknown> = {}
+      for (const c of components ?? []) {
+        out[String((c as { name?: string }).name ?? '')] = zero(
+          (c as { type?: string }).type,
+          (c as { components?: readonly AbiEntry[] }).components,
+        )
+      }
+      return out
+    }
+    return null
+  }
+
+  return {
+    label: 'fake backend (no chain — every read answers empty)',
+    async read(_address, abi, method) {
+      await latency()
+      const entry = abi.find(
+        (e) => (e as { type?: string }).type === 'function' && (e as { name?: string }).name === method,
+      ) as { outputs?: Array<{ name?: string; type?: string; components?: AbiEntry[] }> } | undefined
+      if (!entry) throw new Error(`the ABI has no readable method "${method}"`)
+
+      const outputs = entry.outputs ?? []
+      if (outputs.length === 0) return undefined
+      if (outputs.length === 1) return zero(outputs[0]?.type, outputs[0]?.components)
+      // Several outputs come back keyed by name, exactly as `product-sdk-contracts` decodes them —
+      // so `utils/contracts.ts` normalisation is exercised by the fake too, not bypassed.
+      const out: Record<string, unknown> = {}
+      outputs.forEach((o, i) => {
+        out[o.name || `_${i}`] = zero(o.type, o.components)
+      })
+      return out
+    },
+  }
 }
 
 /* ------------------------------------------------------------ tiny PRNG -- */
@@ -117,21 +191,23 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
     latencyMs = 90,
     failRate = 0,
     seed = 20260729,
-    rpcUrl,
+    chainReads = true,
   } = options
 
   const diag = createDiagnostics()
   const random = rng(seed)
   const jitter = (base: number) => Math.max(0, Math.round(base * (0.6 + random() * 0.9)))
 
-  const provider =
-    rpcUrl === null || rpcUrl === undefined ? null : new ethers.JsonRpcProvider(rpcUrl)
+  const chainReader = chainReads ? createFakeChainReader(() => sleep(jitter(latencyMs))) : null
 
   const canWrite = caps === 'write' || caps === 'live'
   const canPushLive = caps === 'live'
 
   const capabilities = createCapabilityStore({
-    canRead: caps !== 'none' || true, // reading never depends on a container
+    // ⚠️ Was `caps !== 'none' || true`, i.e. an unconditional `true` with a misleading left operand —
+    // "reading never depends on a container" was the assumption the whole external RPC rested on.
+    // It does now. The fake STANDS IN for the container, so the reader exists unless `?rpc=off`.
+    canRead: !!chainReader,
     canWrite,
     canPushLive,
     // The fake backend stands in FOR the container, so this is true. Otherwise every `?backend=fake`
@@ -158,7 +234,6 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
   // the two things that need a chain: the authorisation clock and the balance.
   const delegate = createDelegate({
     diagnostics: diag,
-    provider: () => provider,
     deriveOverride: async () => {
       await sleep(jitter(latencyMs))
       // The one preset with no key at all: the host refused to derive entropy, or we are outside a
@@ -205,13 +280,18 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
       lowOnFunds: fakeBalance !== null && !funded,
       // Kept word-for-word in step with `delegate.ts` `explain()`. If they drift, the fake stops
       // testing the copy the real one produces, which is half of its job.
+      //
+      // ⚠️ REWRITTEN 2026-07-31 with `explain()`: the old copy promised "announcing a post costs no
+      // prompt" and "your next post will top it up", both of which described the removed
+      // ethers-signing arm. `funded` is kept in the state (the fake is the only place a funded
+      // delegate can be simulated at all) but no longer changes the sentence, because being funded
+      // does not currently change what the app can do.
       reason: !live
         ? base.expiresAt === null
-          ? 'not authorised yet — your next post will set it up with one extra signature'
-          : 'the authorisation has expired — your next post will renew it'
-        : !funded
-          ? 'the posting key is out of funds — your next post will top it up'
-          : `authorised for ${Math.round((base.expiresAt! - now) / DAY)} more days — announcing a post costs no prompt`,
+          ? 'a posting key exists but is not authorised — every post asks you to sign'
+          : 'the authorisation has expired — every post asks you to sign'
+        : `authorised on chain for ${Math.round((base.expiresAt! - now) / DAY)} more days — but the ` +
+          'key cannot be funded or submitted from here yet, so posts still ask you to sign',
     }
   }
 
@@ -219,7 +299,11 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
 
   diag.step('container', caps === 'none' ? 'skip' : 'ok', 'fake backend — no real container involved')
   diag.step('sdk', 'skip', 'fake backend — no SDK loaded')
-  diag.step('chain', provider ? 'ok' : 'skip', provider ? (rpcUrl as string) : 'no read provider (?rpc=off)')
+  diag.step(
+    'chain',
+    chainReader ? 'ok' : 'skip',
+    chainReader ? chainReader.label : 'chain reads disabled (?rpc=off) — every list is empty',
+  )
   diag.step('connect', canWrite ? 'ok' : 'skip', canWrite ? FAKE_SELF_SS58 : 'read-only preview')
   diag.step('permChain', canWrite ? 'ok' : 'skip', 'simulated')
   diag.step('statements', canPushLive ? 'ok' : 'skip', canPushLive ? 'in-memory' : 'simulating no personhood proof')
@@ -229,6 +313,48 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
   let destroyed = false
   const assertLive = () => {
     if (destroyed) throw new Error('This backend has been destroyed.')
+  }
+
+  /* ------------------------------------------------- the Bulletin READ path - */
+  //
+  // ⭐ THE FAKE IS NOW THE DEV SEAM FOR READS AS WELL AS WRITES, because there is no longer an HTTP
+  // path to fall back on: post bodies come through the host's preimage lookup or not at all
+  // (`lib/bulletin.ts`). So `?backend=fake` has to answer reads too, or localhost shows a board of
+  // holes.
+  //
+  // ⛔ AND IT SERVES ONLY WHAT THIS SESSION WROTE. Not a fixture generator, not a deterministic
+  // body for any CID somebody asks for. Synthesising bodies would put invented words under a real
+  // author's name on a screen somebody will eventually screenshot; `backend.ts` refuses that trade
+  // for the whole backend and this is the same refusal one layer down.
+  //
+  // ⚠️ THAT USED TO BITE HARDER THAN IT DOES NOW. `readProvider` pointed at the REAL chain, so a
+  // fake session walked real heads and rendered real people's threads as "(content no longer
+  // available)". The chain reader is fake too as of 2026-07-31 (see `createFakeChainReader`), so the
+  // board simply starts empty and both halves of the preview are consistent about what they know.
+  // Compose a thread in the same session and its body reads back correctly.
+  //
+  // `caps=none` deliberately installs NOTHING: it simulates a page outside the container, which is
+  // now a page that genuinely cannot read a body, and the fake exists to reproduce failure modes.
+  if (caps === 'none') {
+    setBulletinSource(null)
+    diag.step('read', 'fail', 'fake backend — simulating a page outside the Polkadot app, where no post body can load')
+  } else {
+    setBulletinSource({
+      label: 'fake backend (this session only)',
+      async read(cid) {
+        await sleep(jitter(latencyMs))
+        const bytes = blobs.get(cid)
+        if (!bytes) {
+          throw new Error(
+            `The fake backend has no Bulletin and serves only what this session wrote, so ${cid} ` +
+              'is unavailable. This is what an expired body looks like — compose a post to see the ' +
+              'loaded state.',
+          )
+        }
+        return bytes.slice()
+      },
+    })
+    diag.step('read', 'ok', 'fake backend — serves only the objects this session wrote')
   }
 
   return {
@@ -255,10 +381,9 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
      * with no personhood proof. A present-but-refusing writer keeps the composer on screen and its
      * error path exercisable.
      *
-     * It cannot succeed, either: `readProvider` points at a REAL RPC by default, so a stub that
-     * returned a transaction hash would be followed by a read of the real chain that never shows the
-     * write — reported to the user as "submitted but not visible yet", which is a lie about a
-     * transaction that was never submitted at all.
+     * It must not succeed, either: a stub returning a transaction hash would be followed by a read
+     * that never shows the write — reported to the user as "submitted but not visible yet", which is
+     * a lie about a transaction that was never submitted at all.
      */
     writeContract: canWrite
       ? async (_address, _abi, method, _args, label) => {
@@ -361,17 +486,17 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
       },
     },
 
-    readProvider: () => provider,
+    chainReader: () => chainReader,
 
     signer: () => ({
       // The fake has no host, so arm 1 is honestly empty. A UI that needs it must say "not
       // available in the preview" rather than silently doing nothing.
+      // (There is no arm 2 any more — see `types.ts` `SignerSeam`.)
       host: {
         account: canWrite ? { address: FAKE_SELF_SS58, h160Address: FAKE_SELF_H160 } : null,
         signer: null,
         submit: null,
       },
-      delegateSigner: canWrite ? delegate.signer() : null,
     }),
 
     // `null` when the preview cannot write, exactly as the real backend does: the delegate exists to
@@ -434,6 +559,9 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
 
     destroy() {
       destroyed = true
+      // Cleared before the blobs it reads from, so a read can never observe an emptied source as a
+      // torn-down one — see `session.ts` `destroy`.
+      setBulletinSource(null)
       blobs.clear()
     },
   }

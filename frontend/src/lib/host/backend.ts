@@ -10,15 +10,29 @@
 //
 // The default is the opposite of what you might expect: OUTSIDE a container we do NOT silently fall
 // back to the fake. A page that quietly serves invented content is far worse than one that says
-// "posting needs the Polkadot app" — someone would eventually screenshot fake posts as evidence of
-// real ones. The real backend handles the no-container case honestly, read-only, and says so.
+// "Plaza runs inside the Polkadot app" — someone would eventually screenshot fake posts as evidence
+// of real ones. The real backend handles the no-container case honestly and says so.
+//
+// ⚠️ AND "HONESTLY" NOW MEANS EMPTY, NOT READ-ONLY. This comment used to promise a read-only page
+// outside the container. Both read paths — Bulletin bodies and, since 2026-07-31, chain state — go
+// through the host and have no substitute, so a plain browser tab loads nothing at all and says
+// which step could not open. See `session.ts` and `gotchas.md` § THE SDK PATH IS THE ONLY PATH.
 
 import { createFakeBackend, type FakeCapabilityPreset, type FakeDelegatePreset } from './fake'
 import { openHostSession } from './session'
 import type { HostBackend } from './types'
 
-/** Paseo Asset Hub ETH RPC — anonymous reads only. Nothing here signs. */
-export const DEFAULT_RPC_URL = 'https://paseo-assethub-rpc.laissez-faire.trade'
+// ⛔ `DEFAULT_RPC_URL` IS GONE, DELETED 2026-07-31. DO NOT BRING IT BACK.
+//
+// It was `https://paseo-assethub-rpc.laissez-faire.trade` — a third-party domain, neither Parity's
+// nor the community foundation's — and `session.ts` built an `ethers.JsonRpcProvider` from it
+// BEFORE the container check, unconditionally, for every visitor. Every contract read in the app
+// flowed through it. Inside the host container that is an external origin the user gets prompted
+// about, exactly as they were prompted about the IPFS gateways. Chain reads now go through
+// `@parity/product-sdk-contracts` `.query()` over the host provider; see `utils/contracts.ts`.
+//
+// There is nothing to configure any more, which is the point: an endpoint constant is an invitation
+// to make it overridable, and `?rpc=<url>` was exactly that mistake (see `chainReads` below).
 
 const CAPS: readonly FakeCapabilityPreset[] = ['none', 'read', 'write', 'live']
 const DELEGATES: readonly FakeDelegatePreset[] = [
@@ -37,7 +51,13 @@ export interface BackendSelection {
   latencyMs: number
   failRate: number
   seed: number
-  rpcUrl: string | null
+  /**
+   * Whether to open the chain-read path at all. `false` only for `?rpc=off`.
+   *
+   * ⚠️ IT USED TO BE `rpcUrl: string | null` AND THAT WAS A SECURITY BUG, not just a layering one.
+   * See `chainReads` in the parser below.
+   */
+  chainReads: boolean
 }
 
 /**
@@ -77,7 +97,26 @@ export function parseBackendSelection(search: string): BackendSelection {
     latencyMs: number('latency', 90),
     failRate: number('fail', 0),
     seed: number('seed', 20260729),
-    rpcUrl: params.get('rpc') === 'off' ? null : (params.get('rpc') || DEFAULT_RPC_URL),
+    /**
+     * ⛔ `?rpc=` IS A SWITCH, NOT A URL. `off` means NO CHAIN READS; ANY other value is IGNORED.
+     *
+     * ⚠️ THE NAME IS A FOSSIL AND THE PARAMETER NO LONGER NAMES ANYTHING. There is no RPC to point
+     * at: chain reads go through the SDK over the host provider (`utils/contracts.ts`), and the
+     * external endpoint this used to select was removed on 2026-07-31. The key is kept because
+     * `?rpc=off` is documented in `FAKE_SCENARIOS`, has been typed into address bars, and still has
+     * exactly the meaning it always had at the UI level: prove that a screen degrades honestly with
+     * no chain behind it.
+     *
+     * ⛔ AND IT MUST NEVER AGAIN ACCEPT A VALUE. It used to be `params.get('rpc') || DEFAULT_RPC_URL`
+     * — an arbitrary origin, no allowlist, no scheme check, taken straight off the query string.
+     * `frontend/CLAUDE.md` records **[V]** that the dot.li shell FORWARDS QUERY AND HASH INBOUND, so
+     * a shared `https://plaza-social.dot/?rpc=https://evil.example` pointed the whole app at an
+     * attacker-chosen origin: fabricated heads, profiles and vote tallies, and arbitrary CIDs handed
+     * to the host's preimage lookup.
+     *
+     * ⚠️ Do not "improve" this with an allowlist. There is nothing left for an allowlist to allow.
+     */
+    chainReads: params.get('rpc') !== 'off',
   }
 }
 
@@ -102,13 +141,13 @@ export async function openBackend(options: OpenBackendOptions): Promise<HostBack
       latencyMs: selection.latencyMs,
       failRate: selection.failRate,
       seed: selection.seed,
-      rpcUrl: selection.rpcUrl,
+      chainReads: selection.chainReads,
     })
   }
 
   return openHostSession({
     appName: options.appName,
-    rpcUrl: selection.rpcUrl ?? DEFAULT_RPC_URL,
+    chainReads: selection.chainReads,
   })
 }
 
@@ -131,5 +170,8 @@ export const FAKE_SCENARIOS: ReadonlyArray<{ query: string; what: string }> = [
   { query: '?backend=fake&caps=live&delegate=lowfunds', what: 'Authorised but out of fees.' },
   { query: '?backend=fake&caps=live&delegate=unavailable', what: 'No key at all; every post prompts.' },
   { query: '?backend=fake&caps=live&fail=1', what: 'Every write fails, so failure UI has something to render.' },
-  { query: '?backend=fake&caps=live&rpc=off', what: 'No chain at all — nothing may crash.' },
+  {
+    query: '?backend=fake&caps=live&rpc=off',
+    what: 'No chain reads at all — every list is empty and nothing may crash.',
+  },
 ]

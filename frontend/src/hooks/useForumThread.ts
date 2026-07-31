@@ -15,7 +15,7 @@ import { FORUM_REGISTRY, threadRegistryId } from "../lib/registry";
 import { POLL_INTERVAL_MS, createRefreshGate, deepEqual, refresh, startPolling, type RefreshMode } from "../lib/poll";
 import { NO_WRITE_SESSION } from "../lib/publish";
 import { usePublisher } from "./usePublisher";
-import { gatewayFetcher } from "../lib/gateways";
+import { bulletinFetcher } from "../lib/bulletin";
 
 /**
  * The forum, on the migrated content model.
@@ -187,8 +187,13 @@ export function useForumThread({
 
   // One cache per hook instance, persisted in the browser. Bodies are immutable and content-addressed,
   // so a cache hit can never be stale — only absent.
+  //
+  // ⚠️ `bulletinFetcher()` reads through the HOST, not over HTTP — see `lib/bulletin.ts`. It resolves
+  // the installed source per call, which is why building it here (before the container handshake has
+  // finished) is safe. Do not re-add a URL-based fetcher: that is what made the host prompt the user
+  // for permission to reach a public IPFS gateway.
   const cache = useMemo(
-    () => createBlobCache({ fetcher: gatewayFetcher(), persist: browserPersistence() }),
+    () => createBlobCache({ fetcher: bulletinFetcher(), persist: browserPersistence() }),
     []
   );
 
@@ -479,8 +484,13 @@ export function useForumThread({
       // the row has landed yet or not.
       await loadThreads("background");
       if (!confirmed) {
-        // The write went through — the head move returned a transaction hash — but the read RPC had
-        // not caught up. Saying so beats a silent list that has not changed yet.
+        // The write went through — the head move returned a transaction hash — but the read did not
+        // show it yet. Saying so beats a silent list that has not changed yet.
+        //
+        // ⚠️ CORRECTED 2026-07-31: this used to be blamed on "the read RPC" trailing the host,
+        // which was a symptom of reads going through a separate public endpoint. They do not any
+        // more — one chain client, `.query()` at `best`. The gap that remains is real but smaller:
+        // a native extrinsic gives no receipt to await, so `publish()` can only re-read and see.
         throw new Error(
           "Your thread was submitted, but it has not shown up in a read yet. It should appear " +
             "within a minute; the list refreshes on its own."

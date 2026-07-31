@@ -6,8 +6,6 @@
 // shape of `Capabilities` in particular is a direct consequence of §5's prompt table and is not
 // arbitrary.
 
-import type { ethers } from 'ethers'
-
 /* ============================================================ diagnostics == */
 
 export type DiagnosticStatus = 'running' | 'ok' | 'fail' | 'skip'
@@ -55,7 +53,34 @@ export interface Diagnostics {
  * If you find a `disabled={!canPushLive}` anywhere, it is a bug.
  */
 export interface Capabilities {
-  /** Reads never need a wallet, a container, or a signer. Effectively always true. */
+  /**
+   * CHAIN reads — heads, profiles, follows, vote tallies.
+   *
+   * ⭐ SETTLED 2026-07-31: `canRead` MEANS "THE SDK CHAIN-READ PATH IS OPEN", AND IT NEEDS THE HOST.
+   *
+   * It used to mean "an `ethers.JsonRpcProvider` was constructed", which was true for every visitor
+   * because that provider pointed at a third-party HTTP endpoint
+   * (`paseo-assethub-rpc.laissez-faire.trade`). That was the same violation the IPFS gateways were —
+   * an external origin the host prompts about — and it is gone. Chain reads now go through
+   * `@parity/product-sdk-contracts` `.query()` over the host provider, exactly as writes already do.
+   *
+   * ⛔ THE HONEST CONSEQUENCE: OUTSIDE THE POLKADOT APP THERE ARE NO CHAIN READS AT ALL, and
+   * `canRead` is `false` there. That is a correction, not a regression — see `gotchas.md`
+   * § *THE SDK PATH IS THE ONLY PATH*. `SessionStatus` already renders the honest header for it
+   * ("Plaza could not reach the chain"), and `?backend=fake` is the local-development seam.
+   *
+   * TWO READ PATHS, TWO PLACES THE TRUTH LIVES, AND ONLY ONE OF THEM IS A FLAG:
+   *
+   *   · CHAIN reads (heads, profiles, tallies, the follow graph) → this flag, and the `chain` step
+   *     in DIAGNOSTICS for the detail.
+   *   · BULLETIN BODY reads → NOT a flag. The `read` step in DIAGNOSTICS is the source of truth;
+   *     `session.ts` sets it to `fail` with a sentence when the host preimage lookup did not open.
+   *     Inventing a second flag no UI consumes would be worse than saying where to look.
+   *
+   * The two come apart in exactly one direction: a host can serve chain reads while its preimage
+   * lookup refuses, which renders a full board of holes. It cannot go the other way, because both
+   * ride the same host connection.
+   */
   canRead: boolean
   /** Can store content and move a head pointer. Depends on the Bulletin path alone. */
   canWrite: boolean
@@ -246,22 +271,35 @@ export interface PutBlobOptions {
 }
 
 /**
- * The two-arm signer seam.
+ * The signer seam. ⚠️ IT HAS ONE ARM.
  *
- * ARM 1 — host-signed (`signAndSend`). For contract calls the user must approve. Per §5 of
- * architecture.md this ALWAYS prompts: `SmartContractAllowance` carries no signing key, and all
- * four of the deployed host's signing handlers reach an unconditional modal. There is no
- * "auto-sign for the rest of this session" mode and asking for one does nothing (see
- * `allowance.ts`). Use it for one-off onboarding steps — `authorizeDelegate`, profile creation.
+ * ARM 1 — host-signed. For every contract call. Per §5 of architecture.md this ALWAYS prompts:
+ * `SmartContractAllowance` carries no signing key, and all four of the deployed host's signing
+ * handlers reach an unconditional modal. There is no "auto-sign for the rest of this session" mode
+ * and asking for one does nothing (see `allowance.ts`).
  *
- * ARM 2 — delegate-signed (`delegateSigner`). A local key that signs its OWN transactions, so the
- * host is never asked and no modal appears. Use it for everything on the hot path. Its key is
- * derived through `deriveEntropy` (RFC-0007), namespaced per product by the host, so it is
- * reproducible from the user's wallet on the same device and is never written to disk.
+ * ⛔ ARM 2 — `delegateSigner` — IS GONE, REMOVED 2026-07-31, AND IT WAS NEVER CAPABLE OF WORKING.
  *
- * ⛔ NOTHING IN THE DELEGATE ARM MAY EVER BLOCK A WRITE. Every failure in it means "fall back to
- * the prompting arm", never an error the user sees. A user must not lose a post because a
- * convenience mechanism broke.
+ * It was an `ethers.Wallet` connected to a third-party public RPC, and it failed for two
+ * INDEPENDENT reasons at once:
+ *
+ *   1. The delegate H160 is unfunded (balance 0.0, nonce 0, **[V]** 2026-07-30), so the node
+ *      answered `code 1012 "Transaction is temporarily banned"` and the txpool then banned the
+ *      hash — which reads like a mysterious ban rather than "no money".
+ *   2. Every call site used `vote(…)` / `follow(…)` rather than the delegation-aware
+ *      `voteFor(…)` / `followFor(…)`, so even a FUNDED delegate would have credited the throwaway
+ *      key instead of the user.
+ *
+ * On top of both, broadcasting through `ethers` meant an external HTTP origin the host prompts
+ * about — the violation `gotchas.md` § *THE SDK PATH IS THE ONLY PATH* forbids.
+ *
+ * ⚠️ THE CONCEPT IS NOT DEAD, THE LAST MILE IS. `deriveEntropy` (RFC-0007) is a real platform
+ * primitive and `lib/host/delegate.ts` still derives the key and reports its address, so
+ * "SET UP POSTING KEY" has something honest to show. What it no longer does is sign or broadcast.
+ * When a delegate can be funded AND authorised, the route back is `product-sdk-keys`
+ * (`KeyManager.fromRawKey(...).deriveAccount()`) submitting a NATIVE extrinsic — never ethers over
+ * an ETH RPC. See `gotchas.md` § *no allowance*: "A delegate key is not an escape route… do not
+ * invent one."
  */
 export interface HostAccount {
   /** SS58. What the host calls the account, and what contract `origin` parameters want. */
@@ -293,13 +331,41 @@ export interface SignerSeam {
     /** Submit an already-prepared native transaction, prompting the user. `null` when unwired. */
     submit: ((prepared: unknown, label: string) => Promise<{ txHash: string }>) | null
   }
+}
+
+/* =========================================================== chain reads == */
+
+/** One ABI entry. Deliberately loose — ABIs are loaded from JSON. */
+export type AbiEntry = Record<string, unknown>
+
+/**
+ * ⭐ THE ONE WAY PLAZA READS CONTRACT STATE. There is no other, and adding one is the mistake
+ * `gotchas.md` § *THE SDK PATH IS THE ONLY PATH* is about.
+ *
+ * Backed by `@parity/product-sdk-contracts`: `createContract(runtime, address, abi).<method>.query()`
+ * over a `createChainClient({ chains: { assetHub } })` whose connection routes through the HOST
+ * provider — the chain-client docs are explicit that "there is no direct-WebSocket fallback", which
+ * is precisely the property we want. Three facts make this usable for anonymous readers:
+ *
+ *   · `.query()` is a `ReviveApi.call` DRY RUN. It submits nothing, signs nothing and costs nothing.
+ *   · Origin resolution ends in a "pallet-revive account fallback", so a query needs NO account.
+ *   · `at` defaults to `"best"` "so `.query()` reads observe the same state as `.tx()`" — i.e. the
+ *     reader no longer trails the writer, which is what the old separate public RPC did.
+ *
+ * ⛔ A FAILED READ THROWS. It never returns a plausible zero. `walk.ts` renders an unreadable body
+ * as a hole with a reason and `lib/poll.ts` keeps the last good list on a failed background poll;
+ * both of those depend on being TOLD, and a silent fallback value would defeat them.
+ */
+export interface ChainReader {
+  /** Short human label for diagnostics — e.g. "host asset-hub (devnet)". */
+  readonly label: string
   /**
-   * ARM 2 — delegate-signed. An ordinary ethers signer backed by the derived delegate key, already
-   * connected to the read provider, signing its own transactions with no host involvement and
-   * therefore no prompt. `null` when no key could be derived — in which case callers fall back to
-   * arm 1 and accept the prompt, and MUST NOT surface that as a failure.
+   * Dry-run one read-only method and return its DECODED result, exactly as the SDK decoded it:
+   * a single output comes back bare, several come back as an object keyed by output name.
+   * Normalising that into the array-plus-names shape call sites expect is `utils/contracts.ts`'s
+   * job, so this stays a thin, testable seam over the SDK.
    */
-  delegateSigner: ethers.Signer | null
+  read(address: string, abi: AbiEntry[], method: string, args: unknown[]): Promise<unknown>
 }
 
 /**
@@ -334,8 +400,11 @@ export interface HostBackend {
    */
   payments: PaymentsSeam | null
 
-  /** Anonymous reads. Always available, never gated, never needs a wallet. */
-  readProvider: () => ethers.Provider | null
+  /**
+   * Anonymous CHAIN reads, through the SDK. Never gated on an account — but `null` OUTSIDE the host
+   * container, because the SDK is the only path and it does not exist there. See `Capabilities.canRead`.
+   */
+  chainReader: () => ChainReader | null
 
   signer: () => SignerSeam
 

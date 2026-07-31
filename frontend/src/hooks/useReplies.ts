@@ -15,7 +15,7 @@ import {
 } from "../lib/poll";
 import { NO_WRITE_SESSION } from "../lib/publish";
 import { usePublisher } from "./usePublisher";
-import { gatewayFetcher } from "../lib/gateways";
+import { bulletinFetcher } from "../lib/bulletin";
 
 /**
  * Replies, on the migrated content model.
@@ -157,7 +157,9 @@ export function useReplies({
 
   // Bodies are immutable and content-addressed, so a cache hit can never be stale — only absent.
   const cache = useMemo(
-    () => createBlobCache({ fetcher: gatewayFetcher(), persist: browserPersistence() }),
+    // ⚠️ `bulletinFetcher()` reads through the HOST, not over HTTP — see `lib/bulletin.ts`. It
+    // resolves the installed source per call, so building it before the handshake finishes is safe.
+    () => createBlobCache({ fetcher: bulletinFetcher(), persist: browserPersistence() }),
     []
   );
 
@@ -327,12 +329,16 @@ export function useReplies({
       // composer, so a cold load here would empty the very thread the user just replied to. And the
       // new reply cannot be missed by the equality skip: a list with one more entry differs on
       // LENGTH, which `deepEqual` checks before it compares any element. If the reply genuinely is
-      // not visible to the read RPC yet, the fetch returns the identical list, nothing commits, and
+      // not visible to a read yet, the fetch returns the identical list, nothing commits, and
       // `confirmed` is false — which is what the message below is for.
       await loadReplies("background");
       if (!confirmed) {
-        // The write went through — the head move returned a transaction hash — but the read RPC had
-        // not caught up. Saying so beats a list that silently has not changed yet.
+        // The write went through — the head move returned a transaction hash — but the read did not
+        // show it yet. Saying so beats a list that silently has not changed yet.
+        //
+        // ⚠️ CORRECTED 2026-07-31: not "the read RPC trails" any more — reads and writes share one
+        // chain client and `.query()` targets `best`. What remains is that a native extrinsic
+        // yields no receipt to await, so the only confirmation available is re-reading.
         throw new Error(
           "Your reply was submitted, but it has not shown up in a read yet. It should appear " +
             "within a minute; replies refresh on their own."

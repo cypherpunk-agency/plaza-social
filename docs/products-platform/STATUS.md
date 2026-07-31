@@ -63,7 +63,14 @@ Bulletin authorization error. Cost an hour. See gotchas.
 
 ## What works, verified on a real device
 
-- **Anonymous reading**, everywhere, needing nothing — contracts via `eth_call`, bodies via gateways.
+- **Anonymous reading — inside the host, needing no wallet and no sign-in.**
+  ⚠️ **This line used to read *"everywhere, needing nothing — contracts via `eth_call`, bodies via
+  gateways"*, and that phrasing directly caused a design error on 2026-07-31.** It was read as a
+  promise of an out-of-host HTTP route worth preserving, which produced a "prefer the SDK, fall back
+  to gateways" design — the exact thing the migration had removed. **"Needing nothing" means no wallet
+  and no sign-in. It does not mean no host.** See gotchas.md § *THE SDK PATH IS THE ONLY PATH*.
+  Post bodies now come from the host preimage subscription (`lib/bulletin.ts`); the IPFS gateway list
+  is deleted. A plain browser tab therefore renders every body as unavailable, and that is correct.
 - **All four contracts deployed.** `node contracts/scripts/verify-deployment.mjs`. Contract tests
   **136 passing, 0 failing**.
 - **Arm 1 — host-signed contract writes.** A profile was created on chain from the phone, with the

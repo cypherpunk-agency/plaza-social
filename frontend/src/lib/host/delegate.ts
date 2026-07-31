@@ -1,4 +1,45 @@
-// The delegate key — arm 2 of the signer seam.
+// The delegate key. ⛔ IT NO LONGER SIGNS ANYTHING, AND THAT IS NOT A REGRESSION.
+//
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// WHAT WAS REMOVED, 2026-07-31, AND WHY IT COULD NEVER HAVE WORKED
+//
+// This file used to wrap the derived key in an `ethers.Wallet`, connect it to a third-party public
+// ETH RPC, and hand it out as `SignerSeam.delegateSigner`. Six live UI call sites signed with it:
+// `vote` / `removeVote`, `follow` / `unfollow`, and `createDefaultProfile` / `setDisplayName` /
+// `setBio` / `transferProfileOwnership` / the three link calls. **Every one of them failed**, for
+// TWO INDEPENDENT reasons:
+//
+//   1. **The key is unfunded.** Balance 0.0, nonce 0, **[V]** 2026-07-30 → `code 1012 "Transaction
+//      is temporarily banned"`, after which the txpool bans the hash and a retry looks like a
+//      different, more mysterious failure than "no money".
+//   2. **The call sites named the wrong function.** They called `vote(…)` / `follow(…)`, which credit
+//      `msg.sender`, rather than the delegation-aware `voteFor(…)` / `followFor(…)`. So even a
+//      FUNDED delegate would have recorded a throwaway per-device key as the voter.
+//
+// And a third, which is what makes it a rule rather than a bug: broadcasting through `ethers` means
+// an external HTTP origin, which the host prompts about. `gotchas.md` § *THE SDK PATH IS THE ONLY
+// PATH*, and § *no allowance*: "A delegate key is not an escape route… do not invent one."
+//
+// ⭐ WHAT SURVIVES, AND WHY IT IS NOT DEAD CODE. `deriveEntropy` (RFC-0007) is a real platform
+// primitive: silent, deterministic per wallet, namespaced per product by the host, never written to
+// disk. It still runs, the address is still reported, and the state below still drives the
+// "SET UP POSTING KEY" panel — which is honest, because `UserRegistry.authorizeDelegate` genuinely
+// works today (host-signed, `hooks/useUserRegistry.ts`). What is missing is a way to FUND the key
+// and a submission path for it.
+//
+// ⛔ THE WAY BACK IS NOT ETHERS. When a delegate can be funded and authorised, it submits a NATIVE
+// extrinsic via `@parity/product-sdk-keys` (`KeyManager.fromRawKey(...).deriveAccount()`) — that is
+// what the reference app does, and it is why `sdk.ts` records the package as deliberately absent
+// rather than forgotten. Re-adding an `ethers.Wallet` over an ETH RPC rebuilds exactly what this
+// change removed.
+//
+// The balance-related state below (`balance`, `lowOnFunds`, `existentialDeposit`, `noteSpend`) is
+// kept and reported as UNKNOWN (`null`) rather than deleted, because "we cannot read it" and "you
+// have nothing" are different facts and the panel renders them differently. Reading it needs a
+// funded-account query the SDK path does not offer for an arbitrary H160 today.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ─── HISTORICAL CONTEXT, STILL LOAD-BEARING ──────────────────────────────────────────────────────
 //
 // ═════════════════════════════════════════════════════════════════════════════════════════════════
 // WHAT THIS IS, IN ONE PARAGRAPH
@@ -135,8 +176,6 @@ function entropyToPrivateKey(entropy: Uint8Array): string {
 
 export interface DelegateOptions {
   diagnostics: Diagnostics
-  /** Anonymous read provider; the delegate signer is connected to it so it can read its own nonce. */
-  provider: () => ethers.Provider | null
   /**
    * Overrides derivation. Used ONLY by the fake backend, which has no host to derive from — it
    * passes a fixed seed so the fake delegate is stable across reloads and obviously not a real key.
@@ -147,9 +186,11 @@ export interface DelegateOptions {
 export interface Delegate {
   state: () => DelegationState
   subscribe: (listener: (state: DelegationState) => void) => () => void
-  /** The ethers signer, connected to the read provider. `null` until derived. Never throws. */
-  signer: () => ethers.Signer | null
-  /** Derive if needed and read balance. Never throws. */
+  /**
+   * ⛔ THERE IS NO `signer()` ANY MORE. See the header. Contract writes go through
+   * `HostBackend.writeContract`; a signer here would be an ethers wallet on an external RPC.
+   */
+  /** Derive if needed. Never throws. */
   refresh: () => Promise<DelegationState>
   /**
    * The ONE prompt. Both steps are INJECTED rather than implemented here, because the contract
@@ -179,31 +220,50 @@ export interface Delegate {
   noteSpend: () => void
 }
 
-export function createDelegate({ diagnostics: diag, provider, deriveOverride }: DelegateOptions): Delegate {
-  let wallet: ethers.Wallet | null = null
+export function createDelegate({ diagnostics: diag, deriveOverride }: DelegateOptions): Delegate {
+  /**
+   * ⚠️ AN ADDRESS-ONLY HANDLE, NOT A SIGNER.
+   *
+   * `ethers.computeAddress` is pure maths on a private key — no provider, no network, nothing that
+   * can broadcast. It is what `authorizeDelegate` needs to record on chain and what the panel shows.
+   * ⛔ Do not upgrade this back into an `ethers.Wallet`; see the header.
+   */
+  let wallet: { address: string } | null = null
   let derivationFailed = false
   let expiresAt: number | null = null
   let maxSeconds = REQUEST_SECONDS
   let balance: bigint | null = null
-  let deriving: Promise<ethers.Wallet | null> | null = null
+  let deriving: Promise<{ address: string } | null> | null = null
 
   const listeners = new Set<(state: DelegationState) => void>()
 
   const hasFunds = () => balance !== null && balance >= LOW_WATER
 
+  /**
+   * ⚠️ EVERY SENTENCE HERE WAS REWRITTEN 2026-07-31, BECAUSE THE OLD ONES PROMISED SOMETHING THE APP
+   * CANNOT DO. They said things like "announcing a post costs no prompt" and "your next post will
+   * top it up" — both describing the removed ethers-signing arm. A delegation is real and useful on
+   * chain, but nothing in this app signs with the key yet, so the honest line is that it does not
+   * shorten a prompt today.
+   *
+   * ⛔ Do not restore the old copy without restoring a working submission path first, and note that
+   * `fake.ts` keeps its wording in step with this function on purpose — if they drift, the fake
+   * stops testing the copy the real one produces, which is half its job.
+   */
   function explain(): string {
     const now = Date.now()
     if (!wallet) {
       return derivationFailed
-        ? 'no local posting key — every post will ask you to sign'
+        ? 'no local posting key — every post asks you to sign'
         : 'setting up a local posting key'
     }
-    if (!expiresAt) return 'not authorised yet — your next post will set it up with one extra signature'
-    if (expiresAt <= now) return 'the authorisation has expired — your next post will renew it'
-    if (!hasFunds()) return 'the posting key is out of funds — your next post will top it up'
+    if (!expiresAt) return 'a posting key exists but is not authorised — every post asks you to sign'
+    if (expiresAt <= now) return 'the authorisation has expired — every post asks you to sign'
     const days = Math.max(0, Math.round((expiresAt - now) / DAY))
-    // "announcing", not "posting": the Bulletin store is a separate write. See the header.
-    return `authorised for ${days} more day${days === 1 ? '' : 's'} — announcing a post costs no prompt`
+    return (
+      `authorised on chain for ${days} more day${days === 1 ? '' : 's'} — but the key cannot be ` +
+      'funded or submitted from here yet, so posts still ask you to sign'
+    )
   }
 
   function state(): DelegationState {
@@ -233,7 +293,7 @@ export function createDelegate({ diagnostics: diag, provider, deriveOverride }: 
     }
   }
 
-  async function ensureWallet(): Promise<ethers.Wallet | null> {
+  async function ensureWallet(): Promise<{ address: string } | null> {
     if (wallet || derivationFailed) return wallet
     deriving ??= (async () => {
       diag.step('delegate', 'running', 'deriving a local posting key')
@@ -254,7 +314,7 @@ export function createDelegate({ diagnostics: diag, provider, deriveOverride }: 
           )
         }
         if (!entropy) throw new Error('the host returned no entropy')
-        wallet = new ethers.Wallet(entropyToPrivateKey(entropy))
+        wallet = { address: ethers.computeAddress(entropyToPrivateKey(entropy)) }
         // Records the DERIVATION only. Authorisation state belongs to `state().reason`, which is
         // live; a diagnostics line saying "not authorised yet" would go stale the moment it was and
         // then contradict the panel two inches above it.
@@ -275,16 +335,27 @@ export function createDelegate({ diagnostics: diag, provider, deriveOverride }: 
     return deriving
   }
 
-  async function readBalance() {
-    const rpc = provider()
-    if (!wallet || !rpc) return
-    try {
-      balance = await withTimeout(rpc.getBalance(wallet.address), 15_000, 'Delegate balance')
-    } catch (error) {
-      // A balance we could not read is UNKNOWN, not zero. Zeroing it would report "out of funds" for
-      // a perfectly funded key and send every write down the prompting path.
-      diag.step('delegate', 'skip', `could not read the posting key's balance: ${describe(error)}`)
-    }
+  /**
+   * ⛔ THE BALANCE IS UNREADABLE, AND `null` IS THE HONEST ANSWER.
+   *
+   * It used to be `provider.getBalance(delegate)` over the public ETH RPC — which is exactly the
+   * external origin this change removed. There is no SDK equivalent for an arbitrary H160's native
+   * balance today (`Revive.OriginalAccount` maps identity, not funds), so rather than guess, the
+   * state keeps `balance: null` and `hasFunds()` stays false.
+   *
+   * ⚠️ `null` MEANS UNKNOWN, NOT ZERO, and the distinction is load-bearing: `explain()` renders
+   * "out of funds" only for a key we have actually measured as empty. It cannot reach that branch
+   * now, which is correct — we have not measured anything.
+   */
+  function readBalance() {
+    if (!wallet || balance !== null) return
+    diag.step(
+      'delegate',
+      'skip',
+      `${wallet.address} derived. Its balance is unknown — reading it needed the public RPC that ` +
+        'was removed, and the key cannot sign or be funded yet, so a posting key does not shorten ' +
+        'any prompt today.',
+    )
   }
 
   return {
@@ -296,22 +367,16 @@ export function createDelegate({ diagnostics: diag, provider, deriveOverride }: 
       return () => listeners.delete(listener)
     },
 
-    signer() {
-      if (!wallet) return null
-      const rpc = provider()
-      return rpc ? wallet.connect(rpc) : wallet
-    },
-
     async refresh() {
       await ensureWallet()
-      await readBalance()
+      readBalance()
       publish()
       return state()
     },
 
     async authorize({ authorizeOnChain, topUp, maxSeconds: contractMax, force = false }) {
       if (!(await ensureWallet())) return state()
-      await readBalance()
+      readBalance()
 
       if (typeof contractMax === 'number' && contractMax > 0) maxSeconds = contractMax
 
@@ -341,7 +406,12 @@ export function createDelegate({ diagnostics: diag, provider, deriveOverride }: 
             balance = (balance ?? 0n) + amount
           }
         }
-        diag.step('delegate', 'ok', `${wallet!.address} authorised — announcing now costs no prompt`)
+        diag.step(
+          'delegate',
+          'ok',
+          `${wallet!.address} authorised on chain. ⚠️ Posts still prompt: nothing in the app signs ` +
+            'with this key yet — see the header of delegate.ts.',
+        )
       } catch (error) {
         diag.step(
           'delegate',
@@ -349,7 +419,7 @@ export function createDelegate({ diagnostics: diag, provider, deriveOverride }: 
           `the authorisation did not go through (${describe(error)}) — posting still works, with a prompt each time`,
         )
       }
-      await readBalance()
+      readBalance()
       publish()
       return state()
     },

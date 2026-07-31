@@ -1,5 +1,51 @@
 # Gotchas — addresses, constants and hard-won facts
 
+## ⛔⛔ THE SDK PATH IS THE ONLY PATH. DO NOT BUILD ALTERNATIVES.
+
+**This is the governing rule of this repo and it outranks every convenience below.** Stated by the
+user, 2026-07-31, verbatim:
+
+> *"The SDK path is the only path to read data from the bulletin chain. You don't create alternative
+> paths like you did. We removed the alternative paths."*
+
+If the platform provides a capability, Plaza uses **that**, and nothing else. No second
+implementation, no HTTP substitute, no "fallback in case the SDK is unavailable". **An unavailable
+SDK capability is an error to surface, not a branch to route around.**
+
+⚠️ **The tell that you are about to break this rule is the word "fallback".** It always sounds like
+robustness. It is not: every alternative path is a second thing to keep correct, a second thing that
+can silently serve stale or wrong data, and — inside the host container — usually **an external
+origin the user gets prompted to approve.**
+
+**How this was learned, twice, both times by shipping the mistake:**
+
+- **[V] 2026-07-31 — IPFS gateways.** Every post body, profile and reply was fetched over public IPFS
+  gateways (`lib/gateways.ts`, `GATEWAYS[0]` = `devnet-ipfs.api.polkadotcommunity.foundation`). On a
+  real phone the host correctly prompted the user to approve that external origin. Meanwhile
+  `@parity/product-sdk-cloud-storage`'s `CloudStorageClient` has **`fetchBytes`** and **`fetchJson`**,
+  which retrieve through the **host preimage lookup subscription** — no HTTP, no prompt, and they
+  handle chunked DAG-PB manifest CIDs. We were already using the same client's `store()` for writes
+  and had simply never used its read side. The gateway machinery was **deleted**, not demoted.
+- **[V] 2026-07-31 — the fallback I then proposed.** Told to fix the above, the first design was
+  "prefer the SDK, fall back to gateways". That is the same bug wearing a hat: it keeps the prompt as
+  the normal case whenever the SDK client does not open, and it rebuilds precisely what the migration
+  had removed. It was caught by the user, not by review.
+
+⚠️ **The bad inference that produced it, so nobody repeats it:** STATUS.md says *"Anonymous reading,
+everywhere, needing nothing"*, which reads like a promise of an out-of-host HTTP route. **It is not.**
+Anonymous reading happens **inside the host** — root `CLAUDE.md` is explicit that the host container
+is the only surface, and that the MetaMask path and the standalone wallet were both *deleted* rather
+than kept as options. "Needing nothing" means needing no wallet and no sign-in, not needing no host.
+
+**For local development the seam is the fake backend** (`?backend=fake`), never a resurrected HTTP
+path. If the fake lacks something, extend `lib/host/fake.ts`.
+
+⚠️ **This rule is not self-enforcing and the codebase has more of these.** An audit is under way
+covering, at least: contract **reads** going through `ethers` against a public RPC while writes go
+through the SDK; the Bulletin chain fallback in `session.ts`; the two write signing arms; and stubs
+that return plausible values without doing the work (`authorizeDelegate`). Before adding any path,
+ask what SDK method you are declining to use, and write the answer down.
+
 ## Working in this repo with several agents at once
 
 ⛔ **NEVER run `git stash`, `git checkout --`, `git restore`, `git reset` or `git clean`.** On
