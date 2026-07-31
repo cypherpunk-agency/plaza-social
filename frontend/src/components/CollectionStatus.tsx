@@ -3,6 +3,7 @@
 
 import type { ReactNode } from 'react';
 
+import { BootConsole } from './BootConsole';
 import type { CollectionState } from './collectionState';
 
 export interface CollectionStatusProps {
@@ -23,8 +24,10 @@ export interface CollectionStatusProps {
   connecting?: ReactNode;
 }
 
-const CONNECTING_HINT =
-  'Waiting for the Polkadot host to open a chain connection. Nothing has been read yet.';
+// ⚠️ `CONNECTING_HINT` — *"Waiting for the Polkadot host to open a chain connection. Nothing has
+// been read yet."* — was removed here, not lost. `BootConsole` opens with the same claim
+// ("waiting on the host handshake — no step has reported yet") and then keeps going with what the
+// session actually recorded, so keeping the static sentence above it would say it twice.
 
 /**
  * The rendering half. Returns `null` for `ready`, so a call site is one element rather than a
@@ -71,11 +74,25 @@ export function CollectionStatus({
       <div className="text-primary-500">
         {state === 'connecting' ? 'CONNECTING...' : `LOADING${noun ? ` ${noun}` : ''}...`}
       </div>
-      {state === 'connecting' && (
-        <div className="text-primary-700 text-xs mt-1 max-w-[60ch] mx-auto">
-          {connecting ?? CONNECTING_HINT}
-        </div>
-      )}
+      {/*
+        ⭐ THE BOOT CONSOLE BELONGS TO `connecting` AND TO NOTHING ELSE.
+        `loading` means a cold read is in flight against a real reader, and `ready` means there are
+        rows on screen — replacing either with a log would be exactly the content-eating that
+        `collectionState.ts` exists to prevent. `isRefreshing` is not an input here and never
+        reaches this file at all.
+
+        A caller that passes `connecting` has something more specific to say, so its sentence wins
+        and the log stays out of its way. Nobody passes it today; the branch is kept because the
+        prop is part of this component's contract.
+      */}
+      {state === 'connecting' &&
+        (connecting ? (
+          <div className="text-primary-700 text-xs mt-1 max-w-[60ch] mx-auto">{connecting}</div>
+        ) : (
+          // Muted, non-interactive, and it terminates: see `BootConsole.tsx`. It replaces
+          // CONNECTING_HINT, whose one sentence it says in the first line and then keeps going.
+          <BootConsole />
+        ))}
     </div>
   );
 }

@@ -10,6 +10,7 @@
 // this app can talk to at all. A button that cannot work is worse than a sentence that explains.
 
 import { FAKE_SCENARIOS, type Capabilities, type DiagnosticStep } from '../lib/host'
+import { BootConsole } from './BootConsole'
 
 interface HostNoticeProps {
   isOpen: boolean
@@ -22,19 +23,9 @@ interface HostNoticeProps {
   showScenarios?: boolean
 }
 
-const STATUS_COLOR: Record<DiagnosticStep['status'], string> = {
-  ok: 'text-accent-400',
-  running: 'text-yellow-500',
-  skip: 'text-primary-600',
-  fail: 'text-red-400',
-}
-
-const STATUS_MARK: Record<DiagnosticStep['status'], string> = {
-  ok: 'ok',
-  running: '..',
-  skip: '--',
-  fail: 'XX',
-}
+// ⚠️ The status colour/mark tables and the row markup moved to `BootConsole.tsx`. This was the THIRD
+// verbatim copy of them (here, `SettingsView`, and the connecting screen), and the copy on the
+// connecting screen is the one nobody can open a console against.
 
 export function HostNotice({
   isOpen,
@@ -96,18 +87,10 @@ export function HostNotice({
           <summary className="text-xs text-accent-400 hover:text-accent-300 transition-colors cursor-pointer">DIAGNOSTICS</summary>
           {/* The only debugger available on a phone. Rendered raw, in execution order, with the
               detail text unabridged — a summarised failure is a failure nobody can act on. */}
-          <div className="mt-2 border border-primary-800 p-3 space-y-1">
-            {diagnostics.length === 0 ? (
-              <p className="text-xs text-primary-700">nothing recorded yet</p>
-            ) : (
-              diagnostics.map((step) => (
-                <div key={step.id} className="text-[11px] leading-snug">
-                  <span className={STATUS_COLOR[step.status]}>[{STATUS_MARK[step.status]}]</span>{' '}
-                  <span className="text-primary-400">{step.label}</span>
-                  {step.detail && <div className="pl-8 text-primary-700 break-words">{step.detail}</div>}
-                </div>
-              ))
-            )}
+          <div className="mt-2 border border-primary-800 p-3">
+            {/* Steps passed as a PROP: this modal already receives the array and must not acquire a
+                dependency on `DiagnosticsProvider` being above it. */}
+            <BootConsole steps={diagnostics} variant="panel" />
           </div>
         </details>
 

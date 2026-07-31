@@ -104,6 +104,38 @@ export function createDiagnostics(): Diagnostics {
   }
 }
 
+/**
+ * ⭐ THE ONE RECORD THE REAL SESSION WRITES INTO, CREATED AT MODULE LOAD.
+ *
+ * ⚠️ IT EXISTS SO THE BOOT CONSOLE CAN STREAM FROM t=0, AND THAT IS THE WHOLE REASON.
+ *
+ * `openHostSession` used to call `createDiagnostics()` inside itself, and `useHostSession` can only
+ * subscribe after `openBackend(...)` RESOLVES — so every handshake step (container, sdk, connect,
+ * account, permChain, bulletin, chain) was already in the PAST before React could read one.
+ * `BootConsole` could therefore show nothing but its own clock for the whole connecting window,
+ * which is precisely the window it was built to explain. Its header says the fix is "one line in
+ * `lib/host/`": have the session publish its `Diagnostics` object synchronously. This is that line.
+ *
+ * ⭐ NO SHAPE CHANGE WAS NEEDED. `DiagnosticStep` and `Diagnostics` are untouched — `subscribe()`
+ * already replays the current list to a new listener, so a subscriber that arrives late still sees
+ * everything, and one that arrives at t=0 sees each step as it lands. The only thing that was wrong
+ * was WHEN the object came into existence.
+ *
+ * ⚠️ A MODULE SINGLETON IS THE HONEST SHAPE HERE, not a shortcut: `useHostSession` opens exactly one
+ * backend per page (its own header explains why a second one would double every permission round
+ * trip), so there is exactly one session to record. `openHostSession` calls `reset()` on entry, so a
+ * re-open starts clean.
+ *
+ * ⚠️ IN REACT STRICT MODE (dev only) the mount effect runs twice, so two overlapping sessions write
+ * into this one record and the second `reset()` clears the first's lines. The step ids are identical,
+ * so the visible result is the later session's record — which is also the one that survives. Do not
+ * "fix" this by going back to a per-session object; that reintroduces the t=0 gap.
+ *
+ * ⛔ THE FAKE BACKEND DOES NOT USE THIS. `fake.ts` still makes its own record, so `useHostSession`
+ * checks identity and swaps its subscription when the opened backend brought a different one.
+ */
+export const sessionDiagnostics: Diagnostics = createDiagnostics()
+
 /** A no-op record, so a caller that reports nothing needs no null checks at every call site. */
 export const nullDiagnostics: Diagnostics = {
   step: () => {},

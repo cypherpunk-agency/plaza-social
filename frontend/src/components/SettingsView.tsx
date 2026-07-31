@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import toast from 'react-hot-toast';
 import { formatBalance, getFuelEmoji } from '../utils/formatters';
 import { AddressDisplay } from './UserAddress';
+import { BootConsole } from './BootConsole';
+import { IdentityDebugPanel } from './IdentityDebugPanel';
 import type { Profile } from '../types/contracts';
 import { FAKE_SCENARIOS, type Capabilities, type DelegationState, type DiagnosticStep } from '../lib/host';
 // Deeper than `lib/host` on purpose, and the only such import above that directory: `asWriteFailure`
@@ -71,20 +73,11 @@ interface SettingsViewProps {
   onRequestAllowanceAgain: () => Promise<unknown>;
 }
 
-const STATUS_COLOR: Record<DiagnosticStep['status'], string> = {
-  ok: 'text-accent-400',
-  running: 'text-yellow-500',
-  skip: 'text-primary-600',
-  fail: 'text-red-400',
-};
-
-const STATUS_MARK: Record<DiagnosticStep['status'], string> = {
-  ok: 'ok',
-  running: '..',
-  skip: '--',
-  fail: 'XX',
-};
-
+// ⚠️ `STATUS_COLOR` / `STATUS_MARK` and the row markup they fed moved to `BootConsole.tsx`, which
+// renders the same record on the connecting screen. Two copies of "turn a `DiagnosticStep` into a
+// line" would drift, and the one on the boot screen is the one nobody can inspect. The Settings
+// treatment is preserved exactly — `variant="panel"` IS that treatment; only the boot screen is
+// muted, because only the boot screen is decoration.
 export function SettingsView({
   capabilities,
   label,
@@ -625,22 +618,22 @@ export function SettingsView({
               is rendered unabridged rather than summarised. */}
           <div>
             <h3 className="text-sm font-bold text-accent-400 font-mono mb-3">DIAGNOSTICS</h3>
-            <div className="border border-primary-700 p-4 space-y-1 font-mono">
-              {diagnostics.length === 0 ? (
-                <p className="text-xs text-primary-700">nothing recorded yet</p>
-              ) : (
-                diagnostics.map((step) => (
-                  <div key={step.id} className="text-[11px] leading-snug">
-                    <span className={STATUS_COLOR[step.status]}>[{STATUS_MARK[step.status]}]</span>{' '}
-                    <span className="text-primary-400">{step.label}</span>
-                    {step.detail && (
-                      <div className="pl-8 text-primary-700 break-words">{step.detail}</div>
-                    )}
-                  </div>
-                ))
-              )}
+            <div className="border border-primary-700 p-4">
+              {/* Steps passed as a PROP, not read from `DiagnosticsProvider`: this screen already
+                  receives the array and must not acquire a dependency on a context above it. */}
+              <BootConsole steps={diagnostics} variant="panel" />
             </div>
           </div>
+
+          {/* DEBUG / IDENTITY — sits directly under DIAGNOSTICS because it answers the next question
+              that panel raises: not "which step refused" but "which account did this device get, and
+              what did it get it FOR". It performs no host call of its own; `session.ts` fills the
+              record during the handshake and this renders it. See `IdentityDebugPanel.tsx`. */}
+          <IdentityDebugPanel
+            backendLabel={label}
+            capabilities={capabilities}
+            diagnostics={diagnostics}
+          />
 
           {/* FAKE BACKEND — deliberately reachable from the deployed bundle too, not just in dev.
               Bulletin publishing is rate-limited to 1/day on Lite personhood, so "rebuild and

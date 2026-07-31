@@ -25,6 +25,11 @@ import {
   type HostBackend,
   type SignerSeam,
 } from '../lib/host'
+// Deeper than the barrel, deliberately and narrowly: `sessionDiagnostics` is the record the REAL
+// session writes into, and subscribing to it before `openBackend` resolves is the entire fix for the
+// boot console's blind spot. `lib/host/index.ts` is owned elsewhere and exports `createDiagnostics`
+// but not this; move the export up when that file next changes. It pulls in no `@parity/*`.
+import { sessionDiagnostics } from '../lib/host/diagnostics'
 
 export interface HostSession {
   /** Still opening. Reads may already work; writes definitely do not yet. */
@@ -92,6 +97,20 @@ export function useHostSession(appName: string): HostSession {
     let cancelled = false
     const unsubscribers: Array<() => void> = []
 
+    /**
+     * ⭐ SUBSCRIBED BEFORE `openBackend` IS EVEN CALLED, AND THAT ORDERING IS THE POINT.
+     *
+     * The old code subscribed inside `.then(...)`, so nothing could be read until the whole host
+     * handshake had resolved — container, sdk, connect, account, permChain, bulletin and chain were
+     * all in the past by then, and `BootConsole` had nothing but its own clock to show during
+     * exactly the window it exists to explain. `sessionDiagnostics` is created at module load, so
+     * this subscription is live at t=0 and every step lands in React state as it happens.
+     *
+     * ⚠️ `subscribe()` replays the current list immediately, so this is also the priming read — no
+     * separate `list()` call is needed, and a late subscriber still sees everything.
+     */
+    let offShared: (() => void) | null = sessionDiagnostics.subscribe(setDiagnostics)
+
     // `openBackend` never throws — it returns a read-only backend with a `reason` instead. The catch
     // is here only for the impossible case, and it still has to leave the app usable.
     openBackend({ appName: appNameRef.current })
@@ -104,7 +123,6 @@ export function useHostSession(appName: string): HostSession {
         setBackend(opened)
         setCapabilities(opened.capabilities())
         setDelegation(opened.delegation())
-        setDiagnostics(opened.diagnostics.list())
         setIsInitializing(false)
 
         unsubscribers.push(
@@ -116,8 +134,21 @@ export function useHostSession(appName: string): HostSession {
             setDelegation(next)
             setSeamVersion((v) => v + 1)
           }),
-          opened.diagnostics.subscribe(setDiagnostics),
         )
+
+        /**
+         * ⚠️ IDENTITY CHECK, NOT AN UNCONDITIONAL RESUBSCRIBE. The real session writes into
+         * `sessionDiagnostics`, so for it we are already subscribed and a second subscription would
+         * just call the same setter twice per step. The FAKE backend still builds its own record
+         * (`fake.ts` is not ours to change), so that case swaps: drop the shared subscription — which
+         * would otherwise keep overwriting state with the real session's empty record — and follow
+         * the backend's own.
+         */
+        if (opened.diagnostics !== sessionDiagnostics) {
+          offShared?.()
+          offShared = null
+          unsubscribers.push(opened.diagnostics.subscribe(setDiagnostics))
+        }
       })
       .catch(() => {
         if (!cancelled) setIsInitializing(false)
@@ -125,6 +156,8 @@ export function useHostSession(appName: string): HostSession {
 
     return () => {
       cancelled = true
+      offShared?.()
+      offShared = null
       for (const off of unsubscribers) off()
       backendRef.current?.destroy()
       backendRef.current = null

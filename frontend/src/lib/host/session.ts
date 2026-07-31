@@ -34,8 +34,15 @@ import { createCapabilityStore, READ_ONLY } from './capabilities'
 import { insideContainer, productIdentifier } from './container'
 import { assetHub, createHostContractWriter, createSdkChainReader } from './contracts'
 import { createDelegate } from './delegate'
-import { createDiagnostics } from './diagnostics'
+import { sessionDiagnostics } from './diagnostics'
 import { classifyWriteFailure, isAllowanceFailure } from './errors'
+import {
+  emptySnapshot,
+  productIdentifierFromDappName,
+  setHostIdentity,
+  type HostIdentitySnapshot,
+  type SnapshotAccount,
+} from './identity'
 import { setBulletinSource } from '../bulletin'
 import { destinationFromPublicKey, normaliseH160 } from '../recipient'
 import { loadAddress, loadCloudStorage, loadHost, loadStatementStore, loadTx, loadWallet, sdkAvailable } from './sdk'
@@ -64,6 +71,40 @@ export interface HostSessionOptions {
 }
 
 /**
+ * Flatten one `SignerAccount` into the plain record the identity panel renders.
+ *
+ * ⚠️ EVERY FIELD IS NULLABLE AND NOTHING IS SUBSTITUTED. A missing `name` must arrive as `null` so
+ * the panel can say "the SDK asked and got nothing back" — rendering an empty string, or falling
+ * back to the address, would erase the one field the whole investigation turns on.
+ *
+ * ⛔ NO DERIVATION HAPPENS HERE. `h160Address` is copied from what the signer handed over; it is
+ * never computed from `address`, and `address` is never computed from `h160Address`.
+ */
+function toSnapshotAccount(raw: unknown): SnapshotAccount {
+  const a = (raw ?? {}) as {
+    address?: unknown
+    h160Address?: unknown
+    publicKey?: unknown
+    name?: unknown
+    source?: unknown
+  }
+  const text = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : null)
+  // `publicKey` is a `Uint8Array` on the wire. Hex here rather than in the panel, so the panel stays
+  // a pure renderer and the bytes are never re-encoded twice differently.
+  const publicKeyHex =
+    a.publicKey instanceof Uint8Array && a.publicKey.length > 0
+      ? '0x' + Array.from(a.publicKey, (b) => b.toString(16).padStart(2, '0')).join('')
+      : null
+  return {
+    address: text(a.address),
+    h160Address: text(a.h160Address),
+    publicKeyHex,
+    name: text(a.name),
+    source: text(a.source),
+  }
+}
+
+/**
  * Open a session against the real host container.
  *
  * ⚠️ IT NEVER THROWS AND IT NEVER RETURNS `null`. A failed wallet is a CAPABILITY, not an exception:
@@ -72,8 +113,35 @@ export interface HostSessionOptions {
  * `capabilities().reason`.
  */
 export async function openHostSession(options: HostSessionOptions): Promise<HostBackend> {
-  const diag = createDiagnostics()
+  /**
+   * ⭐ THE SHARED RECORD, NOT A FRESH ONE — and this single line is what lets `BootConsole` stream
+   * from t=0. `createDiagnostics()` here meant the object did not exist until this async function
+   * had already run, so React could not subscribe until after the handshake was over. See
+   * `diagnostics.ts` `sessionDiagnostics`. `reset()` so a re-open starts from an empty record.
+   */
+  const diag = sessionDiagnostics
+  diag.reset()
   const capabilities = createCapabilityStore(READ_ONLY)
+
+  /**
+   * The identity record, published EARLY and republished as facts land.
+   *
+   * ⚠️ PUBLISHED BEFORE THE HANDSHAKE ON PURPOSE. A session that never gets an account is exactly
+   * the session somebody is debugging, and "what did we ask for" is answerable without a host. See
+   * `identity.ts` — nothing in it ever calls the host; every value is a by-product of work this
+   * function performs anyway.
+   */
+  const identity: HostIdentitySnapshot = {
+    ...emptySnapshot(),
+    at: Date.now(),
+    dappName: options.appName,
+    productIdentifierRequested: productIdentifierFromDappName(options.appName),
+    derivationIndex: 0,
+    chainEnvironment: options.bulletinNetwork === 'paseo' ? 'paseo' : 'devnet',
+    bulletinNetworkPreferred: options.bulletinNetwork ?? 'devnet',
+  }
+  const publishIdentity = () => setHostIdentity({ ...identity, at: Date.now() })
+  publishIdentity()
 
   /* -- chain reads --------------------------------------------------------- */
   //
@@ -100,11 +168,33 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
   // Typed loosely on purpose: the SDK bindings are `any` until the `@parity/*` packages are
   // installed (see `sdk.ts`), so a precise interface here would be fiction. What matters is that
   // every VALUE crossing out of these objects is unwrapped through a typed helper.
-  type Connected = ParityResult<Array<{ address: string; h160Address?: string }>>
+  //
+  // ⚠️ THE EXTRA FIELDS ARE NOT DECORATION. `publicKey`, `name` and `source` are real members of
+  // `SignerAccount` (`@parity/product-sdk-signer`) that this file used to throw away. `name` in
+  // particular is the user's `primaryUsername`: the SDK fetches it with `account.getUserId()` DURING
+  // `connect()` (`fetchProductSignerAccount`, `requestName = true` on the `dappName` path), so it is
+  // already paid for. Re-fetching it later would prompt — the SDK's own comment says `getUserId`
+  // "triggers a host identity-permission prompt" — and it is the one field gotchas.md asks us to
+  // compare across devices. Reading it here costs nothing and prompts nobody.
+  type RawAccount = {
+    address?: unknown
+    h160Address?: unknown
+    publicKey?: unknown
+    name?: unknown
+    source?: unknown
+  }
+  type Connected = ParityResult<Array<{ address: string; h160Address?: string } & RawAccount>>
+  type SignerStateLike = {
+    status?: unknown
+    accounts?: readonly RawAccount[]
+    selectedAccount?: unknown
+    activeProvider?: unknown
+    error?: unknown
+  }
   let manager: {
     connect?: () => PromiseLike<Connected>
     selectAccount?: (a: string) => void
-    getState?: () => { selectedAccount?: unknown }
+    getState?: () => SignerStateLike
     getSigner?: () => unknown
     destroy?: () => void
   } | null = null
@@ -143,6 +233,9 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
         : 'the Products SDK is not installed in this build',
   )
   diag.step('sdk', hasSdk ? 'ok' : 'skip', hasSdk ? productIdentifier() : 'not installed')
+  identity.sdkInstalled = hasSdk
+  identity.insideContainer = inside
+  publishIdentity()
 
   if (!inside) {
     /**
@@ -223,6 +316,8 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
       `${chainReader.label} — reads dry-run through the host with product-sdk-contracts .query(), ` +
         'no external RPC and therefore no permission prompt. The connection opens on the first read.',
     )
+    identity.chainReaderLabel = chainReader.label
+    publishIdentity()
   }
 
   /* -- bulletin READS, before the wallet and unconditionally ---------------- */
@@ -286,8 +381,34 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
       'ok',
       account.h160Address ? `${account.address} · ${account.h160Address}` : account.address,
     )
+
+    /**
+     * ⭐ THE IDENTITY RECORD, FILLED FROM WHAT WE ALREADY HAVE. No extra host call is made here and
+     * none may be added: `getUserId`, `getLegacyAccounts` and `createRingVRFProof` all cost a round
+     * trip and can prompt, and the panel that reads this record is read-only by contract.
+     *
+     * ⚠️ THE WHOLE ACCOUNT LIST, not just the selected one. `connect()` normally returns exactly one
+     * product account, so a second entry would be a finding in itself — and the code above silently
+     * picks `accounts[0]` when the host expresses no preference, which is only safe to reason about
+     * if the alternatives are visible.
+     */
+    const state = manager!.getState?.()
+    const listed = state?.accounts && state.accounts.length > 0 ? state.accounts : accounts
+    identity.connect = 'ok'
+    identity.connectError = null
+    identity.accounts = listed.map(toSnapshotAccount)
+    identity.selected = toSnapshotAccount(state?.selectedAccount ?? selected)
+    identity.signerStatus = typeof state?.status === 'string' ? state.status : null
+    identity.activeProvider = typeof state?.activeProvider === 'string' ? state.activeProvider : null
+    // `describe()` walks the cause chain; `null` when the signer reported no error at all, which the
+    // panel renders as "none" rather than blank.
+    identity.signerError = state?.error ? describe(state.error) : null
+    publishIdentity()
   } catch (error) {
     diag.step('connect', 'fail', describe(error))
+    identity.connect = 'failed'
+    identity.connectError = describe(error)
+    publishIdentity()
     try {
       manager?.destroy?.()
     } catch {

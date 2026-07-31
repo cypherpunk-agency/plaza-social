@@ -4,6 +4,7 @@ import { useUserRegistry } from './hooks/useUserRegistry';
 import { useHostSession } from './hooks/useHostSession';
 import { PublisherProvider } from './hooks/usePublisher';
 import { PaymentsProvider } from './hooks/usePayments';
+import { DiagnosticsProvider } from './hooks/useDiagnostics';
 import { useDeployments } from './hooks/useDeployments';
 import { useFollowRegistry } from './hooks/useFollowRegistry';
 import { SessionStatus } from './components/SessionStatus';
@@ -679,6 +680,14 @@ function App() {
       this session cannot pay — the honest state, not an error. See `hooks/usePayments.tsx`.
     */}
     <PaymentsProvider payments={host.backend?.payments ?? null}>
+    {/*
+      The session diagnostics record, provided once for the same reason the two seams above it are:
+      its consumer is `CollectionStatus`, a leaf that six views render and that takes no session
+      props at all. This adds NO state and NO second telemetry mechanism — it republishes the exact
+      array `useHostSession` already keeps and already hands to `SettingsView` and `HostNotice`.
+      See `hooks/useDiagnostics.tsx`.
+    */}
+    <DiagnosticsProvider steps={host.diagnostics}>
     <div className="h-screen bg-black flex flex-col scanline">
       <Toaster
         position="top-right"
@@ -1025,6 +1034,7 @@ function App() {
       )}
 
       </div>
+    </DiagnosticsProvider>
     </PaymentsProvider>
     </PublisherProvider>
   );
