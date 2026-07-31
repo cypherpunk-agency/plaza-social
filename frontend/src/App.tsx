@@ -441,15 +441,46 @@ function App() {
   // Profile creation now happens where the user initiated something — `handleSendMessage` below, and
   // the settings screen.
 
-  // Get display name helper - depends only on getProfile to avoid frequent recreation
+  /**
+   * ⭐ THE DISPLAY-NAME HELPER. BATCHED AND CACHED UNDERNEATH, AND ITS IDENTITY NEVER CHANGES.
+   *
+   * ⚠️ THE STABILITY IS THE LOAD-BEARING PART, not the caching. This function is handed to
+   * `useForumThread`, `useUserPosts`, `useReplies` and `Sidebar`; inside those hooks it is a
+   * dependency of the loader, and the loader used to be a dependency of the 30-second poll's
+   * effect. An unstable `getDisplayName` therefore tore the interval down and restarted it on every
+   * render — so the 30 seconds never elapsed and **the poll silently never fired**. Those hooks now
+   * hold the loader in a ref for exactly that reason, and this `useCallback([])` is the other half:
+   * belt and braces, because the failure is invisible (nothing errors, the list simply stops
+   * updating).
+   *
+   * ⛔ DO NOT ADD A DEPENDENCY HERE. `userRegistry.getProfile` changes identity whenever the
+   * registry address or the reader does, which is precisely the event that used to restart every
+   * poll. It is read through a latch instead — see below.
+   *
+   * ⚠️ THE BATCHING IS NOT HERE, IT IS IN `useUserRegistry`. `getProfile` is now a batched,
+   * 60-second-cached read over `UserRegistry.getProfiles(address[])`, so the fifty calls this
+   * function makes while the board renders collapse into ONE `getProfiles`, and the next poll
+   * usually makes none at all. Everything else that reads a profile — the hover tooltip, the
+   * profile modal, the sidebar's follow list — shares that cache without knowing it exists.
+   */
+  const getProfileLatch = useRef(userRegistry.getProfile);
+  // ⚠️ ASSIGNED DURING RENDER, NOT IN AN EFFECT, AND THAT IS NOT AN OVERSIGHT. React runs CHILD
+  // effects before parent effects, so a child that asks for a display name in its own mount effect
+  // would read a latch this component had not updated yet — i.e. the previous reader, right after
+  // the reader changed. A plain latest-value latch has no ordering to get wrong.
+  getProfileLatch.current = userRegistry.getProfile;
+
   const getDisplayName = useCallback(async (address: string): Promise<string> => {
     try {
-      const profile = await userRegistry.getProfile(address);
+      const profile = await getProfileLatch.current(address);
+      // ⚠️ '' MEANS "NO NAME TO SHOW", and it has to stay distinguishable from a name. A profile
+      // that does not exist has an empty `displayName` anyway; a read that FAILED also lands here,
+      // and the callers render the address instead of inventing one.
       return profile.exists ? profile.displayName : '';
     } catch {
       return '';
     }
-  }, [userRegistry.getProfile]);
+  }, []);
 
   // Update URL and page title when navigation state changes
   useEffect(() => {

@@ -261,12 +261,36 @@ export function Sidebar({
                 &#9654;
               </span>
               <span className="font-bold">Following</span>
-              <span className="text-primary-700 text-xs ml-auto">{followingWithNames.length}</span>
+              {/* ⛔ NO `0` WHILE THERE IS NO ACCOUNT. A count is a claim, and until the session
+                  resolves a product account there is no follow graph to have counted. */}
+              {isConnected && (
+                <span className="text-primary-700 text-xs ml-auto">{followingWithNames.length}</span>
+              )}
             </button>
 
             {sidebarExpanded.following && (
               <div className="pl-4">
-                {loadingFollowingNames ? (
+                {/*
+                  ⭐ THREE STATES, THE SAME RULE THE LISTS FOLLOW (`collectionState.ts`): never say
+                  a collection is empty before it has been read.
+
+                  ⚠️ THE SIGNAL HERE IS `isConnected`, NOT A CHAIN READER, and that is a deliberate
+                  compromise. This component is not given `provider` and `App.tsx` belongs to
+                  another change, so the closest honest fact available is `!!host.address` — and it
+                  is the right shape anyway: `following` is *this account's* follow graph, so with
+                  no account there is nothing that could be empty.
+
+                  Rendering NOTHING rather than a placeholder is the point. "Not following anyone"
+                  is false during startup, and an anonymous reader has no follow list to be told
+                  about at all — so silence, rather than inventing sign-in copy for a surface that
+                  deliberately has no connect control (see `SessionStatus.tsx`).
+
+                  ⚠️ RESIDUAL, KNOWN: with an account present but the FollowRegistry read still in
+                  flight, `following` is `[]` and this still says "Not following anyone". Closing
+                  that needs a loading flag out of `useFollowRegistry` through `App.tsx`, neither of
+                  which this change owns.
+                */}
+                {!isConnected ? null : loadingFollowingNames ? (
                   <div className="px-4 py-2 text-primary-600 font-mono text-sm">
                     Loading...
                   </div>

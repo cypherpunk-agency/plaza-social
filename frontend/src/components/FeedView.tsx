@@ -1,6 +1,8 @@
 import { useFeed } from '../hooks/useFeed';
 import { PostCard } from './PostCard';
 import { useVoting } from '../hooks/useVoting';
+import { CollectionStatus } from './CollectionStatus';
+import { useCollectionState } from './collectionState';
 import type { Provider, Signer } from '../utils/contracts';
 
 interface FeedViewProps {
@@ -49,6 +51,36 @@ export function FeedView({
     userAddress: currentAddress,
   });
 
+  /**
+   * ⭐ THE THREE-WAY RULE — see `collectionState.ts`. TWO claims on this screen were made before
+   * anything had been read:
+   *
+   *  1. `following.length === 0` → "YOUR FEED IS EMPTY. Follow some users…". The follow graph is
+   *     read through the same session; until there is a chain reader it is `[]` for everybody, so
+   *     this told people with a full feed to go and find someone to follow.
+   *  2. `posts.length === 0` → "No posts from users you follow yet."
+   *
+   * `sessionReady` is the shared precondition; the posts decision additionally needs a non-empty
+   * follow set, because `useFeed`'s cold effect refuses to run without one and therefore never
+   * raises `isLoading`.
+   */
+  const sessionReady = !!provider && !!userPostsAddress;
+  const postsState = useCollectionState({
+    ready: sessionReady && following.length > 0,
+    isLoading,
+    count: posts.length,
+    error,
+    subject: userPostsAddress,
+  });
+
+  if (!sessionReady) {
+    return (
+      <div className="flex flex-col h-full">
+        <CollectionStatus state="connecting" layout="fill" />
+      </div>
+    );
+  }
+
   if (following.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-center p-8">
@@ -60,14 +92,6 @@ export function FeedView({
           Follow some users to see their posts here. Click on a user in any
           channel to view their profile and follow them.
         </div>
-      </div>
-    );
-  }
-
-  if (isLoading && posts.length === 0) {
-    return (
-      <div className="flex items-center justify-center h-full">
-        <div className="text-primary-500 font-mono">LOADING FEED...</div>
       </div>
     );
   }
@@ -107,11 +131,13 @@ export function FeedView({
 
       {/* Posts */}
       <div className="flex-1 overflow-y-auto p-4">
-        {posts.length === 0 ? (
-          <div className="text-center text-primary-600 font-mono py-8">
-            No posts from users you follow yet.
-          </div>
-        ) : (
+        {/* ⛔ The empty line is reachable only after a completed read; `isRefreshing` is not read. */}
+        <CollectionStatus
+          state={postsState}
+          noun="FEED"
+          empty="No posts from users you follow yet."
+        />
+        {postsState === 'ready' && (
           <div className="space-y-4">
             {posts.map((post) => (
               /* ⚠️ CID, NOT `index` — see `types/contracts.ts`: `index` is a position in the loaded

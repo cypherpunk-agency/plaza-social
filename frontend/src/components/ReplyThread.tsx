@@ -3,6 +3,8 @@ import type { Profile } from '../types/contracts';
 import { useReplies } from '../hooks/useReplies';
 import { useVoting } from '../hooks/useVoting';
 import { ReplyItem } from './ReplyItem';
+import { CollectionStatus } from './CollectionStatus';
+import { useCollectionState } from './collectionState';
 import { entityIdOfCid } from '../lib/entity';
 import { reportError } from '../lib/reportError';
 import type { Provider, Signer } from '../utils/contracts';
@@ -71,6 +73,7 @@ export function ReplyThread({
     replies,
     replyCount,
     isLoading,
+    error,
     canReply,
     addReply,
     editReply,
@@ -99,6 +102,28 @@ export function ReplyThread({
     enabled: !disabled,
   });
 
+  /**
+   * ⭐ THE THREE-WAY RULE — see `collectionState.ts`. "No replies yet" used to be the `else` of
+   * `replies.length > 0`, so it rendered during host startup (no chain reader, `isLoading` never
+   * raised), on a post whose CID has not resolved (no reply registry to read), and after a failed
+   * read. All three are "we do not know", not "there are none".
+   *
+   * `ready` mirrors `useReplies`' cold effect: `repliesAddress && provider && registryId`, and
+   * `registryId` is `threadRegistryId(parentCid)`, which is null without a CID.
+   *
+   * ⛔ `disabled` is deliberately NOT part of this. It gates REPLYING, not reading — the hook loads
+   * regardless — so folding it in here would report a read-only session as a broken one.
+   */
+  const listState = useCollectionState({
+    ready: !!provider && !!repliesAddress && !!parentCid,
+    isLoading,
+    count: replies.length,
+    error,
+    subject: parentCid,
+  });
+  /** `(0)` on the ADD REPLY button is a claim as much as the empty line is. */
+  const countIsKnown = listState === 'ready' || listState === 'empty';
+
   const handleSubmitReply = async () => {
     if (!replyContent.trim() || isSubmitting) return;
 
@@ -118,14 +143,11 @@ export function ReplyThread({
     }
   };
 
-  if (isLoading && replies.length === 0) {
-    return (
-      <div className="py-4 font-mono text-xs text-primary-600">
-        Loading replies...
-      </div>
-    );
-  }
-
+  /*
+   * ⚠️ THERE IS NO LONGER AN EARLY RETURN FOR LOADING. It used to replace the whole section,
+   * composer included, so the reply box vanished and came back on every cold load. The status line
+   * now sits where the list goes and the composer stays mounted.
+   */
   return (
     <div className="mt-4 space-y-3">
       {/* Composer. ⚠️ Gated on `canReply` (i.e. on the PUBLISHER), never on `signer`: `signer` is the
@@ -144,7 +166,7 @@ export function ReplyThread({
               onClick={() => setIsComposing(true)}
               className="px-3 py-1 text-xs font-mono text-primary-400 border border-primary-500 hover:bg-primary-900 transition-colors"
             >
-              + ADD REPLY ({replyCount})
+              {countIsKnown ? `+ ADD REPLY (${replyCount})` : '+ ADD REPLY'}
             </button>
           ) : (
             <div className="border border-primary-700 p-3">
@@ -181,6 +203,21 @@ export function ReplyThread({
         </div>
       )}
 
+      {/* ⛔ A FAILED READ IS NOT AN EMPTY CONVERSATION. `useReplies` has always exposed `error` and
+          this component has never rendered it, so a failed walk read as "No replies yet". */}
+      {error && (
+        <div className="text-xs font-mono text-red-500 py-2">
+          Replies could not be loaded: {error}{' '}
+          <button
+            type="button"
+            onClick={() => void refresh()}
+            className="text-primary-600 hover:text-primary-400 transition-colors"
+          >
+            [RETRY]
+          </button>
+        </div>
+      )}
+
       {/* Replies, oldest first — a conversation, not a feed. */}
       {replies.length > 0 ? (
         <div className="space-y-2">
@@ -211,9 +248,13 @@ export function ReplyThread({
           ))}
         </div>
       ) : (
-        <div className="text-xs font-mono text-primary-700 py-2">
-          No replies yet
-        </div>
+        <CollectionStatus
+          state={listState}
+          noun="REPLIES"
+          empty="No replies yet"
+          layout="inline"
+          connecting="Connecting..."
+        />
       )}
 
       {/* Refresh button */}

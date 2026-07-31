@@ -5,6 +5,8 @@ import { useVoting } from '../hooks/useVoting';
 import { NewPostForm } from './NewPostForm';
 import { PostCard } from './PostCard';
 import { PostDetailView } from './PostDetailView';
+import { CollectionStatus } from './CollectionStatus';
+import { useCollectionState } from './collectionState';
 import type { Provider, Signer } from '../utils/contracts';
 import type { Profile } from '../types/contracts';
 
@@ -94,6 +96,25 @@ export function UserPostsFeed({
   const publisher = usePublisher();
   const canPost = isOwnProfile && !!publisher;
 
+  /**
+   * ⭐ THE THREE-WAY RULE — see `collectionState.ts`. `[NO POSTS YET]` used to hang off
+   * `!isLoading && posts.length === 0`, and `isLoading` is the COLD flag which `useUserPosts` never
+   * raises while `createReadContract` returns null. So during host startup this told a visitor that
+   * somebody's feed was empty, and told the owner to "create your first post" over posts they had
+   * already written.
+   *
+   * `ready` mirrors the hook's cold effect exactly: `userPostsAddress && provider && userAddress`.
+   */
+  const feedState = useCollectionState({
+    ready: !!provider && !!userPostsAddress && !!profileOwner,
+    isLoading,
+    count: posts.length,
+    error,
+    subject: profileOwner,
+  });
+  /** A count is a claim too: `Posts (0)` over a feed nobody has read yet is the same lie. */
+  const countIsKnown = feedState === 'ready' || feedState === 'empty';
+
   // Find selected post for detail view
   const selectedPost = useMemo(() => {
     if (selectedPostIndex == null) return null;
@@ -148,7 +169,7 @@ export function UserPostsFeed({
       {/* Header */}
       <div className="flex items-center justify-between">
         <h3 className="font-mono text-sm text-primary-500 uppercase tracking-wider">
-          Posts ({postCount})
+          {countIsKnown ? `Posts (${postCount})` : 'Posts'}
         </h3>
         {posts.length > 0 && (
           <button
@@ -169,14 +190,6 @@ export function UserPostsFeed({
         />
       )}
 
-      {/* Loading State */}
-      {isLoading && posts.length === 0 && (
-        <div className="py-8 text-center font-mono text-primary-600">
-          <div className="text-lg mb-2 terminal-cursor">...</div>
-          <div className="text-xs">LOADING POSTS...</div>
-        </div>
-      )}
-
       {/* Error State */}
       {error && (
         <div className="py-4 text-center font-mono text-red-500 text-sm">
@@ -184,18 +197,21 @@ export function UserPostsFeed({
         </div>
       )}
 
-      {/* Empty State */}
-      {!isLoading && !error && posts.length === 0 && (
-        <div className="py-8 text-center font-mono">
-          <div className="text-primary-600 text-sm mb-1">
-            [NO POSTS YET]
-          </div>
-          {isOwnProfile && (
-            <div className="text-primary-700 text-xs">
-              Create your first post above
-            </div>
-          )}
-        </div>
+      {/* Connecting / loading / empty — one control, one decision. ⛔ `[NO POSTS YET]` is now
+          reachable ONLY after a read completed; `isRefreshing` is not consulted at all. */}
+      {!error && (
+        <CollectionStatus
+          state={feedState}
+          noun="POSTS"
+          empty={
+            <>
+              <div className="text-sm mb-1">[NO POSTS YET]</div>
+              {isOwnProfile && (
+                <div className="text-primary-700 text-xs">Create your first post above</div>
+              )}
+            </>
+          }
+        />
       )}
 
       {/* Posts List */}

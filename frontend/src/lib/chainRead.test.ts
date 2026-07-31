@@ -185,6 +185,9 @@ test("createWriteContract always returns null — there is no ethers signing arm
 
 const READ_PATH_MODULES = [
   "utils/contracts.ts",
+  // The batching layer. It issues no call of its own — it is handed a `fetch` — but it now sits
+  // between every list hook and the reader, so it belongs under the same invariants.
+  "lib/batch.ts",
   "lib/host/session.ts",
   "lib/host/backend.ts",
   "lib/host/fake.ts",

@@ -6,6 +6,8 @@ import { ThreadCard } from './ThreadCard';
 import { ThreadComposer } from './ThreadComposer';
 import { ThreadDetailView } from './ThreadDetailView';
 import { PANE_HEADER } from './paneChrome';
+import { CollectionStatus } from './CollectionStatus';
+import { useCollectionState } from './collectionState';
 import type { Provider, Signer } from '../utils/contracts';
 import type { Profile } from '../types/contracts';
 import toast from 'react-hot-toast';
@@ -108,6 +110,18 @@ export function ForumView({
     enabled: true,
   });
 
+  /**
+   * ⭐ SESSION-NOT-READY IS A THIRD STATE. See `collectionState.ts` for the whole story; the short
+   * version is that `isLoading` is the COLD flag and `useForumThread`'s loader returns before
+   * raising it while there is no chain reader — so the old `threads.length === 0 && !isLoading`
+   * empty branch fired during startup and told the reader their forum was empty. Reported from a
+   * phone, where the startup window is seconds long.
+   *
+   * `ready` mirrors the hook's own guard exactly: `createReadContract` returns null without BOTH an
+   * address and a reader, and the cold effect keys on `forumThreadAddress && provider`.
+   */
+  const sessionReady = !!provider && !!forumThreadAddress;
+
   const {
     getVoteTally,
     getUserVote,
@@ -119,6 +133,14 @@ export function ForumView({
     provider,
     signer,
     userAddress: currentAddress,
+  });
+
+  const listState = useCollectionState({
+    ready: sessionReady,
+    isLoading,
+    count: threads.length,
+    error,
+    subject: forumThreadAddress,
   });
 
   /**
@@ -338,9 +360,12 @@ export function ForumView({
             <span className="text-primary-500 text-lg">[FORUM]</span>
           </div>
           <div className="flex gap-2">
+            {/* Disabled while the session is still coming up too: without a chain reader `refresh`
+                returns without reading anything, so an enabled button would be a control that
+                silently does nothing. */}
             <button
               onClick={refresh}
-              disabled={isLoading}
+              disabled={isLoading || !sessionReady}
               className="px-3 py-1 text-xs font-mono text-primary-500 border border-primary-600 hover:border-primary-400 disabled:opacity-50"
             >
               {isLoading ? 'LOADING...' : 'REFRESH'}
@@ -375,21 +400,20 @@ export function ForumView({
         </div>
       )}
 
-      {/* Loading State */}
-      {isLoading && threads.length === 0 && !error && (
-        <div className="flex items-center justify-center h-full">
-          <div className="text-primary-500 font-mono">LOADING THREADS...</div>
-        </div>
-      )}
-
-      {/* Threads List */}
+      {/* Threads List.
+          ⛔ THE EMPTY MESSAGE IS NOT REACHABLE FROM `threads.length === 0` ANY MORE, and that is the
+          whole point of this change. `CollectionStatus` renders CONNECTING while there is no chain
+          reader, LOADING THREADS while a cold read is in flight, and only says "no threads yet"
+          once a read has actually completed and come back with nothing. See `collectionState.ts`.
+          ⛔ Nothing here consults `isRefreshing`: the 30s poll must never replace the rows. */}
       {!error && (
         <div className="flex-1 overflow-y-auto p-4 min-w-0">
-          {threads.length === 0 && !isLoading ? (
-            <div className="text-center text-primary-600 font-mono py-8">
-              No threads yet. Be the first to start a discussion!
-            </div>
-          ) : (
+          <CollectionStatus
+            state={listState}
+            noun="THREADS"
+            empty="No threads yet. Be the first to start a discussion!"
+          />
+          {listState === 'ready' && (
             <div className="space-y-4 min-w-0">
               {threads.map((thread) => (
                 <ThreadCard

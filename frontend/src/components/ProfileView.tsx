@@ -4,6 +4,7 @@ import { AddressDisplay, CashBalance, ownCashBalanceState } from './UserAddress'
 import type { Profile, Link } from '../types/contracts';
 import { UserPostsFeed } from './UserPostsFeed';
 import { TipModal } from './TipModal';
+import { CollectionStatus } from './CollectionStatus';
 import { usePayments, useOwnCashBalance } from '../hooks/usePayments';
 import type { Provider, Signer } from '../utils/contracts';
 import toast from 'react-hot-toast';
@@ -292,6 +293,28 @@ export function ProfileView({
         <p className="text-primary-600 font-mono text-sm">
           SELECT A USER TO VIEW THEIR PROFILE
         </p>
+      </div>
+    );
+  }
+
+  /**
+   * ⭐ SESSION-NOT-READY, BEFORE BOTH `isLoading` AND `error` — the same third state the lists grew
+   * (see `collectionState.ts`), in the one shape it takes on a single-object read.
+   *
+   * `getProfile` comes from `useUserRegistry`, whose `getReadContract()` returns null without a
+   * chain reader; the callback then throws `"Contract not available"`, which landed in `error` and
+   * rendered as a red failure over a session that was merely still starting. Worse, `profile` stays
+   * null so the body's `!profile.exists` branch — "This user hasn't created a profile yet." — is one
+   * successful-looking read away from being a confident lie about somebody's account.
+   *
+   * ⛔ This is `provider`, the chain reader, NOT `canWrite`/`signer`: reading a profile anonymously
+   * is the intended experience and must not report itself as a deficiency.
+   */
+  if (!provider) {
+    // Same wrapper as the two early returns around it, so the pane geometry does not shift.
+    return (
+      <div className="flex-1 flex items-center justify-center">
+        <CollectionStatus state="connecting" />
       </div>
     );
   }

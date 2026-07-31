@@ -1,8 +1,9 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import type { VoteType, VoteTally } from "../types/contracts";
 import { VoteType as VoteTypeEnum } from "../types/contracts";
 import VotingABI from "../contracts/Voting.json";
 import { createReadContract, type Provider, type Signer } from "../utils/contracts";
+import { createBatchLoader, decodeTallies, decodeUserVotes, isBatchEntryMissing } from "../lib/batch";
 import { useHostWrite } from "./usePublisher";
 
 /**
@@ -18,6 +19,15 @@ import { useHostWrite } from "./usePublisher";
  * derivations are `pure` on the contract, so they are computed locally and cannot fail or cost a
  * round trip. Everything below takes an already-derived `bytes32`.
  */
+
+/**
+ * Entity ids per batched `Voting` read.
+ *
+ * A board page is 50 threads and a conversation is capped at 50 replies, so 50 covers the widest
+ * screen either produces in one call. A longer queue splits into several calls rather than being
+ * sent as one unbounded array.
+ */
+const VOTE_BATCH_MAX = 50;
 
 /**
  * ⭐ VOTES ARE HOST-SIGNED NOW, 2026-07-31. ONE PROMPT PER VOTE, AND THAT IS THE HONEST STATE.
@@ -75,27 +85,93 @@ export function useVoting({
     return createReadContract(votingAddress, VotingABI.abi, provider);
   }, [votingAddress, provider]);
 
+  /**
+   * ⭐ ONE `getTallies` FOR A WHOLE SCREENFUL, INSTEAD OF TWO READS PER CARD.
+   *
+   * Every `VotingWidget` on the page fires its own `useEffect` on mount, and they all mount in the
+   * same commit — so all of their asks land in one tick and the loader turns them into a single
+   * call. Fifty threads used to be a hundred reads here; they are one.
+   *
+   * ⚠️ VERIFIED AGAINST THE ABI: `getTallies(bytes32[] entityIds) -> VoteTally[] result`
+   * (`contracts/Voting.json`, `contracts/Voting.sol:193`). One output, so the decoded `tuple[]`
+   * reaches us untouched with `upvotes` / `downvotes` named.
+   *
+   * ⭐ AND `getScore` IS GONE FROM THE READ PATH, WHICH IS THE OTHER HALF OF THE SAVING. The
+   * contract's implementation is exactly `int256(tally.upvotes) - int256(tally.downvotes)`
+   * (`Voting.sol:180`) — a second round trip to subtract two numbers we already have. Computed here
+   * instead. ⛔ If `getScore` ever stops being that subtraction, this has to go back to a read; the
+   * tell would be a score that disagrees with the arrows above and below it.
+   *
+   * ⚠️ NO TTL. A tally changes the moment anybody votes, and this hook is what a vote is submitted
+   * through. Batching without caching is the whole intent: fewer calls, never a stale number.
+   */
+  const tallies = useMemo(
+    () =>
+      createBatchLoader<string, VoteTally>({
+        keyOf: (entityId) => entityId.toLowerCase(),
+        maxBatch: VOTE_BATCH_MAX,
+        missingMessage: (entityId) => `Voting.getTallies returned no entry for ${entityId}`,
+        fetch: async (entityIds) => {
+          const contract = getReadContract();
+          if (!contract) throw new Error("Contract not available");
+          // Decoded by `lib/batch.ts`, where the shape and the derived `score` are pinned by tests.
+          return decodeTallies(await contract.getTallies(entityIds), entityIds.length);
+        },
+      }),
+    [getReadContract]
+  );
+
+  /**
+   * The same trick for "did I vote on this?" — `getUserVotes(bytes32[], address) -> VoteType[]`
+   * (`contracts/Voting.json`, `contracts/Voting.sol:214`), one call for the page.
+   *
+   * ⚠️ REBUILT WHEN THE VOTER CHANGES. The address is baked into the batch call, so a loader built
+   * for one account must never answer for another — signing in has to re-read, not re-use.
+   * `VoteType.None` is `0`, which is a real answer and not the absent sentinel; only a slot the
+   * batch did not return at all is absent.
+   */
+  const userVotes = useMemo(
+    () =>
+      createBatchLoader<string, VoteType>({
+        keyOf: (entityId) => entityId.toLowerCase(),
+        maxBatch: VOTE_BATCH_MAX,
+        missingMessage: (entityId) => `Voting.getUserVotes returned no entry for ${entityId}`,
+        fetch: async (entityIds) => {
+          const contract = getReadContract();
+          if (!contract || !userAddress) throw new Error("Contract not available");
+          return decodeUserVotes(
+            await contract.getUserVotes(entityIds, userAddress),
+            entityIds.length
+          );
+        },
+      }),
+    [getReadContract, userAddress]
+  );
+
+  /**
+   * ⚠️ THE ZEROES ON FAILURE ARE UNCHANGED, AND THEY ARE NOT A "MISSING MEANS 0" VIOLATION.
+   *
+   * A tally genuinely IS `(0, 0)` for anything nobody has voted on — that is the contract's own
+   * answer for an unknown `entityId`, not an invention — and the pre-batch version returned the same
+   * zeroes when the read failed. Preserving it keeps `VotingWidget`'s render identical, and the
+   * widget has no other representation available: its `VoteTally` has no "unknown". Changing that
+   * belongs with a change to the widget, which this pass is not allowed to touch.
+   */
   const getVoteTally = useCallback(
     async (entityId: string): Promise<VoteTally> => {
-      const contract = getReadContract();
-      if (!contract) {
-        return { upvotes: 0, downvotes: 0, score: 0 };
-      }
-
+      if (!getReadContract()) return { upvotes: 0, downvotes: 0, score: 0 };
       try {
-        const [upvotes, downvotes] = await contract.getTally(entityId);
-        const score = await contract.getScore(entityId);
-        return {
-          upvotes: Number(upvotes),
-          downvotes: Number(downvotes),
-          score: Number(score),
-        };
+        return await tallies.load(entityId);
       } catch (err) {
-        console.error("Failed to get vote tally:", err);
+        // ⚠️ AN ABSENT SLOT IS NOT WORTH A CONSOLE LINE. `?backend=fake` answers every `tuple[]`
+        // with `[]` deliberately, so on the fake EVERY key in every batch is absent — logging it
+        // per card would bury the scenario the fake exists to test under fifty errors per paint.
+        // A call that actually broke is still reported.
+        if (!isBatchEntryMissing(err)) console.error("Failed to get vote tally:", err);
         return { upvotes: 0, downvotes: 0, score: 0 };
       }
     },
-    [getReadContract]
+    [getReadContract, tallies]
   );
 
   const getUserVote = useCallback(
@@ -107,14 +183,21 @@ export function useVoting({
       }
 
       try {
-        const voteType = await contract.getUserVote(entityId, voterAddress);
-        return Number(voteType) as VoteType;
+        // ⚠️ AN EXPLICIT `voter` BYPASSES THE BATCH. The loader is bound to `userAddress`; answering
+        // a question about somebody else out of it would attribute one person's vote to another.
+        // No caller passes one today (`VotingWidget`'s prop type is `(entityId) => …`), so this is
+        // the rare path, not the hot one.
+        if (voterAddress !== userAddress) {
+          return Number(await contract.getUserVote(entityId, voterAddress)) as VoteType;
+        }
+        return await userVotes.load(entityId);
       } catch (err) {
-        console.error("Failed to get user vote:", err);
+        // Same rule as the tally above — absent is quiet, broken is loud.
+        if (!isBatchEntryMissing(err)) console.error("Failed to get user vote:", err);
         return VoteTypeEnum.None;
       }
     },
-    [getReadContract, userAddress]
+    [getReadContract, userAddress, userVotes]
   );
 
   /**

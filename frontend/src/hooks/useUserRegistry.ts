@@ -1,8 +1,8 @@
-import { useState, useCallback, useEffect } from "react";
-import { ethers } from "ethers";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import type { Profile, Link } from "../types/contracts";
 import UserRegistryABI from "../contracts/UserRegistry.json";
 import { createReadContract, type Provider, type Signer } from "../utils/contracts";
+import { createBatchLoader, decodeProfiles } from "../lib/batch";
 import { useHostWrite } from "./usePublisher";
 
 interface UseUserRegistryProps {
@@ -30,6 +30,30 @@ interface UseUserRegistryProps {
   hostWrite?: HostWrite | null;
   enabled?: boolean;
 }
+
+/**
+ * How long a profile read stays fresh.
+ *
+ * ⚠️ BOUNDED ON PURPOSE. A cache with no expiry means a user who renames themselves keeps their old
+ * name on everybody else's screen until the tab is reloaded — a bug that would look like the write
+ * having failed. Sixty seconds is two poll periods, so a rename shows up within about a minute
+ * without asking; the user's OWN writes do not wait for it at all, because every write in this hook
+ * invalidates the cache immediately (see `submit`).
+ *
+ * ⚠️ SHORT IS CHEAP NOW, AND THAT IS THE POINT. Expiring the whole board's names costs ONE
+ * `getProfiles` call on the next poll, not fifty `getProfile` calls, so freshness is no longer
+ * traded against read count.
+ */
+const PROFILE_CACHE_TTL_MS = 60_000;
+
+/**
+ * Addresses per `getProfiles` call.
+ *
+ * The board reads 50 heads, so 50 covers a full page in one call. A longer queue is split into
+ * several calls rather than sent as one — an unbounded array argument is a revert waiting for the
+ * day somebody follows two hundred people.
+ */
+const PROFILE_BATCH_MAX = 50;
 
 /** See `lib/host/types.ts` — `HostBackend.writeContract`. */
 type HostWrite = (
@@ -88,7 +112,7 @@ interface UseUserRegistryReturn {
   isDelegate: (delegateAddress: string) => Promise<boolean>;
 
   // Lookup
-  resolveToOwner: (address: string) => Promise<string>;
+
   getProfile: (address: string) => Promise<Profile>;
   getLinks: (address: string) => Promise<Link[]>;
   hasProfile: (address: string) => Promise<boolean>;
@@ -122,6 +146,48 @@ export function useUserRegistry({
     return createReadContract(registryAddress, UserRegistryABI.abi, provider);
   }, [registryAddress, provider]);
 
+  /**
+   * ⭐ EVERY PROFILE READ IN THE APP GOES THROUGH ONE BATCHED, SHORT-LIVED CACHE.
+   *
+   * `getProfile` is the single most-called read here: the forum decorates every row with its
+   * author's display name, replies do the same, the sidebar does it once per followee, and the
+   * hover tooltip does it again. Before this it was literally one `getProfile(address)` per item,
+   * per 30-second poll, with no memory between polls and no de-duplication even when the same
+   * person wrote five of the fifty rows.
+   *
+   * ⚠️ THE FUNCTION VERIFIED AGAINST THE ABI IS `getProfiles(address[]) -> Profile[] result`
+   * (`contracts/UserRegistry.json`, and `contracts/UserRegistry.sol:435`). One output, so
+   * `normaliseCallResult` passes the decoded `tuple[]` through untouched and each entry arrives
+   * with named fields.
+   *
+   * ⚠️ `exists: false` IS AN ANSWER, NOT AN ABSENCE. The contract returns a zeroed struct for an
+   * address that never made a profile, exactly as single `getProfile` did, and that resolves and is
+   * cached like any other value. Only a slot the batch did not return at all is treated as absent —
+   * see `alignBatch`.
+   */
+  const profiles = useMemo(
+    () =>
+      createBatchLoader<string, Profile>({
+        // Addresses reach us in mixed case (chain attribution vs. what an object claims), and two
+        // spellings of one address must not be two cache entries or two batch slots.
+        keyOf: (address) => address.toLowerCase(),
+        ttlMs: PROFILE_CACHE_TTL_MS,
+        maxBatch: PROFILE_BATCH_MAX,
+        missingMessage: (address) =>
+          `UserRegistry.getProfiles returned no entry for ${address}`,
+        fetch: async (owners) => {
+          const contract = getReadContract();
+          // Same words the single read used, and the same meaning: no address or no reader. ⚠️ This
+          // rejects EVERY key in the batch, which is what the per-item loop did when there was no
+          // contract — each of its calls threw the same thing.
+          if (!contract) throw new Error("Contract not available");
+          // Decoded by `lib/batch.ts`, where the shape is pinned by `npm run test:lib`.
+          return decodeProfiles(await contract.getProfiles(owners), owners.length);
+        },
+      }),
+    [getReadContract],
+  );
+
   // Prop first, context second. ⚠️ TODAY ONLY THE PROP FIRES: the sole caller is `App`, which
   // renders `PublisherProvider` and is therefore above `HostWriteContext`. The fallback is for a
   // caller mounted inside it — do not delete the prop on the assumption that context will cover.
@@ -146,15 +212,32 @@ export function useUserRegistry({
             "cannot reach it. Open Plaza inside the Polkadot app and try again.",
         );
       }
-      return hostWrite(
+      const result = await hostWrite(
         registryAddress,
         UserRegistryABI.abi as unknown as Record<string, unknown>[],
         method,
         args,
         method,
       );
+
+      /**
+       * ⭐ THE CACHE'S EXPLICIT INVALIDATION, AND IT IS DELIBERATELY UNCONDITIONAL.
+       *
+       * Every write reachable from here is submitted AS the user (host-signed, so `msg.sender` is
+       * them), and the ones that change what a name resolves to — `createProfile`,
+       * `createDefaultProfile`, `setDisplayName`, `setBio`, `transferProfileOwnership` — are the
+       * common ones. The delegation calls do not touch the `Profile` struct, but invalidating one
+       * map entry costs nothing and a per-method allowlist is a thing that goes stale silently the
+       * next time a method is added. ⛔ Do not "optimise" this into a switch.
+       *
+       * Without it, `ProfileView` re-reads right after an edit (`getProfile(userAddress)` on
+       * line ~232) and would be served the pre-edit name from cache — the edit would look like it
+       * had silently failed.
+       */
+      if (userAddress) profiles.invalidate(userAddress);
+      return result;
     },
-    [enabled, registryAddress, hostWrite]
+    [enabled, registryAddress, hostWrite, profiles, userAddress]
   );
 
   const loadProfile = useCallback(async () => {
@@ -171,13 +254,21 @@ export function useUserRegistry({
       setIsLoading(true);
       setError(null);
 
+      // ⚠️ THE SINGLE `getProfile`, ON PURPOSE, AND IT MUST BYPASS THE CACHE. This is the
+      // read-after-write path for the user's own profile: routing it through `profiles.load` would
+      // let a value written moments ago be answered from the cache the write just invalidated and
+      // some other row re-populated. One address, one read — there is nothing to batch here anyway.
       const profileData = await contract.getProfile(userAddress);
-      setProfile({
+      const own: Profile = {
         owner: profileData.owner,
         displayName: profileData.displayName,
         bio: profileData.bio,
         exists: profileData.exists,
-      });
+      };
+      setProfile(own);
+      // …but the value is fresh and came from the same chain read, so hand it to the cache. Every
+      // `getDisplayName(me)` on the board is then free. See `BatchLoader.prime`.
+      profiles.prime(userAddress, own);
 
       if (profileData.exists) {
         const linksData = await contract.getLinks(userAddress);
@@ -195,7 +286,7 @@ export function useUserRegistry({
     } finally {
       setIsLoading(false);
     }
-  }, [userAddress, getReadContract]);
+  }, [userAddress, getReadContract, profiles]);
 
   useEffect(() => {
     if (enabled) {
@@ -443,30 +534,35 @@ export function useUserRegistry({
     [getReadContract, userAddress]
   );
 
-  const resolveToOwner = useCallback(
-    async (address: string): Promise<string> => {
-      const contract = getReadContract();
-      if (!contract) return ethers.ZeroAddress;
-
-      return contract.resolveToOwner(address);
-    },
-    [getReadContract]
-  );
-
+/**
+ * ⛔ `resolveToOwner` WAS DELETED HERE, 2026-07-31, AND MUST NOT COME BACK AS A CONTRACT CALL.
+ *
+ * It called `contract.resolveToOwner(address)`, which exists in **neither `UserRegistry.json` nor
+ * `UserRegistry.sol`** — the sixth instance of this repo's most repeated bug, after `getEntityId`,
+ * `getThreadCount`, `getUserPostCount`, `addReply`, and the `addLink` arity mismatch. It had zero
+ * consumers, so it had never been called and never failed.
+ *
+ * ⚠️ AND THE SEMANTICS IT IMPLIED CANNOT EXIST. "Resolve a delegate back to its owner" is a REVERSE
+ * lookup, and architecture.md rules it out on purpose: a delegate address is only unique *per owner*,
+ * so there is nothing to resolve to and a guess would misattribute a post to the wrong person. That
+ * is why every delegated call NAMES its principal — `setHeadFor`, `followFor`, `voteFor` — and the
+ * callee checks `canActAs`. If you need an owner, take it as an argument; do not look it up.
+ */
+  /**
+   * ⭐ THE ONE PROFILE READ EVERYTHING ELSE USES — batched and cached, same signature as before.
+   *
+   * Callers still ask for one address; `profiles` turns the whole tick's worth of asks into a single
+   * `getProfiles`. Nothing above this line had to change, which is why the forum, the replies, the
+   * sidebar and the hover tooltip all got the reduction without being edited.
+   *
+   * ⚠️ IT STILL REJECTS. `getDisplayName` in `App.tsx` catches and renders no name, and
+   * `ProfileTooltip` / `UserProfileModal` have their own catches. A batch whose call failed rejects
+   * every key in it, and a batch that came back missing one entry rejects that key alone — so one
+   * unreadable profile can no longer be the reason the other forty-nine rows show nothing.
+   */
   const getProfileFn = useCallback(
-    async (address: string): Promise<Profile> => {
-      const contract = getReadContract();
-      if (!contract) throw new Error("Contract not available");
-
-      const p = await contract.getProfile(address);
-      return {
-        owner: p.owner,
-        displayName: p.displayName,
-        bio: p.bio,
-        exists: p.exists,
-      };
-    },
-    [getReadContract]
+    async (address: string): Promise<Profile> => profiles.load(address),
+    [profiles]
   );
 
   const getLinksFn = useCallback(
@@ -483,14 +579,23 @@ export function useUserRegistry({
     [getReadContract]
   );
 
+  /**
+   * ⚠️ SERVED FROM THE SAME BATCH, not from `UserRegistry.hasProfile`.
+   *
+   * The contract's `hasProfile(addr)` is literally `profiles[addr].exists`, so asking it separately
+   * would be a second read for a field the batched struct already carries. `false` on a failed read
+   * is what the old single-call version returned, and is kept: this answer gates a UI affordance,
+   * and "we could not tell" has to fall on the side of not claiming a profile exists.
+   */
   const hasProfile = useCallback(
     async (address: string): Promise<boolean> => {
-      const contract = getReadContract();
-      if (!contract) return false;
-
-      return contract.hasProfile(address);
+      try {
+        return (await profiles.load(address)).exists;
+      } catch {
+        return false;
+      }
     },
-    [getReadContract]
+    [profiles]
   );
 
   return {
@@ -512,7 +617,7 @@ export function useUserRegistry({
     confirmDelegate,
     maxDelegationSeconds,
     isDelegate,
-    resolveToOwner,
+
     getProfile: getProfileFn,
     getLinks: getLinksFn,
     hasProfile,
