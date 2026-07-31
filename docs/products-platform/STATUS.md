@@ -3,6 +3,14 @@
 Short by design. The long reasoning is in [`architecture.md`](architecture.md); the traps are in
 [`gotchas.md`](gotchas.md). **Last updated 2026-07-31.**
 
+⭐ **[V] 2026-07-31 — Plaza now runs inside a SIMULATED host, reading the real devnet chain, and
+the harness takes SCREENSHOTS.** `cd frontend && npm run test:host:plaza`. See
+[`simulated-host.md`](simulated-host.md) for what it can and — more importantly — cannot prove.
+It settles the product-account derivation inputs by experiment (origin, hostname and index take
+no part; the root is the only variable, and `plaza-social.dot` is never requested). It settles
+**nothing** about native-container vs browser-over-SSO: `requestResourceAllocation` there
+allocates everything unconditionally and the statement store is an in-memory array.
+
 ## ⛔⛔ READ THIS BEFORE BELIEVING ANY "VERIFIED ON A REAL DEVICE" CLAIM BELOW
 
 **[V] 2026-07-31 — a statement-store allowance is a PERSONHOOD-GATED DAILY SLOT, and on a browser

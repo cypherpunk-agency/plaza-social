@@ -164,9 +164,23 @@ export function Sidebar({
         target in this codebase (see frontend/CLAUDE.md § Clickable non-buttons) and it earns that
         here: it duplicates the real CLOSE MENU button below, plus Escape.
       */}
+      {/*
+        ⚠️ `/90`, NOT `/70`, AND THE REASON IS THE THEME. Seen for the first time on 2026-07-31, in a
+        Playwright capture at 375px (`tests/.artifacts/screens/host-phone-7-nav-drawer.png`) — the
+        first time anyone had looked at this app at all.
+
+        A black wash over an all-black page changes nothing except the alpha of the text on top of
+        it, so at `/70` the 119px strip beside the drawer stayed perfectly readable and the overlay
+        did not read as an overlay — it read as a rendering glitch, two live panes side by side. On a
+        light theme `/70` is plenty; here the backdrop has no surface of its own to show.
+
+        ⛔ Do not "simplify" this back toward a conventional value. The number is doing a different
+        job than it does in a light UI, and the only way to check it is to LOOK — the in-app Browser
+        pane does not composite frames, so `npm run test:host:screens` is the instrument.
+      */}
       {isDrawerOpen && (
         <div
-          className="fixed inset-0 z-30 bg-black/70 xl:hidden"
+          className="fixed inset-0 z-30 bg-black/90 xl:hidden"
           onClick={onCloseDrawer}
           aria-hidden="true"
         />

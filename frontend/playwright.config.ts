@@ -26,13 +26,26 @@ export default defineConfig({
     trace: 'retain-on-failure',
     video: 'off',
   },
-  webServer: {
-    command:
-      'npx vite build --config tests/fixture-app/vite.config.ts && npx vite preview --config tests/fixture-app/vite.config.ts',
-    url: 'http://localhost:5199',
-    reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  },
+  webServer: [
+    {
+      command:
+        'npx vite build --config tests/fixture-app/vite.config.ts && npx vite preview --config tests/fixture-app/vite.config.ts',
+      url: 'http://localhost:5199',
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+    // ⭐ The REAL Plaza bundle, so the host harness can run the app itself and not only the
+    // probe. `vite build` (not `tsc -b && vite build`): the typecheck is `npm run build`'s job
+    // and running it here would make this harness fail for someone else's half-finished edit.
+    {
+      command: 'npx vite build && npx vite preview --config tests/plaza-app.vite.config.ts',
+      url: 'http://localhost:5200',
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  ],
 });

@@ -4,6 +4,17 @@ Runs a real `@parity/product-sdk` client inside a real Polkadot Products host
 container, driven by Playwright. This is the only way to execute SDK calls
 without the phone app or a devnet publish.
 
+⭐ **It runs PLAZA ITSELF, not only a probe app.** `tests/plaza-fixture.ts` points the
+same test host at `frontend/dist` — the bundle `pad` publishes — and declares the
+**devnet** Asset Hub, so the app's own `openHostSession()` → `PostRegistry.getHeadsPaged`
+path executes against the **real deployed contracts**. It also takes **screenshots**,
+which is the first time anyone in this project has seen the app.
+
+**Read [`docs/products-platform/simulated-host.md`](../../docs/products-platform/simulated-host.md)
+before drawing a conclusion from a green run here.** It has the full domain-by-domain
+capability table (55 of 64 wire methods; `coinPayment` is 0 of 9) and, more importantly,
+the list of things the simulator *cannot* prove.
+
 ## Run it
 
 ```bash
@@ -33,13 +44,31 @@ a run is meant to be read, not just pass.
 
 | File | Role |
 |---|---|
-| `../playwright.config.ts` | testDir, single worker, webServer (build + preview of the probe app) |
-| `host-fixture.ts` | the reusable fixture — wraps `createTestHostFixture`, adds `probe` |
+| `../playwright.config.ts` | testDir, single worker, **two** webServers: probe app on :5199, Plaza on :5200 |
+| `host-fixture.ts` | fixture for the **probe app** — wraps `createTestHostFixture`, adds `probe` |
 | `fixture-app/` | the minimal "product": `index.html` + `main.ts`, its own vite config |
 | `00-smoke.spec.ts` | host page loads, iframe attaches, consoles are readable |
 | `01-container.spec.ts` | container detection, session handshake, account resolution |
 | `02-allowances.spec.ts` | `requestResourceAllocation` — request, response, tag spelling |
 | `03-prompts.spec.ts` | which operations reach the host's signing handler |
+| **`plaza-fixture.ts`** | fixture for **Plaza** — real networks, viewports, `open()`, `shot()` |
+| **`plaza-app.vite.config.ts`** | serves `frontend/dist` on :5200 with framing allowed |
+| **`10-plaza-in-host.spec.ts`** | Plaza boots, handshakes, reads the real devnet chain |
+| **`11-plaza-screenshots.spec.ts`** | ⭐ pixels, at 375 and 1280, host-backed and fake-backed |
+| **`12-product-account.spec.ts`** | ⭐ the controlled experiment on what the account depends on |
+
+Two products, two ports:
+
+| Product | Port | Config |
+|---|---|---|
+| `fixture-app/` (probe) | 5199 | `fixture-app/vite.config.ts` |
+| `frontend/dist` (**Plaza**) | 5200 | `plaza-app.vite.config.ts` |
+
+```bash
+npm run test:host           # everything
+npm run test:host:plaza     # specs 10–12 only
+npm run test:host:screens   # just the pictures → tests/.artifacts/screens/
+```
 
 ## Using the fixture in a new test
 
@@ -112,3 +141,20 @@ name to `ProbeMethod` in `host-fixture.ts`.
   broadcast. That is why `03-prompts.spec.ts` stops at `checkAuthorization` and
   builds Bulletin extrinsics by hand through PAPI when it needs a signature.
 - `PreimageManager.submit()` returns a bare `Promise<HexString>`, not a `Result`.
+- **Declare the DEVNET Asset Hub** (`0xd6eec261…`, `wss://asset-hub-paseo-rpc.n.dwellir.com`).
+  The test SDK's built-in `PASEO_ASSET_HUB` is a *different chain* and our contracts are not on
+  it — every read comes back empty and it looks exactly like a broken deployment.
+- **`wss://bulletin-paseo.tservices.es:8443` answers HTTP 429** on the websocket handshake and
+  PAPI retries in a tight loop. `PLAZA_NETWORKS` omits it deliberately; `session.ts` then takes
+  its existing paseo fallback.
+- **The host page forwards its own `location.search` into the iframe**, exactly like the dot.li
+  shell — so `hostUrl/?backend=fake&caps=live` reaches Plaza unchanged.
+- **`getByRole` cannot see a `display:none` element.** Below `xl` the whole sidebar is `hidden`,
+  so counting a nav row before opening the drawer reports 0 and silently skips the step.
+- **Nav rows carry a leading glyph** (`☰ Forum`, `⚙ Settings`, `@ 0x…`), so `/^Forum$/` matches
+  nothing and then hangs on `click()` until the test times out.
+- ⛔ **Never `waitForFunction(() => …document.body.innerText…)`.** It re-reads the whole rendered
+  text every animation frame; it OOM-killed the Playwright worker here (`code=134`). Poll from
+  the Node side instead.
+- **The first contract read pays for ~880 kB of Asset Hub metadata** over the proxied RPC. Allow
+  a minute before asserting on chain-derived UI.

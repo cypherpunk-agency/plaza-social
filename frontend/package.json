@@ -11,6 +11,8 @@
     "preview": "vite preview",
     "preview:dist": "npx serve dist",
     "test:host": "playwright test --config playwright.config.ts",
+    "test:host:plaza": "playwright test --config playwright.config.ts 10-plaza-in-host 11-plaza-screenshots 12-product-account",
+    "test:host:screens": "playwright test --config playwright.config.ts 11-plaza-screenshots",
     "test:host:probe": "vite --config tests/fixture-app/vite.config.ts",
     "test:lib": "node --experimental-strip-types --test src/lib/*.test.ts"
   },
