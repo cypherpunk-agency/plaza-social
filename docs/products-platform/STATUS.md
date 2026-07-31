@@ -8,7 +8,7 @@ Short by design. The long reasoning is in [`architecture.md`](architecture.md); 
 | What | Where |
 |---|---|
 | App | **https://plaza-social.dev-dot.li** — `plaza-social.dot` (`.dot.li` serves it too) |
-| Bundle CID | `bafybeih6yfyxl6vrc2nrilgktnpm3hj4ka4dsoktylvwxozh7vxfti35di` — a **CAR file**, fetchable whole, NOT pathable (2026-07-30). |
+| Bundle CID | `bafybeibnvl7qnwv7r3q4skp4pru7q3ztcnc6evng3cib3syc6qfeqkfe2q` — a **CAR file**, fetchable whole, NOT pathable (2026-07-31). |
 | Source | `github.com/Tomen/plaza`, branch `claude/polkadot-products-sdk-review-b2cff4` |
 | Deploy | `npx @polkadot-community-foundation/polkadot-app-deploy@latest frontend/dist plaza-social.dot --env devnet --mnemonic "$MNEMONIC"` |
 | `UserRegistry` | `0xfD00289e765414C0281EFC35335b6453F055FBD7` = `@plaza-social/user-registry` v0 |
@@ -102,11 +102,35 @@ Bulletin authorization error. Cost an hour. See gotchas.
    there is `unverified`. **Nobody has yet pressed COPY LINK on a phone.**
    ⛔ **`?post=N` on the profile feed is STILL POSITIONAL.** Same bug, same fix, not done —
    `UserPost` already carries `cid`, but `PostDetailView`/`useUserPosts` belong to another change.
-2. **Move the remaining owner-only calls to `writeContract`** — start with `authorizeDelegate`, since
+2. ⭐ **Take the app to a phone and exercise the four things only a device can settle.** Everything
+   below this line in the write column is `[I]`, and one session with the app open converts most of
+   it. In priority order:
+   - **Send one CASH tip.** The whole path above the host boundary is tested; the host call has never
+     run. If it fails, suspect the unexplained *"Protected asset access requires value-transfer
+     authorization"* on pUSD **before** suspecting a malformed call — that is written into the code.
+   - **Publish one reply.** The last `[I]` in the write column; identical to the thread write that is
+     `[V]`, but never actually on chain.
+   - **Press COPY LINK.** `Clipboard` is a host device permission and a missing one fails silently.
+     `lib/clipboard.ts` reports `copied`/`unverified`/`failed`; find out which one a phone gives.
+   - **Look at the app.** No agent has ever *seen* it — the Browser pane does not composite frames, so
+     every layout and colour claim in this repo is numeric inference. Contrast, spacing and the new
+     focus ring are unreviewed by eyes.
+
+3. **Move the remaining owner-only calls to `writeContract`** — start with `authorizeDelegate`, since
    "SET UP POSTING KEY" is offered in the UI and would fail today. That is also what removes the
    per-post signing prompt: with a live delegation, `usePublisher`'s `writeHead` switches to
    `setHeadFor(author, …)` and nothing else changes.
-3. **Migrate `useChannelRegistry` / `useChannel`** the way `useForumThread`, `useUserPosts` and
+
+4. **Two accessibility/layout defects that undo work already done.** Both are small and both hit the
+   primary surface:
+   - ⛔ **The sidebar is a fixed `w-64` with no responsive behaviour.** Measured at 375×812 it takes
+     **176px of 375** — 47% of a phone screen, leaving thread titles 196px. The forum was just capped
+     to a readable measure and this undoes it. A drawer behind the existing `☰` is the fix.
+   - ⛔ **Thread titles are `<h3 onClick>`** (`ThreadCard.tsx:122`, `:145`) — no tab stop, no
+     Enter/Space, announced as static text. This is the app's primary navigation affordance and it is
+     unreachable by keyboard. Make it a `<button type="button" className="text-left …">`.
+   - Minor, same class: `App.tsx:564` and `:585` settings buttons have no hover class at all.
+5. **Migrate `useChannelRegistry` / `useChannel`** the way `useForumThread`, `useUserPosts` and
    `useReplies` were: heads from `PostRegistry` for a `bytes32` registry id, then `walkChain`.
    A room id is `openRegistryId("room:<name>")` from `frontend/src/lib/registry.ts` — do not compute
    one anywhere else. **This is now a re-wiring job, not a repair**: the hooks and components are
@@ -115,9 +139,16 @@ Bulletin authorization error. Cost an hour. See gotchas.
    "create a room" step to restore — an open room needs no transaction.
    ⭐ **Publish one reply from a phone** while you are in there: the reply write path is wired and
    fake-tested but has never touched the chain, so it is the last **[I]** in the write column.
-4. **Adopt the app-side personhood check** — `PeopleLite.LitePeople[account]` on the Individuality
+6. **`?post=N` on the profile feed is still POSITIONAL** — the same bug `?thread=N` had, unfixed.
+   `UserPost` already carries `cid`, and `lib/threadLink.ts` is the pattern to copy. Pairs naturally
+   with **optional titles on profile posts**: a titled post is a `thread` announcement written into
+   `FEED_REGISTRY` pointing at a `post` body, which needs no wire-format change and gives
+   cross-posting for free (N announcements, one body).
+7. **Adopt the app-side personhood check** — `PeopleLite.LitePeople[account]` on the Individuality
    chain. Real one-human-one-account, and much stronger than `hasProfile`, which gates nothing.
-5. Delete the dead ABIs (`ChatChannel`, `ChannelRegistry`, `ForumThread`, `Replies`, `UserPosts`) once
+   ⚠️ It was **151** entries when first measured and **157** on 2026-07-30 — it drifts; re-read it,
+   never quote the number.
+8. Delete the dead ABIs (`ChatChannel`, `ChannelRegistry`, `ForumThread`, `Replies`, `UserPosts`) once
    their consumers are gone.
 
 ## Settled — do not re-litigate
@@ -138,6 +169,25 @@ Bulletin authorization error. Cost an hour. See gotchas.
   devnet→paseo fallback cannot help; the preimage channel bypasses the chain bridge entirely.
 - **Deploys are not rate-limited by personhood.** The "1/day Lite, 5/day Full" claim applies to
   `pad --publish` (the Browse listing), not to a deploy. Several deploys an hour work fine.
+- **CASH is Coinage; `payment.*` is how you spend it.** Both RFC-0006 requests are keyed on
+  `CoinPaymentPurseId`, so `requestPayment` is the *account-addressed view of the same CASH purse* —
+  not a substitution of pUSD for CASH. `coinPayment` (RFC-0017) is the bearer/merchant surface and
+  cannot serve a tip: the payee must be present to mint a receivable, delivery rides the
+  personhood-gated statement store, and no host implements it (zero handlers in the reference bundle,
+  none wrapped by `product-sdk-host`). pUSD (asset **50000413**, 6dp) is only the denomination.
+- **Two money units, and mixing them is a 10⁴ error.** RFC-0006 `Balance` is `u128` **plancks**;
+  RFC-0017 `CoinPaymentBalance` is `u32` **cents**. Confirmed against Parity's own `w3spay` on a real
+  host: `plancks = cents × 10^(6−2)`. And `pallet-coinage` sets `UnderlyingAssetUnit = 10⁴`, so
+  **sub-cent amounts cannot exist as coins** — the UI takes 2 decimals, not 6.
+- **`Revive.AutoMap = true`, so nobody calls `map_account`.** It is a runtime **constant** — reading
+  it as *storage* returns `null`, which looks exactly like `false`. `Revive.OriginalAccount` (4236
+  entries) is the H160→AccountId32 route. ⛔ **Never derive one.** `h160ToSs58()` was measured against
+  the real user and yields a *different* account; tipping it destroys the funds. Resolve, or refuse.
+- **Colour utilities must be declared in `@theme static`, not a hand-written list.** Tailwind only
+  generates variants for colours it knows about. The old `:root` + manual-utility approach meant
+  `hover:text-primary-400` (22 uses), `focus:border-primary-400` (18) and ~5 other heavily-used
+  classes **did not exist in the built CSS at all** — which is why orange controls had no highlight
+  while the red DELETE beside them did. See `frontend/CLAUDE.md` § Interaction states.
 
 ## Questions still unanswered
 
@@ -145,7 +195,19 @@ Bulletin authorization error. Cost an hour. See gotchas.
 2. Is a PGAS-funded storage deposit refunded in PGAS, or a one-way burn?
 3. **No third-party Bulletin renewal has ever happened on this chain.** Do one `force_renew` by a
    non-storer before building the preservation screen on it.
-4. Does the host's own product account need `map_account` (0.2 PAS **native**, not PGAS)?
+4. ~~Does the host's own product account need `map_account`?~~ **[V] ANSWERED — no.**
+   `Revive.AutoMap = true`; mapping is automatic on first use and the 0.20052 PAS hold is moot.
+9. **What grants "value-transfer authorization" on pUSD?** Of 661 assets on Asset Hub, **50000413 is
+   the only protected one** — every value method on its precompile reverts with that string while
+   USDC and PGAS controls answer fine. It is not the `from` address, and the phrase appears nowhere
+   in any `@parity` package. Whether `requestPayment` bypasses or wraps it is unproven. **If a real
+   tip fails on a device, this is the first suspect, not a malformed call.**
+10. **Does the host settle `requestPayment` as a Coinage transfer or a plain pUSD transfer?** Parity's
+    own two references contradict each other.
+11. **Does the production Polkadot app implement RFC-0006 at all?** The reference test host ships
+    exactly four payment handlers and the public iOS bridge agrees, but the Android app is
+    closed-source. Strong `[I]`, not `[V]`. There is no feature probe — the `Feature` union is only
+    `{tag:'Chain'}` — so a phone is the only way to know.
 5. **What else does the Individuality chain give us?** `ProofOfInk`, `MobRule` (a dispute/jury system
    with credits and payouts), `Members`, `Honour`, `Score`. `MobRule` looks directly relevant to
    moderation, which §7 currently solves with a per-registry admin.

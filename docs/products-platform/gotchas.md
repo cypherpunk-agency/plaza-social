@@ -1,4 +1,26 @@
-# Gotchas, constants and hard-won facts
+# Gotchas
+
+## Working in this repo with several agents at once
+
+⛔ **NEVER run `git stash`, `git checkout --`, `git restore`, `git reset` or `git clean`.** On
+2026-07-30 one agent ran `git stash` to get a clean lint baseline and reverted **every** agent's
+uncommitted work — ~29k lines — to HEAD. Its own conclusion is the right one: *there was no reason to
+want a clean tree.* The deeper fix is that the tree should never be far from its last commit; commit
+early and often.
+
+⚠️ **A `Read` result is not durable across a tool call.** Re-read any shared file immediately before
+editing it. A vanished edit looks exactly like a bad `old_string` match, which sends you debugging
+the wrong thing.
+
+⚠️ **You cannot tell which agents are running from the filesystem.** Transcript files are unflushed —
+size and mtime are identical for a finished agent and a live one. **Completion notifications are the
+only reliable signal.** Do not assert an agent is done from a timestamp; that mistake was made and
+caught here.
+
+⚠️ **Nobody has ever *seen* this app.** `computer{action:"screenshot"}` fails — the Browser pane does
+not composite frames. Every layout, colour and contrast claim in this repo is numeric inference from
+`getBoundingClientRect` / `getComputedStyle` / `scrollWidth`. Say so when you report; do not write
+"looks right"., constants and hard-won facts
 
 > ## How to not waste a day here
 >

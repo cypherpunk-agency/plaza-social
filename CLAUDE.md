@@ -35,11 +35,15 @@ were deleted. Anonymous reading still works inside the host.
 (addresses in STATUS.md and `contracts/deployments.json`).
 
 **Host-signed contract writes work** — a profile was created on chain from the phone (2026-07-30).
-**The two-signature write is wired** — body → Bulletin, then pointer → `PostRegistry` — in
-`frontend/src/lib/publish.ts`, with threads and profile posts on it. It has unit tests but **has not
-yet published from a phone**, and it rides the same preimage channel that is itself unconfirmed; one
-post attempt settles both. Chat, replies and channels still call deleted contracts. See STATUS.md
-before assuming a feature works.
+**Content creation works, proven on a phone.** The two-signature write — body → Bulletin, then
+pointer → `PostRegistry` — lives in `frontend/src/lib/publish.ts`; threads, profile posts and replies
+are on it. Voting, forum master–detail, `?cid=` deep links and CASH tipping are wired.
+
+**What is still `[I]` rather than `[V]`** is anything whose last mile needs a device: the reply write
+has never touched the chain, no CASH tip has ever run against a real host, COPY LINK has never been
+pressed on a phone, and **nobody has ever looked at the app** — the Browser pane does not composite
+frames, so every visual claim here is numeric inference. Chat is un-migrated and unwired from the UI.
+See STATUS.md before assuming a feature works.
 
 ## Quick start
 
