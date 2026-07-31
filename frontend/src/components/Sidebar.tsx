@@ -1,5 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { truncateAddress } from '../utils/formatters';
+
+/**
+ * The id the header's toggle points `aria-controls` at. Exported so the button and the panel can
+ * never drift apart — a dangling `aria-controls` is invisible in review and silently useless.
+ */
+export const SIDEBAR_DRAWER_ID = 'plaza-primary-nav';
 
 interface FollowingUser {
   address: string;
@@ -45,6 +51,15 @@ interface SidebarProps {
   currentUserDisplayName?: string | null;
   // Forum availability
   forumAvailable?: boolean;
+  /**
+   * ⚠️ DRAWER VISIBILITY BELOW `xl`. This is NOT `sidebarExpanded`, and conflating the two is the
+   * obvious mistake here: `sidebarExpanded` says which SECTIONS inside the nav are unfolded and is
+   * persisted to localStorage; this says whether the whole panel is on screen at all, and is
+   * deliberately transient. At `xl` and above it is ignored — the panel is always rendered.
+   */
+  isDrawerOpen?: boolean;
+  /** Close the drawer. The caller also restores focus to the toggle; see `App.tsx`. */
+  onCloseDrawer?: () => void;
 }
 
 export function Sidebar({
@@ -61,9 +76,34 @@ export function Sidebar({
   currentUserAddress,
   currentUserDisplayName,
   forumAvailable = false,
+  isDrawerOpen = false,
+  onCloseDrawer,
 }: SidebarProps) {
   const [followingWithNames, setFollowingWithNames] = useState<FollowingUser[]>([]);
   const [loadingFollowingNames, setLoadingFollowingNames] = useState(false);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+
+  /**
+   * Focus moves INTO the drawer when it opens, and Escape closes it.
+   *
+   * ⚠️ The close button is `xl:hidden`, so at desktop width `.focus()` is a no-op on a
+   * `display: none` element — which is exactly right: at `xl` the panel is not a drawer, nothing
+   * was "opened", and stealing focus would be wrong. Restoring focus to the toggle is the CALLER's
+   * job (`App.tsx` holds the button ref), because the toggle lives in the header, not here.
+   *
+   * No focus TRAP: the same markup is a plain static column at `xl`, where trapping Tab inside the
+   * nav would strand a keyboard user. Escape plus a real close button is the honest amount of modal
+   * behaviour for something that is only sometimes modal.
+   */
+  useEffect(() => {
+    if (!isDrawerOpen) return;
+    closeButtonRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onCloseDrawer?.();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [isDrawerOpen, onCloseDrawer]);
 
   // Load following display names
   useEffect(() => {
@@ -83,6 +123,11 @@ export function Sidebar({
       .finally(() => setLoadingFollowingNames(false));
   }, [following, getDisplayName]);
 
+  /**
+   * ⚠️ SECTION EXPANSION MUST NOT CLOSE THE DRAWER. Unfolding "Following" is how you get AT the
+   * links; closing the panel underneath the finger that opened it would make the section unusable
+   * on a phone. Only a NAVIGATION closes — every handler below that changes `viewMode` does.
+   */
   const handleToggle = (section: SidebarSection) => {
     onToggleSection?.(section);
   };
@@ -90,25 +135,76 @@ export function Sidebar({
   const handleProfileClick = (address: string) => {
     onSelectProfile?.(address);
     onViewModeChange('profile');
+    onCloseDrawer?.();
   };
 
   const handleMyProfileClick = () => {
     if (currentUserAddress) {
       onSelectProfile?.(currentUserAddress);
       onViewModeChange('profile');
+      onCloseDrawer?.();
     }
   };
 
   const handleSettingsClick = () => {
     onViewModeChange('settings');
+    onCloseDrawer?.();
   };
 
   const handleForumClick = () => {
     onViewModeChange('forum');
+    onCloseDrawer?.();
   };
 
   return (
-    <div className="w-64 border-r-2 border-primary-500 bg-black flex flex-col">
+    <>
+      {/*
+        Backdrop. `xl:hidden` because above the breakpoint the panel is part of the layout and there
+        is nothing to dismiss. A `<div onClick>` overlay is the one accepted un-focusable click
+        target in this codebase (see frontend/CLAUDE.md § Clickable non-buttons) and it earns that
+        here: it duplicates the real CLOSE MENU button below, plus Escape.
+      */}
+      {isDrawerOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/70 xl:hidden"
+          onClick={onCloseDrawer}
+          aria-hidden="true"
+        />
+      )}
+
+      {/*
+        ⚠️ MOBILE FIRST, MATCHING THE FORUM'S `xl` BREAKPOINT ON PURPOSE. The base state is the
+        phone: the panel is OFF-CANVAS (`hidden`), and opening it makes it a `fixed` overlay. At
+        `xl` — the same 1280px at which `ForumView` splits into two panes — `xl:static xl:flex`
+        restores exactly today's behaviour, a plain 16rem column in the flex row.
+
+        Measured before this change at 375×812: the fixed `w-64` column ate 176px of 375 (47%),
+        leaving thread titles ~196px and undoing the forum's `max-w-[70ch]` measure work.
+
+        `hidden` rather than a `-translate-x-full` slide: an off-canvas element that is still
+        `display: block` keeps every one of its ~10 buttons in the tab order, so a keyboard user on
+        a phone tabs through an invisible menu before reaching the page. Losing the slide animation
+        is a cheap price for that.
+      */}
+      <nav
+        id={SIDEBAR_DRAWER_ID}
+        aria-label="Primary"
+        className={`${
+          isDrawerOpen ? 'flex fixed inset-y-0 left-0 z-40' : 'hidden'
+        } xl:static xl:z-auto xl:flex w-64 shrink-0 border-r-2 border-primary-500 bg-black flex-col`}
+      >
+      {/* The drawer's own close control. Only exists while the panel is a drawer. */}
+      <div className="border-b-2 border-primary-500 xl:hidden">
+        <button
+          ref={closeButtonRef}
+          type="button"
+          onClick={onCloseDrawer}
+          className="w-full text-left px-4 py-3 text-sm font-mono text-primary-500 hover:text-primary-400 transition-colors"
+        >
+          &larr; CLOSE MENU
+        </button>
+      </div>
+
       {/* My Profile Section */}
       {isConnected && currentUserAddress && (
         <div className="border-b-2 border-primary-500">
@@ -216,6 +312,7 @@ export function Sidebar({
           <span>Settings</span>
         </button>
       </div>
-    </div>
+      </nav>
+    </>
   );
 }

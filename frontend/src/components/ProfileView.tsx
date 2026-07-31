@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
-import { truncateAddress, formatBalance } from '../utils/formatters';
-import { AddressDisplay } from './UserAddress';
+import { truncateAddress } from '../utils/formatters';
+import { AddressDisplay, CashBalance, ownCashBalanceState } from './UserAddress';
 import type { Profile, Link } from '../types/contracts';
 import { UserPostsFeed } from './UserPostsFeed';
 import { TipModal } from './TipModal';
+import { usePayments, useOwnCashBalance } from '../hooks/usePayments';
 import type { Provider, Signer } from '../utils/contracts';
 import toast from 'react-hot-toast';
 
@@ -35,9 +36,15 @@ interface ProfileViewProps {
   onUpdateBio?: (bio: string) => Promise<void>;
   onAddLink?: (name: string, url: string) => Promise<void>;
   onRemoveLink?: (index: number) => Promise<void>;
-  // Tipping
+  /**
+   * @deprecated Unused. The delegate key is not a payer — it is never funded, which is why every
+   * tip used to die on "Insufficient balance in selected wallet". Tips are debited from the USER by
+   * the host; see `TipModal`. Kept so App.tsx still compiles while these props are retired.
+   */
   sessionWallet?: Signer | null;
+  /** @deprecated Unused. */
   sessionWalletAddress?: string | null;
+  /** @deprecated Unused. */
   sessionWalletBalance?: bigint;
   // Tooltip props for nested UserLinks
   isFollowingUser?: (address: string) => boolean;
@@ -73,9 +80,7 @@ export function ProfileView({
   onUpdateBio,
   onAddLink,
   onRemoveLink,
-  sessionWallet,
-  sessionWalletAddress,
-  sessionWalletBalance,
+  // `sessionWallet*` are deliberately NOT destructured — see their @deprecated notes above.
   // Tooltip props for nested UserLinks
   isFollowingUser,
   onTip,
@@ -100,15 +105,32 @@ export function ProfileView({
   const [newLinkUrl, setNewLinkUrl] = useState('');
   const [isSaving, setIsSaving] = useState(false);
 
-  // Tip modal state
+  /**
+   * Tip modal state.
+   *
+   * ⚠️ THIS WAS DEAD FOR A WHILE — the state and the `<TipModal>` at the bottom both existed and
+   * nothing ever set it to `true`, so a static pass proposed deleting the modal as unreachable. The
+   * missing piece was never the modal; it was the SEND TIP button below, which the profile page had
+   * simply never grown. The button is the fix, not the deletion.
+   */
   const [showTipModal, setShowTipModal] = useState(false);
 
-  // Profile balance
-  const [profileBalance, setProfileBalance] = useState<bigint>(0n);
-
-  // Target user session key state
-
   const isOwnProfile = userAddress?.toLowerCase() === currentUserAddress?.toLowerCase();
+
+  /**
+   * The CASH seam, borrowed from the session rather than drilled in — see `hooks/usePayments`.
+   * `canTip` (a prop) already says whether the session can pay at all; this is the same fact from
+   * the same source, and it is what the modal needs to actually send.
+   */
+  const payments = usePayments();
+  // ⛔ CASH, not PAS, and only ever our own. `provider.getBalance(userAddress)` used to render a
+  // FAILED read as `0.0000 PAS`; there is no host API for anyone else's CASH at all. See
+  // `UserAddress/CashBalance.tsx`.
+  const ownBalance = useOwnCashBalance(isOwnProfile);
+  const balanceState = isOwnProfile
+    ? ownCashBalanceState(ownBalance)
+    : ({ kind: 'private' } as const);
+
   const canEdit = isOwnProfile && onUpdateDisplayName && onUpdateBio;
 
   const handleFollow = async () => {
@@ -166,16 +188,10 @@ export function ProfileView({
     setIsEditing(false);
   }, [userAddress]);
 
-  // Fetch profile balance
+  // A stale tip sheet must not follow you to the next person's page.
   useEffect(() => {
-    if (userAddress && provider) {
-      provider.getBalance(userAddress)
-        .then(setProfileBalance)
-        .catch(() => setProfileBalance(0n));
-    } else {
-      setProfileBalance(0n);
-    }
-  }, [userAddress, provider]);
+    setShowTipModal(false);
+  }, [userAddress]);
 
   // Start editing
   const handleStartEdit = () => {
@@ -339,7 +355,7 @@ export function ProfileView({
           <div className="mt-3 flex items-center gap-3 text-xs font-mono text-primary-600">
             <AddressDisplay address={userAddress} size="xs" variant="muted" />
             <span className="text-primary-700">·</span>
-            <span>{formatBalance(profileBalance)} PAS</span>
+            <CashBalance state={balanceState} />
           </div>
 
           {/* Action buttons */}
@@ -369,6 +385,35 @@ export function ProfileView({
                   CANCEL
                 </button>
               </>
+            )}
+            {/*
+              ⭐ THE PROFILE PAGE'S TIP CONTROL. Same affordance the hover card has had all along —
+              yellow, `SEND TIP`, opening the same `TipModal` — so that reaching someone's profile
+              does not LOSE a control that hovering their name offers.
+
+              Gated on `canTip`, which App derives from `!!host.backend?.payments`. ⛔ NOT on
+              `sessionWallet` (the parked `UserProfileModal` still does that, and it is wrong: the
+              delegate key is not the payer and is never funded) and ⛔ NOT on `canWrite`, which is
+              posting ability and says nothing about money.
+
+              Shown-but-disabled rather than hidden when the session cannot pay: a control that
+              vanishes teaches nobody why, and the modal itself explains — which is why the hover
+              card's TIP does the same thing.
+            */}
+            {!isOwnProfile && userAddress && (
+              <button
+                type="button"
+                onClick={() => setShowTipModal(true)}
+                disabled={!canTip}
+                title={canTip ? undefined : 'Tipping pays in CASH from your Polkadot app balance.'}
+                className={`px-4 py-1.5 border-2 text-sm font-mono transition-colors ${
+                  canTip
+                    ? 'bg-yellow-950 border-yellow-500 text-yellow-400 hover:bg-yellow-900 hover:border-yellow-400'
+                    : 'bg-gray-900 border-gray-700 text-gray-600 cursor-not-allowed'
+                }`}
+              >
+                SEND TIP
+              </button>
             )}
             {!isOwnProfile && onFollow && onUnfollow && (
               <button
@@ -541,10 +586,12 @@ export function ProfileView({
           isOpen={showTipModal}
           onClose={() => setShowTipModal(false)}
           recipientAddress={userAddress}
+          // ⭐ The profile page knows the display name; the hover card's `onTip(address)` does not.
+          // So this route gives the nicer copy — "Sent 1.00 CASH to Ada" rather than to `0x1877…`.
           recipientName={profile?.displayName}
-          sessionWallet={sessionWallet}
-          sessionWalletAddress={sessionWalletAddress}
-          sessionWalletBalance={sessionWalletBalance}
+          // ⛔ THIS PROP IS WHAT MAKES THE MODAL FUNCTIONAL. Without it the modal renders its
+          // "only works inside the Polkadot app" branch even inside the Polkadot app.
+          payments={payments}
           onConnectWallet={onConnectWallet}
         />
       )}

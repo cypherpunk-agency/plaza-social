@@ -70,6 +70,23 @@ const importTx = () => import('@parity/product-sdk-tx')
 const importContracts = () => import('@parity/product-sdk-contracts')
 // @ts-ignore optional dependency — see the block comment above
 const importChainClient = () => import('@parity/product-sdk-chain-client')
+/**
+ * SS58 ↔ raw-bytes CODECS. Pure maths, no host, no chain.
+ *
+ * ⛔ IT IS HERE FOR ONE THING: `ss58Decode`, to turn the `SS58String` that
+ * `Revive.OriginalAccount` returns back into the 32 raw bytes `payment.request` takes
+ * (`destination: S.Hex(32)` in `@parity/truapi`). That is a DECODE — it recovers exactly the bytes
+ * the chain encoded — and it is the opposite of the forbidden thing.
+ *
+ * ⛔ NOTHING MAY USE `deriveH160`/`ss58ToH160` FROM THIS PACKAGE TO GO THE OTHER WAY. H160 → account
+ * is not a computation; see `types.ts` `PaymentsSeam.resolveRecipient`. Paying a derived account
+ * destroys the money.
+ *
+ * Imported as the leaf package rather than `@parity/product-sdk/address`, whose barrel side-effect
+ * imports cloud-storage, chain-client, contracts, crypto, host, local-storage and signer.
+ */
+// @ts-ignore optional dependency — see the block comment above
+const importAddress = () => import('@parity/product-sdk-address')
 
 /**
  * Asset Hub chain DESCRIPTORS, imported one at a time.
@@ -126,6 +143,7 @@ export const loadStatementStore = once(importStatementStore) as Loader<any>
 export const loadTx = once(importTx) as Loader<any>
 export const loadContracts = once(importContracts) as Loader<any>
 export const loadChainClient = once(importChainClient) as Loader<any>
+export const loadAddress = once(importAddress) as Loader<any>
 
 /**
  * Is the SDK even present in this build?

@@ -1,4 +1,4 @@
-# Gotchas
+# Gotchas — addresses, constants and hard-won facts
 
 ## Working in this repo with several agents at once
 
@@ -20,7 +20,7 @@ caught here.
 ⚠️ **Nobody has ever *seen* this app.** `computer{action:"screenshot"}` fails — the Browser pane does
 not composite frames. Every layout, colour and contrast claim in this repo is numeric inference from
 `getBoundingClientRect` / `getComputedStyle` / `scrollWidth`. Say so when you report; do not write
-"looks right"., constants and hard-won facts
+"looks right".
 
 > ## How to not waste a day here
 >
@@ -467,6 +467,159 @@ up over a visible profile, and the create form never switched to its edit view �
 write silently did nothing". Events are no help here: `eth_getLogs` cannot see host-submitted contract
 calls at all, so polling the view function is the correct mechanism, not a workaround. Give up quietly
 after a timeout — the write already succeeded, and the next natural refresh will show it.
+
+## ⭐ "Submit failed, no allowance set for account" is a DEAD PHONE LINK, not a contract problem
+
+**[V] 2026-07-31**, read out of the live host bundle `https://browse.dev-dot.li/assets/auth-BuYgQyky.js`
+(find it by grepping the served `index-*.js` for `auth-`).
+
+Seen on a real device as a reply that would not post:
+
+```
+TxError: createTransaction failed: HostFailure: Submit failed, no allowance set for account
+```
+
+Every word of that string points at the contract call, and every word is misleading. **It is a
+STATEMENT-STORE rejection.** Two independent readings agree:
+
+- The host builds the sentence from `{tag:'rejected', reason:'noAllowance'}` — one of a family with
+  `noProof`, `badProof`, `encodingTooLarge`, `accountFull`, `storeFull`, `expiryTooLow`. Nothing in that
+  family concerns contracts, gas, PGAS or `pallet-revive`.
+- On the **web** host, the browser reaches the paired **phone** over an SSO-v2 channel *whose transport
+  is the statement store*. `createTransaction`, `signRaw`, `getRingVrfAlias` **and
+  `requestResourceAllocation`** all funnel through one `c.request(...)` → `submitRequestMessage` →
+  `prover.generateMessageProof(...).andThen(statementStore.submitStatement)`.
+
+So the write did not fail on chain — **it never reached a chain.** The signing request could not be
+shipped to the phone.
+
+**This explains the body-survives / pointer-fails asymmetry**, which otherwise looks like a bug in
+`publish.ts`. The Bulletin preimage path does not use that channel at all (the SSO chunk contains no
+preimage handler) and is signed with a `slotAccountKey` the browser holds locally. So the post body
+stores fine and only the pointer write dies. A user sees a post that vanished; the data is safe.
+
+⚠️ **Consequences for anything you might try:**
+
+- **Re-asking for an allowance cannot help.** `requestResourceAllocation` travels the *same dead
+  channel*. Reaching for a shorter claim TTL in `allowance.ts` is treating the wrong illness.
+- **`SmartContractAllowance` is INERT on this host.** Its persisted record is
+  `{productId, resource: O({bulletin, statementStore}), slotAccountKey}` and its tag mapper has exactly
+  two cases (`bulletin → BulletInAllowance`, `statementStore → StatementStoreAllowance`). There is no
+  smart-contract case and no host-side slot for one. We still request it; it buys nothing here.
+- `value: 0` (the derivation index) **is** correct — every product-account path in the SDK defaults to
+  `derivationIndex = 0` — and is irrelevant to this failure.
+- ~~**The only remedy is signing in again.**~~ ⛔ **FALSE. Retracted the next day — read the section
+  below before acting on anything above.** We shipped that sentence into the app's error copy and it
+  cannot work.
+
+## ⛔ …and the remedy we shipped for it was WRONG: the statement-store allowance is PERSONHOOD-GATED
+
+**[V] 2026-07-31**, one day after the section above, prompted by the user hitting the identical error
+**three more times on a fresh build across three different actions** — authorise-posting-key, a
+profile blog post, and a reply. "The session went stale" cannot explain a failure that is total.
+
+This section does not contradict the one above. Everything above about *where* the failure happens is
+correct. What was wrong was the next question, which nobody asked: **what grants a statement-store
+allowance in the first place?**
+
+### The chain says: only a person can have one
+
+`statement_submit` is served by the **Individuality / People chain** — `wss://people-paseo.rotko.net`
+answers `statement_submit`, `statement_subscribeStatement`, `statement_unsubscribeStatement`
+(**[V]** `rpc_methods`, 2026-07-31). That runtime has **no `Statement` pallet** and no
+balance-derived allowance. Allowances live in `Resources`, and exactly two calls create one:
+
+| call | origin it demands |
+|---|---|
+| `Resources.set_statement_store_account(period, seq, target_account)` | `Origin::StmtStoreAlias`, produced by the `AsResources` **`RegisterStatementStoreAllowance(proof, seq, collection)`** transaction extension *"after proof validation"* |
+| `Resources.set_friend_request_statement_account_for_sequence(...)` | `Origin::FriendRequestAlias`, from `RegisterFriendRequestWithProof` |
+
+`collection` is `MembershipCollection::{People | LitePeople}` and `proof` is an **anonymous ring-VRF
+membership proof**. That is personhood, and there is no other door.
+
+Measured on chain the same day (`node contracts/scripts/probe-statement-allowance.mjs`):
+
+```
+StmtStoreSlotsPerPeriod        20     <- a full person may authorize 20 accounts per DAY
+LiteStmtStoreSlotsPerPeriod    10     <- a lite person, 10
+StmtStoreGraceWindow           172800 <- 2 days, then the OCW sweeps the entry
+Resources.StatementStoreAllowances: 106 entries
+  period 20663 (-2 d)  52     period 20664 (-1 d)  33     period 20665 (TODAY)  21
+PeopleLite.LitePeople  158 entries      People.AccountToPersonalId  0 entries
+```
+
+Every live allowance sits in today, yesterday or the day before — exactly the grace window. **An
+allowance is a daily slot, not a session property.** No cache TTL in `allowance.ts` has any bearing on
+it.
+
+### Why signing in again cannot possibly help
+
+**[V]** from `auth-BuYgQyky.js`. The pairing handshake `Bl({...})` is **read-only on the browser
+side**: it computes a QR payload from a locally generated `DeviceIdentity`
+(`statementAccountSeed = crypto.getRandomValues(32)`), then only `subscribeStatements` + polls
+`queryStatements`. **The phone writes the handshake statement; the browser writes nothing.**
+
+Three things follow, and they match the reported symptom exactly:
+
+1. **Login always appears to succeed**, allowance or not — it never submits a statement, so it never
+   touches the gate.
+2. **The first browser→phone request is the first statement the browser ever submits.** That is
+   `createTransaction` / `signRaw` / `getRingVrfAlias` / `requestResourceAllocation`. So *every*
+   action fails, identically, immediately after a "successful" sign-in.
+3. **A fresh pairing makes it worse, not better**: the browser mints a *new* random statement account
+   which needs its own `set_statement_store_account`, i.e. its own personhood proof and its own daily
+   slot.
+
+### What this account looks like
+
+The product account `0x18773c30d65de35027ac8cd19e98c0ddb9c44ef9` → `5EJ3VTQ…` (via
+`Revive.OriginalAccount`, **never derived**) is **neither a `LitePerson` nor a full `Person`** —
+checked 2026-07-31 against 158 `LitePeople` entries.
+
+⚠️ **[?] That is evidence, not proof of the user's status.** A product account is derived per product
+from the user's root entropy; personhood would be registered against the *identity* account the
+Polkadot app holds, and there is no on-chain reverse map from one to the other. **Do not write "the
+user has no personhood" as `[V]` on the strength of this read.** What is `[V]` is that *this* account
+is in neither collection and that personhood is the only route to an allowance.
+
+### ⭐ The split that matters most, and it is still `[?]`
+
+- On **2026-07-30 22:22** a profile was created on chain and two threads published, from a phone.
+- On **2026-07-31** every host-signed contract write failed with `noAllowance`.
+
+The most likely reading is that the first ran in the **native Polkadot app container** — where the
+host *is* the device, signing is local, and no SSO channel and no statement store are involved — while
+the second ran in a **browser paired to a phone over SSO**, which is the only surface the failure
+above can occur on. If that is the split, **"Arm 1 — host-signed contract writes work" is true of the
+native container and has never been demonstrated in the browser host**, and much of the write column
+in STATUS.md is scoped more narrowly than it reads.
+
+**[?] Nobody has confirmed which surface either session was.** It cannot be settled from a
+development machine — it needs someone to open Plaza *inside the Polkadot app* and post. That is now
+the single highest-value device test in the repo.
+
+### What the app does about it
+
+`frontend/src/lib/host/errors.ts`: the code is `no_statement_allowance` (**renamed from
+`stale_session`**, which encoded the wrong diagnosis in the one place people look). The copy no longer
+says "sign in again"; it says open Plaza inside the Polkadot app, offers personhood as the second
+route, and explicitly disowns re-login. `isAllowanceFailure` still returns true so
+`allowance.invalidate()` runs, but that is **bookkeeping** — it stops the diagnostics panel claiming a
+grant we do not have, and fixes nothing.
+
+⛔ **There is no app-side fix, and do not invent one.** A delegate key is not an escape route: the
+pointer write is host-signed, and the derived delegate H160 is unfunded with nonce 0. Wiring
+`authorizeDelegate` on a browser host just adds a fourth thing that fails identically.
+
+**[?] Still open:**
+- Whether the **native container** has this failure mode. Everything traced above is
+  `browse.dev-dot.li`'s SSO channel. Do not assume it generalises.
+- Whether the phone, for a user who *does* hold personhood, calls `set_statement_store_account` for
+  the browser's statement account at pairing time. It is the only mechanism that fits and the QR
+  payload carries exactly the account it would need — but it is `[I]`, read off the browser half of a
+  two-party protocol.
+- Whether a working browser session therefore dies at a **period boundary** (a day). If it does, that
+  and not a lapsed session is what a returning user hits.
 
 ## Frontend / SDK traps
 

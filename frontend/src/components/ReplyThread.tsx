@@ -133,9 +133,16 @@ export function ReplyThread({
       {canReply && (
         <div className="mb-4">
           {!isComposing ? (
+            /* A real button, styled like the other composer-openers. It was text-only, which made
+               the app's second-most-used write affordance look like a caption next to the bordered
+               REFRESH / + NEW THREAD / COPY LINK controls it sits under. Classes copied verbatim
+               from + NEW THREAD in `ForumView` — every one of them is known to build, which is not
+               a given here: a colour must be declared in the `@theme static` block in `index.css`
+               or Tailwind generates no variant for it and the class silently does nothing. */
             <button
+              type="button"
               onClick={() => setIsComposing(true)}
-              className="text-xs font-mono text-primary-500 hover:text-primary-400"
+              className="px-3 py-1 text-xs font-mono text-primary-400 border border-primary-500 hover:bg-primary-900 transition-colors"
             >
               + ADD REPLY ({replyCount})
             </button>

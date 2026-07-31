@@ -35,6 +35,7 @@
 // user to approve a transaction, and suppressing it is exactly what the delegate is for.
 
 import type { BlobCache } from "./blob-cache.ts";
+import { asWriteFailure } from "./host/errors.ts";
 import { decodeObject, encodeObjectBytes, linkFrom, type ChainLink, type WireObject } from "./wire.ts";
 
 export type PutBlob = (bytes: Uint8Array, options?: { contentType?: string }) => Promise<string>;
@@ -196,22 +197,51 @@ export function createPublisher(io: Partial<PublisherIO>): Publisher | null {
     async publish({ registry, build, group, cache }) {
       const chainLink = await link(registry, cache);
       const object = build(chainLink);
-      const cid = await store(object, cache);
-      const { txHash } = await writeHead({
-        registry,
-        group: group ?? NO_GROUP,
-        cid,
-        prev: chainLink.prev ?? "",
-        /**
-         * `storeBlock` is 0 — "unknown", which the contract explicitly permits. It is the Bulletin
-         * block of the store extrinsic, used only to compute the expiry deadline
-         * `storeBlock + RetentionPeriod`, and the write path that actually works on a real host (the
-         * preimage channel) returns no block receipt at all. A fabricated number would produce a
-         * confidently wrong countdown; 0 produces no countdown, which is the truth. See §4a and the
-         * open question in STATUS.md.
-         */
-        storeBlock: 0n,
-      });
+
+      /**
+       * ⭐ THE TWO LEGS FAIL DIFFERENTLY AND MUST SAY SO. `stored` is the whole difference.
+       *
+       * A body failure means nothing was written and retrying is free. A pointer failure means the
+       * words ARE on Bulletin and only the announcement is missing — the user has not lost anything
+       * and must be told that first, because someone who believes they lost what they wrote will not
+       * read the rest of the message.
+       *
+       * This is also the only place that knows which leg failed, which is why the wrapping lives
+       * here rather than in a component. Before it existed the raw host string reached the screen
+       * verbatim: `TxError: createTransaction failed: HostFailure: Submit failed, no allowance set
+       * for account` — accurate, unactionable, and frightening. See `lib/host/errors.ts`.
+       */
+      let cid: string;
+      try {
+        cid = await store(object, cache);
+      } catch (error) {
+        throw asWriteFailure(error, { stored: false });
+      }
+
+      let txHash: string;
+      try {
+        ({ txHash } = await writeHead({
+          registry,
+          group: group ?? NO_GROUP,
+          cid,
+          prev: chainLink.prev ?? "",
+          /**
+           * `storeBlock` is 0 — "unknown", which the contract explicitly permits. It is the Bulletin
+           * block of the store extrinsic, used only to compute the expiry deadline
+           * `storeBlock + RetentionPeriod`, and the write path that actually works on a real host (the
+           * preimage channel) returns no block receipt at all. A fabricated number would produce a
+           * confidently wrong countdown; 0 produces no countdown, which is the truth. See §4a and the
+           * open question in STATUS.md.
+           */
+          storeBlock: 0n,
+        }));
+      } catch (error) {
+        // The body is on Bulletin. It is an orphan — invisible, harmless, and gone within the
+        // retention window — but it is not lost to the person who wrote it, and `stored: true` is
+        // what puts that sentence first in what they read.
+        throw asWriteFailure(error, { stored: true });
+      }
+
       const confirmed = await waitForHead(registry, cid);
       return { cid, txHash, confirmed };
     },

@@ -37,8 +37,10 @@ import { insideContainer, productIdentifier } from './container'
 import { createHostContractWriter } from './contracts'
 import { createDelegate } from './delegate'
 import { createDiagnostics } from './diagnostics'
-import { loadAssetHubDescriptor, loadChainClient, loadCloudStorage, loadHost, loadStatementStore, loadTx, loadWallet, sdkAvailable } from './sdk'
-import type { HostAccount, HostBackend, PaymentsSeam, PutBlobOptions, SignerSeam, TipOutcome } from './types'
+import { classifyWriteFailure, isAllowanceFailure } from './errors'
+import { destinationFromPublicKey, normaliseH160 } from '../recipient'
+import { loadAddress, loadAssetHubDescriptor, loadChainClient, loadCloudStorage, loadHost, loadStatementStore, loadTx, loadWallet, sdkAvailable } from './sdk'
+import type { HostAccount, HostBackend, PaymentsSeam, PutBlobOptions, RecipientResolution, SignerSeam, TipOutcome } from './types'
 import { describe, TIMEOUTS, unwrapParity, withTimeout, type ParityResult } from './util'
 
 export interface HostSessionOptions {
@@ -525,9 +527,49 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
       capabilities: capabilities.get,
       onCapabilities: capabilities.subscribe,
 
+      /**
+       * ⭐ THE SECOND LAZY-ALLOCATION TRIGGER, added 2026-07-31. `putBlob` was the only one.
+       *
+       * That was defensible for POSTS — every post stores a body before it moves a pointer, so
+       * `putBlob` ran first and `ensure()` came with it — but it left every write that is a contract
+       * call and nothing else with no trigger at all: `createProfile`, `authorizeDelegate`,
+       * `setDisplayName`, a vote. Those could reach the host having never asked for an allowance in
+       * the session's life.
+       *
+       * Same three properties as the `putBlob` trigger, and they are the constraints, not the
+       * implementation: it is on the WRITE path only so a reader never sees a dialog; it is awaited
+       * but NEVER GATES, because the host may still allocate implicitly on submission and refusing
+       * to send would disable writing for users who can in fact write; and `ensure()` cannot throw.
+       */
       writeContract: contractWriter
-        ? (address, abi, method, args, label) =>
-            contractWriter.write(address, abi, method, args, label)
+        ? async (address, abi, method, args, label) => {
+            await allowance.ensure()
+            try {
+              return await contractWriter.write(address, abi, method, args, label)
+            } catch (error) {
+              /**
+               * ⚠️ THE FIX FOR THE 2026-07-31 REPLY FAILURE, and it belongs here rather than in
+               * `allowance.ts` because this is the only place that sees a write actually fail.
+               *
+               * A host failure naming an allowance is proof that the persisted claim — possibly
+               * hours old and still inside its 24 h TTL — is worthless. Dropping it is what lets the
+               * NEXT write ask again instead of silently trusting a record the host has refuted.
+               *
+               * It does not retry and does not request: for `no_statement_allowance`, the dominant
+               * case, the allowance request travels the same dead statement-store channel the write
+               * did, so a retry from here would hang and change nothing. See `host/errors.ts`.
+               *
+               * ⚠️ And for that code this is BOOKKEEPING, not a remedy. The missing thing is an
+               * on-chain statement-store slot that only a personhood proof can create; no amount of
+               * re-asking from inside a browser produces one.
+               */
+              const { code } = classifyWriteFailure(error)
+              if (isAllowanceFailure(code)) {
+                allowance.invalidate(`${label} failed with "${code}"`)
+              }
+              throw error
+            }
+          }
         : null,
 
       // Only inside a container: `getPaymentManager()` returns null outside one, and a seam that
@@ -637,44 +679,71 @@ export async function openHostSession(options: HostSessionOptions): Promise<Host
         }
       },
 
-      async resolveRecipient(h160Address) {
-        // ⛔ A LOOKUP, NEVER A COMPUTATION. See `PaymentsSeam.resolveRecipient`.
-        const h160 = h160Address?.trim().toLowerCase()
-        if (!h160 || !/^0x[0-9a-f]{40}$/.test(h160)) return null
+      /**
+       * ⭐ FIXED 2026-07-31 — THIS IS WHY NO RECIPIENT WAS EVER PAYABLE.
+       *
+       * The previous implementation read `Revive.OriginalAccount` with
+       * `client.raw.assetHub._request('state_getStorage', [prefix + address])`. Inside a host
+       * container that call CANNOT succeed for anybody. `createChainClient` runs on
+       * `getHostProvider()`, whose PAPI provider is a hand-written JSON-RPC ↔ TruAPI bridge
+       * (`@parity/product-sdk-host/src/papi-provider.ts`) — a `switch (method)` over exactly
+       * `chainHead_v1_{follow,unfollow,header,body,storage,call,unpin,continue,stopOperation}`,
+       * `chainSpec_v1_{genesisHash,chainName,properties}` and `transaction_v1_{broadcast,stop}`,
+       * whose `default:` branch replies
+       * `-32601 Method "state_getStorage" is not supported by the host`.
+       *
+       * So the lookup threw on every call, the catch returned the same `null` as "no mapping", and
+       * the modal told every user that the person they were trying to tip had "never made a
+       * transaction". That sentence was never about the recipient.
+       *
+       * The typed query below goes through `chainHead_v1_storage`, which the bridge DOES serve —
+       * and the same chain client, against the same Asset Hub descriptor, is what `contracts.ts`
+       * uses for the host-signed write that is verified on a real phone. It returns SS58, so the
+       * seam decodes it back to the 32 bytes `payment.request` wants.
+       */
+      async resolveRecipient(h160Address): Promise<RecipientResolution> {
+        // ⛔ A LOOKUP, NEVER A COMPUTATION. See `lib/recipient.ts`.
+        const h160 = normaliseH160(h160Address)
+        if (!h160) {
+          return { status: 'unavailable', reason: `"${h160Address}" is not a 20-byte address.` }
+        }
         try {
-          const [mod, descriptor] = await Promise.all([
+          const [mod, descriptor, address] = await Promise.all([
             loadChainClient(),
             loadAssetHubDescriptor(options.bulletinNetwork === 'paseo' ? 'paseo' : 'devnet'),
+            loadAddress(),
           ])
           const client = await mod.createChainClient({ chains: { assetHub: descriptor } })
 
-          /**
-           * A RAW storage read, on purpose, for two reasons:
-           *  · the typed path needs papi's `Binary` wrapper, and passing a bare hex string throws
-           *    `value.asBytes is not a function` — which names nothing useful;
-           *  · `Revive.OriginalAccount` is keyed with the IDENTITY hasher, so the key is simply the
-           *    constant pallet+item prefix followed by the 20 address bytes. No hasher is needed at
-           *    runtime, so this costs no dependency.
-           *
-           * The value is 32 raw bytes — exactly the `S.Hex(32)` that `requestPayment.destination`
-           * takes — so there is deliberately no SS58 round trip to get it wrong.
-           * Prefix = twox128("Revive") ++ twox128("OriginalAccount"); verified against live chain.
-           */
-          const PREFIX = '0x735f040a5d490f1107ad9c56f5ca00d2c56ab6c1f203b345fe5879f819627723'
-          const raw = await withTimeout(
-            Promise.resolve(client.raw.assetHub._request('state_getStorage', [PREFIX + h160.slice(2)])),
+          // `StorageDescriptor<[Key: SizedHex<20>], SS58String, true, never>` — `SizedHex` is a
+          // branded plain string, so the bare `0x…` goes in as-is. (The old comment claiming the
+          // typed path needs papi's `Binary` wrapper described an older descriptor generation; this
+          // one has no `Binary` in the key at all.)
+          const ss58 = await withTimeout(
+            Promise.resolve(client.assetHub.query.Revive.OriginalAccount.getValue(h160)),
             TIMEOUTS.connect,
             'OriginalAccount lookup',
           )
-          if (typeof raw !== 'string' || raw.length !== 66) {
+          if (typeof ss58 !== 'string' || !ss58) {
+            // A real answer, and a fact about the recipient: the chain holds no reverse mapping.
             diag.step('payments', 'skip', `${h160} has no Revive.OriginalAccount entry`)
-            return null
+            return { status: 'unmapped' }
           }
-          return raw
+
+          // A DECODE, not a derivation — it recovers the exact bytes the chain encoded. Checked
+          // against the one measured mapping: `5EJ3VTQ…` → `0x62a4c082…903d2f`, which is byte for
+          // byte what the old raw storage read returned. `payment.request.destination` is
+          // `S.Hex(32)` in `@parity/truapi`, so the length check below is the wire contract.
+          const { publicKey } = address.ss58Decode(ss58) as { publicKey: Uint8Array }
+          const destination = destinationFromPublicKey(publicKey)
+          diag.step('payments', 'ok', `${h160} → ${ss58}`)
+          return { status: 'ready', destination }
         } catch (error) {
-          // Refuse rather than guess. An unresolved recipient is a "we will not send" state.
-          diag.step('payments', 'fail', `recipient lookup failed · ${describe(error)}`)
-          return null
+          // ⛔ REFUSE, AND SAY IT WAS US. Never report a failed lookup as a fact about the recipient
+          // — that is exactly the bug this branch used to hide.
+          const reason = describe(error)
+          diag.step('payments', 'fail', `recipient lookup failed · ${reason}`)
+          return { status: 'unavailable', reason }
         }
       },
 

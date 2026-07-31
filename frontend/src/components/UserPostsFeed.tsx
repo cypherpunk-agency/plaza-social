@@ -202,8 +202,12 @@ export function UserPostsFeed({
       {posts.length > 0 && (
         <div className="space-y-4">
           {posts.map((post) => (
+            /* ⚠️ KEYED ON THE CID, NOT `index`. `index` is a POSITION in the loaded page (see
+               `types/contracts.ts`), so a new post arriving shifts every row onto a different key
+               and React remounts the whole list — visible as a flicker on the 30s background poll.
+               The CID is the post's identity and does not move. */
             <PostCard
-              key={post.index}
+              key={post.cid}
               post={post}
               repliesAddress={repliesAddress}
               votingAddress={votingAddress}

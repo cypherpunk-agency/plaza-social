@@ -137,3 +137,47 @@ test('format then parse is the identity for whole-cent amounts', () => {
     assert.equal(ok(formatCash(plancks)), plancks)
   }
 })
+
+/* ------------------------------------------------- the two money units, pinned -- */
+
+test('⭐ the RFC-0006 ↔ RFC-0017 factor is exactly 10^4, and we are on the LEFT of it', () => {
+  // TWO money types live in the same SDK, 10^4 apart, and this is the conversion Parity's own
+  // reference app performs:
+  //
+  //   RFC-0006  `Balance = u128`            base units  → what `payment.request(amount, …)` takes
+  //   RFC-0017  `CoinPaymentBalance = u32`  CENTS       → what `coinPayment.createCheque` takes
+  //
+  //   w3spay: `const plancks = BigInt(input.amountCents) * PLANCKS_PER_CENT` with
+  //           `PLANCKS_PER_CENT = 10^(6-2) = 10_000`.
+  //
+  // ⛔ `parseCash` returns the LEFT-HAND unit — plancks — because `sendTip` calls `payment.request`.
+  // If anything ever routes an amount into a `coinPayment` method it must DIVIDE by this factor, and
+  // the divide must be exact. Handing cents to `payment.request` undercharges by 10_000×; handing
+  // plancks to a cents field overflows a u32 at ~429 CASH and truncates below that.
+  const PLANCKS_PER_CENT = CASH_CENT
+  assert.equal(PLANCKS_PER_CENT, 10n ** BigInt(CASH_DECIMALS - 2))
+  assert.equal(PLANCKS_PER_CENT, 10_000n)
+
+  for (const [text, cents] of [
+    ['0.01', 1n],
+    ['0.10', 10n],
+    ['1.00', 100n],
+    ['5.00', 500n],
+    ['163.84', 16_384n],
+  ] as const) {
+    const plancks = ok(text)
+    assert.equal(plancks % PLANCKS_PER_CENT, 0n, `${text} is not a whole number of cents`)
+    assert.equal(plancks / PLANCKS_PER_CENT, cents)
+    assert.equal(plancks, cents * PLANCKS_PER_CENT)
+  }
+})
+
+test('every parsed amount is expressible as a u32 count of cents at realistic sizes', () => {
+  // `CoinPaymentBalance` is a u32 of cents, so the cents form of anything a person would type must
+  // fit. This is not a limit we impose — it is the one the other unit has — and it is here so that a
+  // future `coinPayment` path cannot silently wrap.
+  const U32_MAX = 4_294_967_295n
+  for (const text of ['0.01', '1.00', '5.00', '9999.99']) {
+    assert.ok(ok(text) / CASH_CENT <= U32_MAX, `${text} overflows a u32 of cents`)
+  }
+})

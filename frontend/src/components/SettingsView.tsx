@@ -4,8 +4,14 @@ import { formatBalance, getFuelEmoji } from '../utils/formatters';
 import { AddressDisplay } from './UserAddress';
 import type { Profile } from '../types/contracts';
 import { FAKE_SCENARIOS, type Capabilities, type DelegationState, type DiagnosticStep } from '../lib/host';
+// Deeper than `lib/host` on purpose, and the only such import above that directory: `asWriteFailure`
+// is not on the barrel's export list yet and `lib/host/index.ts` is owned elsewhere. It pulls in no
+// `@parity/*` — `errors.ts` is pure — so the rule this bends (import from the barrel, never deeper)
+// costs nothing here. Move it to the barrel when that file next changes.
+import { asWriteFailure } from '../lib/host/errors';
 import { useTheme } from '../contexts/ThemeContext';
 import { clearErrors, copyText, formatEntry, subscribeErrors, type ErrorEntry } from '../lib/errors';
+import { reportError } from '../lib/reportError';
 
 // Rewritten for the host-only surface. The old version had two of everything — an "IN-APP WALLET"
 // branch and a "BROWSER WALLET" branch, switched on `walletMode` — because the app used to offer a
@@ -44,6 +50,21 @@ interface SettingsViewProps {
   onAuthorizeDelegate: () => Promise<unknown>;
   onRevokeDelegate: () => Promise<unknown>;
   /**
+   * Ask the CHAIN what it records for this delegate, polling until the reader catches up. Epoch ms,
+   * or `null` for "no live authorisation". `useUserRegistry.confirmDelegate` is the implementation.
+   *
+   * ⭐ THIS IS WHAT MAKES THE SUCCESS MESSAGE TRUE rather than hopeful. Without it the best this
+   * screen can know is what the seam *believes*, and the seam's belief is set from `Date.now()` the
+   * moment its own call resolves — see `lib/host/delegate.ts`, which marks that expiry "provisional"
+   * in as many words. A user pressed AUTHORISE on a real phone, was told the key was authorised,
+   * and then had to sign the very next action; the seam had resolved without writing anything.
+   *
+   * ⚠️ OPTIONAL, and unwired at the time of writing, because passing it means editing `App.tsx`.
+   * When it is absent this screen DOWNGRADES its message to "sent, watch the line above" rather than
+   * claiming a confirmation it cannot have. It never upgrades a guess into a success.
+   */
+  onConfirmDelegate?: (delegateAddress: string) => Promise<number | null>;
+  /**
    * Re-ask the host for its resource allowances. Distinct from everything else here because it is the
    * ONE path that deliberately bypasses the once-per-session latch — see `lib/host/allowance.ts`.
    */
@@ -75,6 +96,7 @@ export function SettingsView({
   delegation,
   onAuthorizeDelegate,
   onRevokeDelegate,
+  onConfirmDelegate,
   onRequestAllowanceAgain,
 }: SettingsViewProps) {
   const { theme, setTheme } = useTheme();
@@ -134,6 +156,23 @@ export function SettingsView({
     }
   };
 
+  /**
+   * ⛔ THIS USED TO RUN THE POSTING-KEY BUTTONS TOO, AND THAT WAS THE BUG.
+   *
+   * `await action(); toast.success(done)` treats a RESOLVED PROMISE as a CONFIRMED WRITE, and for
+   * the delegate the two are not the same thing in any of the three layers underneath it:
+   *
+   *   · `lib/host/session.ts` `authorizeDelegate` is still a STUB — it records a diagnostics line
+   *     and returns `delegate.state()`. It resolves, having touched no chain at all.
+   *   · `lib/host/delegate.ts` `authorize()` CATCHES every failure by design (nothing there may ever
+   *     block a write) and returns state. A rejected signature resolves here too.
+   *   · even a real success sets `expiresAt` from `Date.now()`, which that file itself calls
+   *     provisional — the value the contract stored is a different fact.
+   *
+   * So the posting-key buttons now go through `runVerifiedDelegateAction` below, which asks what the
+   * state actually is before it says anything. This one survives for the allowance re-request, where
+   * "the host answered" IS the whole of the claim being made.
+   */
   const runDelegateAction = async (action: () => Promise<unknown>, running: string, done: string) => {
     setIsSettingUp(true);
     const toastId = toast.loading(running);
@@ -141,7 +180,118 @@ export function SettingsView({
       await action();
       toast.success(done, { id: toastId });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'That did not work', { id: toastId });
+      toast.dismiss(toastId);
+      reportError('ask the host for an allowance', asWriteFailure(err, { stored: false }));
+    } finally {
+      setIsSettingUp(false);
+    }
+  };
+
+  /**
+   * The seam's own belief about the delegation, dug out of whatever `authorizeDelegate` returned.
+   *
+   * Structural rather than typed because the prop is `() => Promise<unknown>`: the seam returns a
+   * `DelegationState | null`, and an expiry in the past or absent both mean "no authorisation".
+   * This is the WEAK signal — it is what the app thinks, not what the chain says.
+   */
+  const claimedExpiry = (result: unknown): number | null => {
+    const value = (result as { expiresAt?: unknown } | null | undefined)?.expiresAt;
+    return typeof value === 'number' && value > Date.now() ? value : null;
+  };
+
+  /**
+   * The one error we raise ourselves, for the case that has no exception to report: everything
+   * resolved and the authorisation still is not there.
+   *
+   * Not routed through `asWriteFailure` on purpose — that classifier's copy is written for a POST
+   * ("your post is saved, but…"), and nothing was posted here. A raw `Error` is enough: `summarise()`
+   * takes the message for the toast and `detailOf()` walks `cause` into the copyable detail, which is
+   * where the "go and read the diagnostics" instruction belongs.
+   */
+  const unconfirmed = (what: string, why: string) =>
+    new Error(`The posting key was not ${what} — nothing reached the chain, so this changed nothing.`, {
+      cause: new Error(
+        `${why}\n\nOpen DIAGNOSTICS below and read the "Posting key (delegate)" lines. If one names ` +
+          'an allowance ("no allowance set for account"), the browser session cannot reach your ' +
+          'phone to sign at all — sign in to the Polkadot app again first.',
+      ),
+    });
+
+  /**
+   * ⚠️ NEVER CLAIM SUCCESS THE APP CANNOT SEE. Three outcomes, and only the first is a success:
+   *
+   *   1. the CHAIN shows it (`onConfirmDelegate` polled and found it) → say so, with the date;
+   *   2. the chain read is unavailable but the seam claims an expiry → say it was SENT, and point at
+   *      the live line above, which is the one thing on this screen that cannot go stale;
+   *   3. anything else → `reportError`, which is short in the toast, tap-to-copy, and durable in
+   *      RECENT ERRORS — the only console a phone user has.
+   *
+   * Outcome 2 is a deliberate downgrade, not a hedge for its own sake. It is honest about the one
+   * thing the user needs: whether they still have to sign every post.
+   */
+  const runVerifiedDelegateAction = async (options: {
+    action: () => Promise<unknown>;
+    expect: 'authorised' | 'revoked';
+    running: string;
+    context: string;
+  }) => {
+    const { action, expect, running, context } = options;
+    const address = delegation?.address ?? null;
+    setIsSettingUp(true);
+    const toastId = toast.loading(running);
+    try {
+      const result = await action();
+
+      // The chain read, when we have one. `confirmDelegate` polls, because the host settles at
+      // best-block and we read through a separate RPC that trails it — one read is not evidence.
+      if (onConfirmDelegate && address) {
+        const onChain = await onConfirmDelegate(address);
+        const settled = expect === 'authorised' ? onChain !== null : onChain === null;
+        if (settled) {
+          toast.success(
+            expect === 'authorised'
+              ? `Posting key authorised until ${new Date(onChain!).toLocaleDateString()}.`
+              : 'Posting key revoked. Every post will ask you to sign again.',
+            { id: toastId },
+          );
+          return;
+        }
+        toast.dismiss(toastId);
+        reportError(
+          context,
+          unconfirmed(
+            expect,
+            `Plaza asked, waited, and re-read UserRegistry — the ${
+              expect === 'authorised' ? 'authorisation is still absent' : 'authorisation is still there'
+            }.`,
+          ),
+        );
+        return;
+      }
+
+      // No chain read wired. Fall back to the seam's belief, and word the message so it promises
+      // nothing about the chain.
+      const claimed = expect === 'authorised' ? claimedExpiry(result) !== null : result === true;
+      if (claimed) {
+        toast(
+          expect === 'authorised'
+            ? 'Sent. The line above will read "authorised for N more days" once it has gone through — if it still says "not authorised yet", it did not.'
+            : 'Sent. The line above will say so once it has gone through.',
+          { id: toastId, icon: 'i', duration: 8000 },
+        );
+        return;
+      }
+
+      toast.dismiss(toastId);
+      reportError(
+        context,
+        unconfirmed(expect, 'Plaza asked, and the answer that came back carried no authorisation.'),
+      );
+    } catch (err) {
+      toast.dismiss(toastId);
+      // `asWriteFailure` gives the allowance failure that is currently breaking every host-signed
+      // write its own readable sentence and remedy, rather than us inventing a second wording for it.
+      reportError(context, asWriteFailure(err, { stored: false }));
     } finally {
       setIsSettingUp(false);
     }
@@ -221,6 +371,26 @@ export function SettingsView({
                     fake backend tests is the copy a user reads. */}
                 <p className="text-primary-500 text-xs leading-relaxed">{delegation.reason}</p>
 
+                {/*
+                  ⚠️ A CORRECTION, NOT DECORATION. The sentence above ends "…your next post will set
+                  it up with one extra signature", and posting does not do that. `usePublisher`'s
+                  `writeHead` calls `setHead` host-signed and nothing on the publish path ever calls
+                  `authorizeDelegate` — its own comment says the branch goes in "when
+                  `authorizeDelegate` lands". So the promise is of an automatic step that does not
+                  exist, and a user who posts twice waiting for it to stop asking will just be asked
+                  twice.
+
+                  ⛔ THE STRING ITSELF CANNOT BE FIXED FROM HERE. It is `explain()` in
+                  `lib/host/delegate.ts`, mirrored word-for-word in `lib/host/fake.ts`; both are
+                  owned elsewhere. Delete this paragraph the moment that sentence stops promising it.
+                */}
+                {!delegation.expiresAt && (
+                  <p className="text-yellow-500 text-xs leading-relaxed">
+                    Posting does not set this up on its own today — use AUTHORISE below. Until then
+                    every post costs one signature.
+                  </p>
+                )}
+
                 {delegation.address && (
                   <div className="flex items-center justify-between">
                     <span className="text-primary-400">Key:</span>
@@ -228,14 +398,38 @@ export function SettingsView({
                   </div>
                 )}
 
-                {delegation.balance !== null && (
-                  <div className="flex items-center justify-between">
-                    <span className="text-primary-400">Balance:</span>
-                    <span className={delegation.lowOnFunds ? 'text-red-400' : 'text-accent-400'}>
-                      {formatBalance(delegation.balance)} PAS {getFuelEmoji(delegation.balance)}
-                    </span>
-                  </div>
-                )}
+                {/*
+                  ⚠️ AN EMPTY POSTING KEY IS THE NORMAL STATE, AND RED SAID OTHERWISE.
+                  `lowOnFunds` is true whenever the balance is under the low-water mark, which for a
+                  key that has never been authorised is ALWAYS: the delegate is a locally derived
+                  H160 that nobody funds — "balance 0.0, nonce 0" [V] 2026-07-30, gotchas.md
+                  § Host-signed contract writes. Rendering `0.0000 PAS` in red with a red fuel dot
+                  reported a fault where there is none, on the one screen a user visits when they
+                  already suspect something is broken.
+                  Funds only start to mean anything once there IS a delegation to spend against — a
+                  delegated write pays its own fee — so the alarm is scoped to that case and the
+                  normal case gets a plain reading plus the reason it is zero.
+                */}
+                {delegation.balance !== null &&
+                  (delegation.expiresAt ? (
+                    <div className="flex items-center justify-between">
+                      <span className="text-primary-400">Balance:</span>
+                      <span className={delegation.lowOnFunds ? 'text-red-400' : 'text-accent-400'}>
+                        {formatBalance(delegation.balance)} PAS {getFuelEmoji(delegation.balance)}
+                      </span>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center justify-between">
+                        <span className="text-primary-400">Balance:</span>
+                        <span className="text-primary-500">{formatBalance(delegation.balance)} PAS</span>
+                      </div>
+                      <p className="text-primary-600 text-xs leading-relaxed">
+                        Empty is expected — nothing funds this key until it is authorised, and it only
+                        ever holds a small float for its own fees.
+                      </p>
+                    </>
+                  ))}
 
                 {delegation.expiresAt && (
                   <div className="flex items-center justify-between">
@@ -251,12 +445,14 @@ export function SettingsView({
                 {delegation.derived && (
                   <div className="flex gap-2">
                     <button
+                      type="button"
                       onClick={() =>
-                        runDelegateAction(
-                          onAuthorizeDelegate,
-                          'Authorising the posting key...',
-                          'Posting key authorised.',
-                        )
+                        runVerifiedDelegateAction({
+                          action: onAuthorizeDelegate,
+                          expect: 'authorised',
+                          running: 'Authorising the posting key...',
+                          context: 'authorise the posting key',
+                        })
                       }
                       disabled={isSettingUp}
                       className="flex-1 py-2 bg-accent-900 hover:bg-accent-800 text-accent-400 border-2 border-accent-500 text-xs disabled:opacity-70 transition-all"
@@ -265,8 +461,14 @@ export function SettingsView({
                     </button>
                     {delegation.expiresAt && (
                       <button
+                        type="button"
                         onClick={() =>
-                          runDelegateAction(onRevokeDelegate, 'Revoking...', 'Posting key revoked.')
+                          runVerifiedDelegateAction({
+                            action: onRevokeDelegate,
+                            expect: 'revoked',
+                            running: 'Revoking...',
+                            context: 'revoke the posting key',
+                          })
                         }
                         disabled={isSettingUp}
                         className="flex-1 py-2 bg-gray-900 hover:bg-gray-800 text-gray-400 border-2 border-gray-600 text-xs disabled:opacity-70 transition-all"

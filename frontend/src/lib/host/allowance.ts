@@ -28,11 +28,33 @@
 //    paragraph scopes "opportunistic" to BY NAME. Every one has implicit fulfilment, so the worst
 //    case of a stale claim is an implicit allocation on submission — i.e. the documented behaviour.
 //    That is the difference between one dialog per page load and one dialog per day.
+//
+// 4. ⭐ A PERSISTED CLAIM MUST BE DESTROYABLE BY EVIDENCE. `invalidate()`, added 2026-07-31.
+//
+//    This is the bug that broke replies. On 2026-07-30 ~22:22 a claim was written and two threads
+//    published. At 06:46 the next morning — 8h later, well inside the 24 h TTL — a reply failed with
+//
+//        TxError: createTransaction failed: HostFailure: Submit failed, no allowance set for account
+//
+//    and the claim latch meant we had not even asked. "The latch caches the attempt, not the answer"
+//    is right; what was missing is that a WRITE FAILURE NAMING AN ALLOWANCE IS PROOF THE CLAIM IS
+//    WORTHLESS. Rules 1–3 all concern not nagging a user who has not contradicted us. Here the host
+//    contradicted us. So the claim dies and the next write asks again.
+//
+//    ⚠️ NOT a shorter TTL. A shorter TTL trades one dialog a day for several and still leaves the
+//    window in which we trust a claim the host has already refuted. Invalidation is the correct
+//    shape: the TTL bounds the guess, evidence overrides it.
+//
+//    ⛔ BUT DO NOT READ RULE 4 AS A FIX FOR THAT FAILURE. It is hygiene. The 2026-07-31 failure was
+//    never about a stale claim: on a browser host the write dies in the statement store, whose
+//    allowance is personhood-gated on chain and cannot be obtained by asking the host again, by
+//    signing in again, or by anything else this file does. Corrected the same day, one day after the
+//    "sign in again" copy shipped. See `errors.ts` § `no_statement_allowance`.
 // ═════════════════════════════════════════════════════════════════════════════════════════════════
 
-import type { AllocationOutcome, Diagnostics } from './types'
-import { describe, describeAge, TIMEOUTS, unwrapParity, withTimeout } from './util'
-import { loadHost } from './sdk'
+import type { AllocationOutcome, Diagnostics } from './types.ts'
+import { describe, describeAge, TIMEOUTS, unwrapParity, withTimeout } from './util.ts'
+import { loadHost } from './sdk.ts'
 
 /**
  * The resources Plaza asks the host to pre-allocate. Requested as ONE batch so the user sees one
@@ -76,12 +98,65 @@ import { loadHost } from './sdk'
  * check this before assuming anything else — do not misdiagnose it as a permissions problem.
  */
 const PLAZA_RESOURCES: Array<{ tag: string; value?: number }> = [
-  // Pre-warmed PGAS for the contract account. `value` is the derivation index; 0 is the product
-  // account we sign with. Worth keeping but NOT a fix for anything: RFC-0010 makes pre-warming a
-  // latency optimisation — the account implicitly claims a slot when it is about to pay fees and
-  // does not hold enough, so steady-state signing works without it.
+  /**
+   * Pre-warmed PGAS for the contract account. `value` is the derivation index and **0 is correct** —
+   * every product-account path in the SDK defaults to 0 (`getProductAccount(dotNsIdentifier,
+   * derivationIndex = 0)`, `HostSigner`'s `derivationIndex = 0`), and `contracts.ts` signs with the
+   * account that seam hands back, so 0 is the account we actually sign with. **[V]** 2026-07-31.
+   *
+   * ⚠️ BUT IT IS NOT THE ALLOWANCE A CONTRACT WRITE CONSULTS, AND ASKING FOR IT FIXES NOTHING.
+   * Two independent readings, both **[V]** 2026-07-31 against the live host bundle
+   * `https://browse.dev-dot.li/assets/auth-BuYgQyky.js`:
+   *
+   *   · The host's persisted allowance record is
+   *     `{ productId, resource: O({ bulletin, statementStore }), slotAccountKey }`, and its
+   *     tag mapper is exactly two cases —
+   *     `bulletin → {tag:'BulletInAllowance'}`, `statementStore → {tag:'StatementStoreAllowance'}`.
+   *     **There is no smart-contract case and no storage slot for one.** So this entry is inert on
+   *     the host we ship inside. It is kept because RFC-0010 defines it and a future host may honour
+   *     it, not because it does anything today.
+   *   · RFC-0010 makes pre-warming a latency optimisation anyway: the account implicitly claims a
+   *     slot when it is about to pay fees and does not hold enough.
+   *
+   * What a contract write really needs is `StatementStoreAllowance` — see the note below it.
+   */
   { tag: 'SmartContractAllowance', value: 0 },
+  /**
+   * ⭐ THIS IS THE ONE A CONTRACT WRITE DEPENDS ON, and nothing about its name says so.
+   *
+   * **[V]** 2026-07-31, read out of `auth-BuYgQyky.js`: the web host talks to the paired phone over
+   * an SSO-v2 channel **whose transport is the statement store**. Every request it forwards —
+   * `createTransaction`, `signRaw`, `getRingVrfAlias`, and `requestResourceAllocation` itself — goes
+   * through one `c.request(...)` → `submitRequestMessage` → `prover.generateMessageProof(...)`
+   * `.andThen(statementStore.submitStatement)`.
+   *
+   * So the string `"Submit failed, no allowance set for account"` is a STATEMENT-STORE rejection
+   * (`{tag:'rejected', reason:'noAllowance'}` → one of a family with `noProof` / `badProof` /
+   * `encodingTooLarge` / `accountFull` / `storeFull` / `expiryTooLow`). Nothing in that family
+   * concerns gas, PGAS, deposits or pallet-revive. A contract call fails there because the request
+   * could not be SHIPPED to the phone to be signed — it never reached a chain.
+   *
+   * ⚠️ CONSEQUENCE, and it is why `invalidate()` is bookkeeping rather than a remedy:
+   * `requestResourceAllocation` travels the SAME dead channel, so "re-request and retry" cannot work
+   * for this failure and must never be promised to the user.
+   *
+   * ⛔ **AND NEITHER CAN SIGNING IN AGAIN. This paragraph asserted that it could, for one day.**
+   * **[V] 2026-07-31**: on the chain that serves `statement_submit`, a statement-store allowance has
+   * one source — `Resources.set_statement_store_account`, whose origin requires an anonymous ring-VRF
+   * **personhood** proof (`RegisterStatementStoreAllowance`) over `People`/`LitePeople`. Pairing is
+   * read-only on the browser side, so a fresh login neither tests nor obtains one; it mints a new
+   * random statement account that needs the same grant. `host/errors.ts` classifies this as
+   * `no_statement_allowance` and points at the in-app route instead. See
+   * `contracts/scripts/probe-statement-allowance.mjs` and gotchas.
+   */
   { tag: 'StatementStoreAllowance', value: undefined },
+  /**
+   * The Bulletin slot allowance. The host keeps a `slotAccountKey` for this one, which is why a
+   * post's BODY still stores while its POINTER fails: the body goes out over the preimage channel
+   * signed with a key the browser holds locally, and needs no round-trip to the phone at all
+   * (`auth-BuYgQyky.js` contains no preimage handler — that path is elsewhere and does not use the
+   * SSO channel). Exactly the asymmetry the 2026-07-31 reply failure showed.
+   */
   { tag: 'BulletinAllowance', value: undefined },
 ]
 
@@ -144,6 +219,16 @@ function writeClaim(address: string | null, outcomes: string): void {
   }
 }
 
+/** Same no-throw contract as the other two: a store that cannot be cleared is slow, never broken. */
+function clearClaim(address: string | null): void {
+  if (!address) return
+  try {
+    globalThis.localStorage?.removeItem(claimKey(address))
+  } catch {
+    /* the in-memory latch is cleared regardless, so this page load still re-asks */
+  }
+}
+
 export interface AllowanceGate {
   /**
    * ⚠️ MUST NOT BE CALLED FROM A READ PATH. The entire point is that a visitor who only reads never
@@ -162,6 +247,21 @@ export interface AllowanceGate {
    * way out of a "deny" the user regrets.
    */
   requestAgain: () => Promise<AllocationOutcome[] | null>
+  /**
+   * ⭐ THROW THE CLAIM AWAY because the host has contradicted it. See rule 4 in the header.
+   *
+   * Call this — and ONLY this — from a write that failed for want of an allowance. It clears both
+   * halves of the latch, so the next write asks the host again instead of trusting a record that a
+   * real failure has already refuted.
+   *
+   * ⚠️ IT DOES NOT REQUEST, AND MUST NOT. Requesting here would put a dialog on top of an error
+   * dialog, and for the failure that actually produces this (`no_statement_allowance`) the request travels the
+   * same dead channel the write did, so it would hang for the host's four-minute queue timeout and
+   * then change nothing. Its whole job is bookkeeping: make the NEXT attempt honest.
+   *
+   * Never throws.
+   */
+  invalidate: (reason: string) => void
   /** What the load path may safely report: whether the FIRST write will show a dialog. Reads only localStorage. */
   describeDeferred: () => string
   /** Called on reconnect. Clears the in-memory latch only — it never requests, so no dialog appears. */
@@ -171,9 +271,19 @@ export interface AllowanceGate {
 export function createAllowanceGate({
   address,
   diagnostics: diag,
+  request,
 }: {
   address: () => string | null
   diagnostics: Diagnostics
+  /**
+   * Injected for tests only. Defaults to the real host call.
+   *
+   * `publish.ts` takes its chain access as functions for exactly this reason: the write path runs
+   * inside a container, i.e. on a phone, where every bug costs a deploy to see. The latch's
+   * ask/don't-ask decision is the part of this file that was wrong, so it needs to be assertable
+   * without a host.
+   */
+  request?: (resources: Array<{ tag: string; value?: number }>) => Promise<AllocationOutcome[] | null>
 }): AllowanceGate {
   /** Holds the in-flight-or-settled promise of the one allocation request this session makes. */
   let inFlight: Promise<AllocationOutcome[] | null> | null = null
@@ -185,19 +295,24 @@ export function createAllowanceGate({
   ): Promise<AllocationOutcome[] | null> {
     const who = address()
     try {
-      const host = await loadHost()
-      if (host?.__parityStub === true) {
+      const outcomes = request
+        ? await request(resources)
+        : await (async () => {
+            const host = await loadHost()
+            if (host?.__parityStub === true) return null
+            return unwrapParity<AllocationOutcome[]>(
+              await withTimeout(
+                host.requestResourceAllocation(resources),
+                TIMEOUTS.allowance,
+                'Resource allocation',
+              ),
+              'Resource allocation',
+            )
+          })()
+      if (!outcomes) {
         diag.step('allowance', 'skip', 'the Products SDK is not installed in this build')
         return null
       }
-      const outcomes = unwrapParity<AllocationOutcome[]>(
-        await withTimeout(
-          host.requestResourceAllocation(resources),
-          TIMEOUTS.allowance,
-          'Resource allocation',
-        ),
-        'Resource allocation',
-      )
       // Outcomes come back POSITIONALLY, so name them — "Rejected, Allocated, Allocated" is
       // unreadable, and the three entries differ in how much anyone should care.
       const named = outcomes
@@ -247,6 +362,17 @@ export function createAllowanceGate({
       const promise = allocate(PLAZA_RESOURCES, 'explicit retry')
       inFlight = promise
       return promise
+    },
+
+    invalidate(reason) {
+      inFlight = null
+      clearClaim(address())
+      diag.step(
+        'allowance',
+        'skip',
+        `cached grant discarded — ${reason}. The next write will ask the host again rather than ` +
+          `trust a claim a real failure has already contradicted.`,
+      )
     },
 
     describeDeferred() {

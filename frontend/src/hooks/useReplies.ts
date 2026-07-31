@@ -6,6 +6,13 @@ import { createBlobCache, browserPersistence } from "../lib/blob-cache";
 import { walkChain } from "../lib/walk";
 import { encodePost, validatePostDraft } from "../lib/wire";
 import { threadRegistryId } from "../lib/registry";
+import {
+  POLL_INTERVAL_MS,
+  createRefreshGate,
+  refresh,
+  startPolling,
+  type RefreshMode,
+} from "../lib/poll";
 import { NO_WRITE_SESSION } from "../lib/publish";
 import { usePublisher } from "./usePublisher";
 import { gatewayFetcher } from "../lib/gateways";
@@ -86,7 +93,15 @@ interface UseRepliesReturn {
   replies: Reply[];
   /** ⚠️ Replies LOADED, not replies that exist. A page is capped and history can expire. */
   replyCount: number;
+  /** True only for a COLD load — nothing on screen yet. Safe to render a skeleton. */
   isLoading: boolean;
+  /**
+   * True while a BACKGROUND poll is in flight, with the previous replies still on screen.
+   *
+   * ⚠️ NEVER unmount the conversation on this — see `lib/poll.ts`. It exists so a UI *can* show a
+   * subtle "updating" hint; nothing is obliged to consume it.
+   */
+  isRefreshing: boolean;
   error: string | null;
   /** False when this session cannot write. Gate the composer on THIS, never on `signer`. */
   canReply: boolean;
@@ -111,9 +126,31 @@ export function useReplies({
   const publisher = usePublisher();
   const [replies, setReplies] = useState<Reply[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const pollIntervalRef = useRef<number | null>(null);
+  /**
+   * The last committed list, mirrored into a ref.
+   *
+   * ⚠️ THE EQUALITY SKIP MUST READ THIS, NOT `replies`. A `useCallback` closes over the `replies` of
+   * the render that created it, so comparing against the state value would compare against data from
+   * an earlier poll and commit a "change" that is not one. Everything that writes `replies` goes
+   * through `commitReplies` so the two can never drift.
+   */
+  const repliesRef = useRef<Reply[]>([]);
+  const commitReplies = useCallback((next: Reply[]) => {
+    repliesRef.current = next;
+    setReplies(next);
+  }, []);
+
+  /**
+   * Orders concurrent loads. ⚠️ LOAD-BEARING HERE IN PARTICULAR, because `addReply` reloads
+   * immediately after a write and that reload races the 30-second poll. Without the gate, a poll
+   * that snapshotted the chain before the write but resolves after the reload commits the pre-write
+   * list — and the reply the user just published disappears until the next tick, with no error,
+   * because the write itself succeeded. See `lib/poll.ts` § RefreshGate.
+   */
+  const gate = useMemo(() => createRefreshGate(), []);
 
   /** Derived in exactly one place — `lib/registry.ts`. Null parent ⇒ null id ⇒ no reads, no writes. */
   const registryId = useMemo(() => threadRegistryId(parentCid), [parentCid]);
@@ -129,96 +166,127 @@ export function useReplies({
     [repliesAddress, provider]
   );
 
-  const loadReplies = useCallback(async () => {
+  /**
+   * The FETCH half: reads the chain and returns a list. It touches no state and announces nothing.
+   *
+   * Keeping it pure is what lets `lib/poll.ts` decide whether this load is allowed to blank the
+   * screen. The old shape — one function that set `isLoading` and `[]` before fetching, re-entered
+   * by a 30-second interval — made a populated conversation empty twice a minute and then
+   * repopulate, which is the flicker reported from a real device.
+   */
+  const fetchReplies = useCallback(async (): Promise<Reply[]> => {
     const contract = getReadContract();
-    if (!contract || !registryId) {
-      setReplies([]);
-      return;
-    }
+    if (!contract || !registryId) return [];
 
-    try {
-      setIsLoading(true);
-      setError(null);
+    // One head per replier, sorted newest-first by the contract. Cost grows with the number of
+    // people who replied, not with the number of replies.
+    const [refs] = await contract.getHeadsPaged(registryId, 0, PAGE);
 
-      // One head per replier, sorted newest-first by the contract. Cost grows with the number of
-      // people who replied, not with the number of replies.
-      const [refs] = await contract.getHeadsPaged(registryId, 0, PAGE);
+    const heads = (refs as OnChainHead[])
+      // A writer banned after the fact keeps their row; moderation is a write gate plus a hide
+      // flag, never a delete, because freeing storage would refund the wrong person.
+      .filter((ref) => ref.allowed && ref.cid)
+      .map((ref) => ({
+        cid: ref.cid,
+        prev: ref.prev || null,
+        // ⚠️ SECONDS on chain, milliseconds everywhere above this line.
+        at: ref.movedAt > 0n ? Number(ref.movedAt) * 1000 : null,
+        by: ref.by,
+        block: ref.storeBlock > 0n ? Number(ref.storeBlock) : null,
+        index: null,
+      }));
 
-      const heads = (refs as OnChainHead[])
-        // A writer banned after the fact keeps their row; moderation is a write gate plus a hide
-        // flag, never a delete, because freeing storage would refund the wrong person.
-        .filter((ref) => ref.allowed && ref.cid)
-        .map((ref) => ({
-          cid: ref.cid,
-          prev: ref.prev || null,
-          // ⚠️ SECONDS on chain, milliseconds everywhere above this line.
-          at: ref.movedAt > 0n ? Number(ref.movedAt) * 1000 : null,
-          by: ref.by,
-          block: ref.storeBlock > 0n ? Number(ref.storeBlock) : null,
-          index: null,
-        }));
+    // A conversation with no replies yet is a RESULT, not a failure — returned and diffed like any
+    // other, so a poll that keeps finding nothing commits nothing and re-renders nothing.
+    if (heads.length === 0) return [];
 
-      if (heads.length === 0) {
-        setReplies([]);
+    const page = await walkChain({ heads, cache, limit: PAGE });
+
+    // `walkChain` emits newest-first across the merged branches. A conversation reads oldest-first,
+    // so reverse HERE rather than asking the walk for a different order — the merge has to be
+    // newest-first to be a k-way merge at all.
+    const ordered = [...page.entries].reverse();
+
+    const formatted = await Promise.all(
+      ordered.map(async (entry, index): Promise<Reply> => {
+        const decoded = entry.object;
+        // `decoded.author` is what the object CLAIMS; `entry.author` is the index's attribution,
+        // which is the only one that is actually authenticated. Prefer the object, fall back.
+        const author = decoded?.author || entry.author || "";
+
+        let displayName: string | undefined;
+        if (getDisplayName && author) {
+          try {
+            displayName = await getDisplayName(author);
+          } catch {
+            displayName = undefined;
+          }
+        }
+
+        // A hole: the body expired from Bulletin, or no gateway would serve it. The pointer is
+        // still on chain, so the reply is real — it is the CONTENT that is gone, and calling that
+        // "deleted" would be wrong. Retention expiry is this design's only deletion mechanism.
+        const content = !decoded
+          ? "(this reply's body has expired from Bulletin storage)"
+          : decoded.kind === "post" || decoded.kind === "msg"
+            ? decoded.body
+            : decoded.kind === "thread"
+              ? decoded.excerpt
+              : "";
+
+        return {
+          index,
+          cid: entry.cid,
+          author,
+          sender: entry.author || author,
+          content,
+          timestamp: decoded?.at ?? entry.at ?? 0,
+          editedAt: null,
+          isDeleted: false,
+          displayName,
+        };
+      })
+    );
+
+    return formatted;
+  }, [getReadContract, registryId, cache, getDisplayName]);
+
+  /**
+   * The ANNOUNCE half. `mode` decides whether this load may blank the screen.
+   *
+   * - `"cold"` — nothing on screen yet, or we just switched to a different parent post.
+   * - `"background"` — the 30-second poll, and the reload after a write. Keeps the current replies
+   *   up, raises `isRefreshing` instead of `isLoading`, commits only if the data actually differs,
+   *   and on failure keeps the last good conversation rather than blanking it.
+   *
+   * ⛔ Never infer the mode from `replies.length === 0`: a thread with no replies yet would then
+   * alternate between the two behaviours forever, which is the flicker again with extra steps.
+   */
+  const loadReplies = useCallback(
+    async (mode: RefreshMode = "cold"): Promise<void> => {
+      if (!getReadContract() || !registryId) {
+        // No contract, or a parent whose CID has not resolved. A cold entry shows the empty state;
+        // a background tick does nothing rather than blanking a conversation that is still good.
+        if (mode === "cold") commitReplies([]);
         return;
       }
-
-      const page = await walkChain({ heads, cache, limit: PAGE });
-
-      // `walkChain` emits newest-first across the merged branches. A conversation reads oldest-first,
-      // so reverse HERE rather than asking the walk for a different order — the merge has to be
-      // newest-first to be a k-way merge at all.
-      const ordered = [...page.entries].reverse();
-
-      const formatted = await Promise.all(
-        ordered.map(async (entry, index): Promise<Reply> => {
-          const decoded = entry.object;
-          // `decoded.author` is what the object CLAIMS; `entry.author` is the index's attribution,
-          // which is the only one that is actually authenticated. Prefer the object, fall back.
-          const author = decoded?.author || entry.author || "";
-
-          let displayName: string | undefined;
-          if (getDisplayName && author) {
-            try {
-              displayName = await getDisplayName(author);
-            } catch {
-              displayName = undefined;
-            }
-          }
-
-          // A hole: the body expired from Bulletin, or no gateway would serve it. The pointer is
-          // still on chain, so the reply is real — it is the CONTENT that is gone, and calling that
-          // "deleted" would be wrong. Retention expiry is this design's only deletion mechanism.
-          const content = !decoded
-            ? "(this reply's body has expired from Bulletin storage)"
-            : decoded.kind === "post" || decoded.kind === "msg"
-              ? decoded.body
-              : decoded.kind === "thread"
-                ? decoded.excerpt
-                : "";
-
-          return {
-            index,
-            cid: entry.cid,
-            author,
-            sender: entry.author || author,
-            content,
-            timestamp: decoded?.at ?? entry.at ?? 0,
-            editedAt: null,
-            isDeleted: false,
-            displayName,
-          };
-        })
-      );
-
-      setReplies(formatted);
-    } catch (err) {
-      console.error("Failed to load replies:", err);
-      setError(err instanceof Error ? err.message : "Failed to load replies");
-    } finally {
-      setIsLoading(false);
-    }
-  }, [getReadContract, registryId, cache, getDisplayName]);
+      await refresh<Reply[]>({
+        mode,
+        gate,
+        sinks: {
+          setData: commitReplies,
+          setLoading: setIsLoading,
+          setRefreshing: setIsRefreshing,
+          setError,
+        },
+        load: fetchReplies,
+        previous: () => repliesRef.current,
+        message: (err) => (err instanceof Error ? err.message : "Failed to load replies"),
+        onError: (err) => console.error("Failed to load replies:", err),
+      });
+    },
+    [getReadContract, registryId, fetchReplies, commitReplies, gate]
+  );
 
   const addReply = useCallback(
     async (content: string): Promise<void> => {
@@ -255,7 +323,13 @@ export function useReplies({
           }),
       });
 
-      await loadReplies();
+      // BACKGROUND, and correct on both counts. The conversation is already on screen above the
+      // composer, so a cold load here would empty the very thread the user just replied to. And the
+      // new reply cannot be missed by the equality skip: a list with one more entry differs on
+      // LENGTH, which `deepEqual` checks before it compares any element. If the reply genuinely is
+      // not visible to the read RPC yet, the fetch returns the identical list, nothing commits, and
+      // `confirmed` is false — which is what the message below is for.
+      await loadReplies("background");
       if (!confirmed) {
         // The write went through — the head move returned a transaction hash — but the read RPC had
         // not caught up. Saying so beats a list that silently has not changed yet.
@@ -287,28 +361,47 @@ export function useReplies({
 
   useEffect(() => {
     if (repliesAddress && provider && registryId) {
-      loadReplies();
+      // COLD, and the only cold entry point: the address, the provider or the PARENT POST just
+      // changed, so whatever is on screen belongs to a different conversation entirely.
+      void loadReplies("cold");
     } else {
-      setReplies([]);
+      commitReplies([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repliesAddress, provider, registryId]);
 
+  /**
+   * Always call the LATEST loader through a ref.
+   *
+   * `loadReplies` changes identity whenever `getDisplayName` does, and an interval effect that
+   * depends on it is torn down and restarted on every such render — which on an unstable
+   * `getDisplayName` means the 30 seconds never elapse and the poll silently never fires. The ref
+   * keeps the effect's dependencies down to the three things that should actually restart a poll.
+   */
+  const loadRepliesRef = useRef(loadReplies);
+  useEffect(() => {
+    loadRepliesRef.current = loadReplies;
+  }, [loadReplies]);
+
   // Polling, NOT log subscriptions. `eth_getLogs` cannot see events from host-submitted contract
   // calls — the host submits native `Revive` extrinsics, which emit `Revive.ContractEmitted` in
   // `System.Events` and nothing in the ETH log index (architecture §8). Do not "modernise" this.
+  //
+  // ⛔ THE TICK IS ALWAYS `"background"`. Passing "cold" here — or, as this did until the flicker
+  // was traced, calling a loader that only had the cold behaviour — empties the conversation and
+  // raises the spinner twice a minute, for data that is almost always identical.
   useEffect(() => {
     if (!repliesAddress || !provider || !registryId) return;
-    pollIntervalRef.current = window.setInterval(() => void loadReplies(), 30000);
-    return () => {
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    };
-  }, [repliesAddress, provider, registryId, loadReplies]);
+    return startPolling(() => void loadRepliesRef.current("background"), {
+      intervalMs: POLL_INTERVAL_MS,
+    });
+  }, [repliesAddress, provider, registryId]);
 
   return {
     replies,
     replyCount: replies.length,
     isLoading,
+    isRefreshing,
     error,
     canReply: enabled && publisher !== null,
     registryId,

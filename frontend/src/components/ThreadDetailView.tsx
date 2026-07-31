@@ -3,6 +3,7 @@ import type { ForumThread, VoteType, VoteTally, Profile } from '../types/contrac
 import { VotingWidget } from './VotingWidget';
 import { ReplyThread } from './ReplyThread';
 import { UserLink } from './UserAddress';
+import { PANE_HEADER } from './paneChrome';
 import { formatTimestamp } from '../utils/formatters';
 import type { Provider, Signer } from '../utils/contracts';
 import { entityIdOfCid } from '../lib/entity';
@@ -73,42 +74,54 @@ export function ThreadDetailView({
   const [isDeleting, setIsDeleting] = useState(false);
 
   /**
-   * The share panel.
+   * What the last COPY LINK press did. `null` is the resting state.
    *
-   * ⚠️ IT IS ALWAYS SHOWN ONCE COPY LINK IS PRESSED, whatever the clipboard did. Inside the host the
-   * address bar belongs to the dot.li shell — `pushState` updates an invisible iframe URL — so this
-   * panel is the ONLY place a user can see or select the link to a thread. That is also why the
-   * outcome is reported honestly instead of with an optimistic toast: `Clipboard` is a host device
-   * permission and a missing one fails silently.
+   * ⚠️ THE SUCCESS PATH IS SILENT APART FROM THE BUTTON. It used to open a panel on EVERY outcome,
+   * on the theory that the host hides the address bar so the user needs to see the link. That was
+   * wrong about which problem it was solving: a user who just copied a link does not need to read
+   * it, and `unverified` is the *normal* outcome (reading the clipboard back would prompt them), so
+   * the panel fired on essentially every press. It now reads as feedback, not as a dialog — the
+   * button confirms in place and resets itself.
+   *
+   * ⛔ `failed` STILL OPENS THE PANEL, AND MUST. `Clipboard` is a host device permission and a
+   * missing one fails silently; inside the container the address bar belongs to the dot.li shell,
+   * so with no clipboard and no URL bar the panel is the ONLY way to get the link out. Deleting it
+   * would turn a denied permission into a button that does nothing at all.
    */
-  const [shareOutcome, setShareOutcome] = useState<CopyOutcome | null>(null);
+  const [copyState, setCopyState] = useState<CopyOutcome | null>(null);
   const shareInputRef = useRef<HTMLInputElement | null>(null);
 
   const isOwner = currentAddress?.toLowerCase() === thread.author.toLowerCase();
 
   const shareUrl = useMemo(() => threadShareUrl(thread.cid), [thread.cid]);
 
-  // Close the panel when the pane switches to a different thread — a stale link under a new title
-  // is worse than no link.
+  // Reset when the pane switches to a different thread — a stale "COPIED", or worse a stale link
+  // under a new title, is worse than nothing.
   useEffect(() => {
-    setShareOutcome(null);
+    setCopyState(null);
   }, [thread.cid]);
+
+  // The in-place confirmation is transient. The failure panel is NOT — it is the fallback path and
+  // stays until dismissed or until the thread changes.
+  useEffect(() => {
+    if (copyState !== 'copied' && copyState !== 'unverified') return;
+    const timer = setTimeout(() => setCopyState(null), 2000);
+    return () => clearTimeout(timer);
+  }, [copyState]);
 
   // Pre-select the text so the manual path is one gesture, not three.
   useEffect(() => {
-    if (shareOutcome && shareInputRef.current) {
+    if (copyState === 'failed' && shareInputRef.current) {
       shareInputRef.current.focus();
       shareInputRef.current.select();
     }
-  }, [shareOutcome]);
+  }, [copyState]);
 
   const handleCopyLink = async () => {
     if (!shareUrl) return;
     const outcome = await copyTextVerified(shareUrl);
-    setShareOutcome(outcome);
-    if (outcome === 'copied') {
-      toast.success('Link copied');
-    } else if (outcome === 'failed') {
+    setCopyState(outcome);
+    if (outcome === 'failed') {
       // A real failure, reported the way every other failure in this app is: short toast,
       // tap-to-copy detail, durable entry under Settings → RECENT ERRORS.
       reportError(
@@ -160,7 +173,8 @@ export function ThreadDetailView({
   if (thread.isDeleted) {
     return (
       <div className="flex flex-col h-full">
-        <div className="px-4 py-3 border-b border-primary-700">
+        {/* Same shared height as the live header — a deleted thread must not shift the rule. */}
+        <div className={PANE_HEADER}>
           <button
             onClick={onBack}
             className="text-sm font-mono text-primary-500 hover:text-primary-400"
@@ -177,8 +191,9 @@ export function ThreadDetailView({
 
   return (
     <div className="flex flex-col h-full min-w-0">
-      {/* Header: back, share, identity. */}
-      <div className="px-4 py-3 border-b border-primary-700 flex items-center flex-wrap gap-3">
+      {/* Header: back, share, identity. Height comes from `PANE_HEADER`, not from content — its
+          border and the list column's are one continuous rule. See `paneChrome.ts`. */}
+      <div className={`${PANE_HEADER} flex-wrap gap-3`}>
         <button
           onClick={onBack}
           className="text-sm font-mono text-primary-500 hover:text-primary-400 whitespace-nowrap"
@@ -191,11 +206,20 @@ export function ThreadDetailView({
 
         {shareUrl && (
           <button
+            type="button"
             onClick={handleCopyLink}
-            className="text-sm font-mono text-primary-500 border border-primary-700 hover:border-primary-500 px-2 py-0.5 whitespace-nowrap"
-            title="Copy a link that opens this thread inside Plaza"
+            className="text-sm font-mono text-primary-500 border border-primary-700 hover:border-primary-500 px-2 py-0.5 whitespace-nowrap transition-colors"
+            title={
+              copyState === 'unverified'
+                ? 'Copied. Confirming it would have meant reading your clipboard back, which prompts you, so this is not verified.'
+                : 'Copy a link that opens this thread inside Plaza'
+            }
           >
-            COPY LINK
+            {/* The whole success path lives here. `aria-live` so the change is announced rather
+                than only seen — the label is the only confirmation there is now. */}
+            <span aria-live="polite">
+              {copyState === 'copied' || copyState === 'unverified' ? 'COPIED' : 'COPY LINK'}
+            </span>
           </button>
         )}
 
@@ -206,8 +230,10 @@ export function ThreadDetailView({
         )}
       </div>
 
-      {/* Share panel. Shown after COPY LINK regardless of outcome — see `shareOutcome` above. */}
-      {shareUrl && shareOutcome && (
+      {/* ⛔ FAILURE FALLBACK — the ONLY thing that opens this panel. Do not widen it back out to the
+          other two outcomes; that is the noise the panel was reported for. Do not remove it either:
+          with no clipboard and no visible address bar there is otherwise no way to get the link. */}
+      {shareUrl && copyState === 'failed' && (
         <div className="px-4 py-3 border-b border-primary-800 bg-primary-950 font-mono text-xs min-w-0">
           <div className="flex items-center gap-2 min-w-0">
             <input
@@ -218,30 +244,18 @@ export function ThreadDetailView({
               className="flex-1 min-w-0 px-2 py-1 bg-black border border-primary-700 text-primary-300 font-mono text-xs focus:outline-none focus:border-primary-400"
             />
             <button
-              onClick={() => setShareOutcome(null)}
-              className="text-primary-600 hover:text-primary-400 px-1"
+              type="button"
+              onClick={() => setCopyState(null)}
+              className="text-primary-600 hover:text-primary-400 px-1 transition-colors"
               title="Hide"
             >
               ×
             </button>
           </div>
-          <p
-            className={`mt-2 max-w-[70ch] ${
-              shareOutcome === 'copied'
-                ? 'text-primary-500'
-                : shareOutcome === 'unverified'
-                  ? 'text-accent-400'
-                  : 'text-red-400'
-            }`}
-          >
-            {shareOutcome === 'copied'
-              ? 'Copied — read back from the clipboard to confirm.'
-              : shareOutcome === 'unverified'
-                ? 'Copied. Reading the clipboard back would have prompted you, so this is not ' +
-                  'confirmed — if the paste comes out wrong, the link is right here.'
-                : 'NOT copied. The clipboard refused, or accepted and kept something else — inside ' +
-                  'the Polkadot host that usually means the Clipboard permission was not granted. ' +
-                  'Select the link above and copy it manually.'}
+          <p className="mt-2 max-w-[70ch] text-red-400">
+            NOT copied. The clipboard refused, or accepted and kept something else — inside the
+            Polkadot host that usually means the Clipboard permission was not granted. Select the
+            link above and copy it manually.
           </p>
           <p className="mt-1 text-primary-700 max-w-[70ch]">
             A <code>.dot</code> link opens the thread inside Plaza; the <code>.dev-dot.li</code>{' '}

@@ -114,8 +114,12 @@ export function FeedView({
         ) : (
           <div className="space-y-4">
             {posts.map((post) => (
+              /* ⚠️ CID, NOT `index` — see `types/contracts.ts`: `index` is a position in the loaded
+                 page, so a new post shifts every row onto a different key and React remounts the
+                 list on each background poll. The owner stays in the key only to keep it obviously
+                 unique across the aggregated feed. */
               <PostCard
-                key={`${post.profileOwner}-${post.index}`}
+                key={`${post.profileOwner}-${post.cid}`}
                 post={post}
                 repliesAddress={repliesAddress}
                 votingAddress={votingAddress}

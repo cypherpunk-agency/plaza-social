@@ -12,6 +12,7 @@ import {
   type DecodedObject,
 } from "../lib/wire";
 import { FORUM_REGISTRY, threadRegistryId } from "../lib/registry";
+import { POLL_INTERVAL_MS, createRefreshGate, deepEqual, refresh, startPolling, type RefreshMode } from "../lib/poll";
 import { NO_WRITE_SESSION } from "../lib/publish";
 import { usePublisher } from "./usePublisher";
 import { gatewayFetcher } from "../lib/gateways";
@@ -74,6 +75,15 @@ interface UseForumThreadProps {
   getDisplayName?: (address: string) => Promise<string>;
   userRegistryAddress?: string | null;
   enabled?: boolean;
+  /**
+   * Walk every loaded thread's reply registry to produce {@link UseForumThreadReturn.replyCounts}.
+   *
+   * ⚠️ OPT-IN, AND DEFAULTS TO OFF, because it is the most expensive read this hook can do — see
+   * `loadReplyCounts` and {@link REPLY_COUNT_THREADS}. It stays off until a caller actually renders
+   * the number. The forum list dropped its `[+] REPLIES (n)` expander when the detail pane took over
+   * replies, and an unread count is 25 chain walks plus their bodies, on a phone, for nothing.
+   */
+  countReplies?: boolean;
 }
 
 /**
@@ -89,7 +99,16 @@ const REPLY_COUNT_DEPTH = 50;
 
 interface UseForumThreadReturn {
   threads: ForumThread[];
+  /** True only for a COLD load — there is genuinely nothing to show yet. Safe to render a skeleton. */
   isLoading: boolean;
+  /**
+   * True while a BACKGROUND poll is in flight, with the previous list still on screen.
+   *
+   * ⚠️ NEVER unmount the list on this. It exists so a UI *can* show a subtle "updating" hint; the
+   * whole point of the stale-while-revalidate rewrite (`lib/poll.ts`) is that the rows stay mounted.
+   * Nothing is obliged to consume it.
+   */
+  isRefreshing: boolean;
   error: string | null;
   threadCount: number;
   /**
@@ -102,7 +121,20 @@ interface UseForumThreadReturn {
    */
   replyCounts: Record<string, number>;
 
-  createThread: (title: string, content: string, tags: string[]) => Promise<number>;
+  /**
+   * Publish a thread; resolves with the **announcement CID**, which is the thread's identity.
+   *
+   * ⚠️ IT USED TO RESOLVE WITH `0` — a leftover from `ForumThread.sol`, when a thread had an
+   * on-chain index. There is no index any more (see the note on `ForumThread.index`: a position in
+   * the loaded page, not an id), so the caller was left to identify what it had just written by
+   * DIFFING the board before and after. `publisher.publish` has always returned the CID; it simply
+   * was not propagated.
+   *
+   * A bare `string`, not `{ cid, confirmed }`, and that is deliberate: an unconfirmed publish
+   * THROWS below rather than resolving, so `confirmed` on a resolved call could only ever be `true`.
+   * Handing the caller a flag it cannot act on invites a branch that can never run.
+   */
+  createThread: (title: string, content: string, tags: string[]) => Promise<string>;
   editThread: (threadIndex: number, newContent: string) => Promise<void>;
   deleteThread: (threadIndex: number) => Promise<void>;
   refresh: () => Promise<void>;
@@ -116,6 +148,7 @@ export function useForumThread({
   provider,
   getDisplayName,
   userRegistryAddress,
+  countReplies = false,
 }: UseForumThreadProps): UseForumThreadReturn {
   // `null` when this session cannot write. Not an error — see `usePublisher`.
   const publisher = usePublisher();
@@ -123,10 +156,34 @@ export function useForumThread({
   const [threadCount, setThreadCount] = useState(0);
   const [replyCounts, setReplyCounts] = useState<Record<string, number>>({});
   const [isLoading, setIsLoading] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const pollIntervalRef = useRef<number | null>(null);
   const hasAttemptedDisplayNameFetch = useRef(false);
+
+  /**
+   * The last committed list, mirrored into a ref.
+   *
+   * ⚠️ THE EQUALITY SKIP MUST READ THIS, NOT `threads`. A `useCallback` closes over the `threads` of
+   * the render that created it, so comparing against the state value would compare against data from
+   * an earlier poll and commit a "change" that is not one. Everything that writes `threads` goes
+   * through `commitThreads` so the two can never drift.
+   */
+  const threadsRef = useRef<ForumThread[]>([]);
+  const commitThreads = useCallback((next: ForumThread[]) => {
+    threadsRef.current = next;
+    setThreads(next);
+    // `threads.length` is what we actually walked, and is the honest count — see `loadThreads`.
+    setThreadCount(next.length);
+  }, []);
+
+  /**
+   * Orders concurrent refreshes so a slow one cannot overwrite a newer one. Without it: the 30s poll
+   * starts fetching, the user publishes a thread, the post-write reload commits it — and then the
+   * poll's PRE-WRITE snapshot resolves and rolls the board back, silently, for up to 30 seconds.
+   * See `lib/poll.ts` § RefreshGate.
+   */
+  const gate = useMemo(() => createRefreshGate(), []);
 
   // One cache per hook instance, persisted in the browser. Bodies are immutable and content-addressed,
   // so a cache hit can never be stale — only absent.
@@ -224,68 +281,89 @@ export function useForumThread({
     [getDisplayName, userRegistryAddress]
   );
 
-  const loadThreads = useCallback(async () => {
+  /**
+   * The FETCH half: reads the chain and returns a list. It touches no state and announces nothing.
+   *
+   * Keeping it pure is what lets `lib/poll.ts` decide whether this load is allowed to blank the
+   * screen. The old shape — one function that set `isLoading` and `[]` before fetching, re-entered
+   * by a 30-second interval — is exactly the reported flicker.
+   */
+  const fetchThreads = useCallback(async (): Promise<ForumThread[]> => {
     const contract = getReadContract();
-    if (!contract) {
-      setThreads([]);
-      setThreadCount(0);
-      return;
-    }
+    if (!contract) return [];
 
-    try {
-      setIsLoading(true);
-      setError(null);
+    // ⚠️ `total` IS THE WRITER COUNT, NOT THE THREAD COUNT, and it was being reported as the
+    // latter. `getHeadsPaged` returns `(refs, total)` where `total = _writers[registry].length` —
+    // one entry per person who has ever posted here, NOT one per thread. With a single author and
+    // two threads it reads 1; with ten authors and one thread each it reads 10. It happens to be
+    // invisible today because exactly one account has posted.
+    //
+    // There is no cheap on-chain thread count and there should not be: the model stores one head
+    // per writer and the threads hang off it in a Bulletin chain, so counting them means walking.
+    // `threads.length` is what we actually walked and is the honest number to show.
+    const [refs] = await contract.getHeadsPaged(FORUM_REGISTRY, 0, 50);
 
-      // Sorted newest-first. Cost grows with the writer set, not the post count — one head per writer.
-      //
-      // ⚠️ `total` IS THE WRITER COUNT, NOT THE THREAD COUNT, and it was being reported as the
-      // latter. `getHeadsPaged` returns `(refs, total)` where `total = _writers[registry].length` —
-      // one entry per person who has ever posted here, NOT one per thread. With a single author and
-      // two threads it reads 1; with ten authors and one thread each it reads 10. It happens to be
-      // invisible today because exactly one account has posted.
-      //
-      // There is no cheap on-chain thread count and there should not be: the model stores one head
-      // per writer and the threads hang off it in a Bulletin chain, so counting them means walking.
-      // `threads.length` is what we actually walked and is the honest number to show.
-      const [refs] = await contract.getHeadsPaged(FORUM_REGISTRY, 0, 50);
+    const heads = (refs as OnChainHead[])
+      // A writer banned after the fact keeps their row; moderation is a write gate plus a hide
+      // flag, never a delete, because freeing storage would refund the wrong person.
+      .filter((ref) => ref.allowed && ref.cid)
+      .map((ref) => ({
+        cid: ref.cid,
+        prev: ref.prev || null,
+        at: ref.movedAt > 0n ? Number(ref.movedAt) * 1000 : null,
+        by: ref.by,
+        block: ref.storeBlock > 0n ? Number(ref.storeBlock) : null,
+        index: null,
+      }));
 
-      const heads = (refs as OnChainHead[])
-        // A writer banned after the fact keeps their row; moderation is a write gate plus a hide
-        // flag, never a delete, because freeing storage would refund the wrong person.
-        .filter((ref) => ref.allowed && ref.cid)
-        .map((ref) => ({
-          cid: ref.cid,
-          prev: ref.prev || null,
-          at: ref.movedAt > 0n ? Number(ref.movedAt) * 1000 : null,
-          by: ref.by,
-          block: ref.storeBlock > 0n ? Number(ref.storeBlock) : null,
-          index: null,
-        }));
+    // An empty board is a RESULT, not a failure — it is returned and diffed like any other, so a
+    // poll that keeps finding nothing commits nothing and re-renders nothing.
+    if (heads.length === 0) return [];
 
-      if (heads.length === 0) {
-        setThreads([]);
-        setThreadCount(0);
+    const page = await walkChain({ heads, cache, limit: 50 });
+
+    // `walkChain` decodes for us — `entry.object` is already a DecodedObject or null for a hole.
+    return Promise.all(
+      page.entries.map((entry, i) =>
+        toForumThread(entry.object, entry.author ?? "", entry.at ?? null, i, entry.cid)
+      )
+    );
+  }, [getReadContract, toForumThread, cache]);
+
+  /**
+   * The ANNOUNCE half. `mode` decides whether this load may blank the screen.
+   *
+   * - `"cold"` — nothing is on screen yet, so raise `isLoading` and let the empty state show.
+   * - `"background"` — the 30-second poll. Keeps the current list up, raises `isRefreshing` instead,
+   *   commits only if the data actually differs, and on failure keeps the last good list.
+   *
+   * ⛔ Never infer the mode from `threads.length === 0`; see `lib/poll.ts`.
+   */
+  const loadThreads = useCallback(
+    async (mode: RefreshMode = "cold"): Promise<void> => {
+      if (!getReadContract()) {
+        // No address or provider yet. A cold entry shows the empty state; a background tick just
+        // does nothing rather than blanking a list that is still perfectly good.
+        if (mode === "cold") commitThreads([]);
         return;
       }
-
-      const page = await walkChain({ heads, cache, limit: 50 });
-
-      // `walkChain` decodes for us — `entry.object` is already a DecodedObject or null for a hole.
-      const formatted = await Promise.all(
-        page.entries.map((entry, i) =>
-          toForumThread(entry.object, entry.author ?? "", entry.at ?? null, i, entry.cid)
-        )
-      );
-
-      setThreads(formatted);
-      setThreadCount(formatted.length);
-    } catch (err) {
-      console.error("Failed to load threads:", err);
-      setError(err instanceof Error ? err.message : "Failed to load threads");
-    } finally {
-      setIsLoading(false);
-    }
-  }, [getReadContract, toForumThread, cache]);
+      await refresh<ForumThread[]>({
+        mode,
+        gate,
+        sinks: {
+          setData: commitThreads,
+          setLoading: setIsLoading,
+          setRefreshing: setIsRefreshing,
+          setError,
+        },
+        load: fetchThreads,
+        previous: () => threadsRef.current,
+        message: (err) => (err instanceof Error ? err.message : "Failed to load threads"),
+        onError: (err) => console.error("Failed to load threads:", err),
+      });
+    },
+    [getReadContract, fetchThreads, commitThreads]
+  );
 
   /**
    * Count the replies under each loaded thread, in the background, best effort.
@@ -355,7 +433,7 @@ export function useForumThread({
   );
 
   const createThread = useCallback(
-    async (title: string, content: string, tags: string[]): Promise<number> => {
+    async (title: string, content: string, tags: string[]): Promise<string> => {
       if (!publisher) throw new Error(NO_WRITE_SESSION);
 
       // Validate BEFORE anything is stored. An over-budget title must be refused at the field that
@@ -372,7 +450,11 @@ export function useForumThread({
       );
 
       // 2 + 3 — the announcement, linked into this author's forum chain, then the head pointer.
-      const { confirmed } = await publisher.publish({
+      //
+      // ⭐ `cid` IS THE THREAD. It is the announcement's CID: the row key the board renders, the
+      // `?cid=` deep link, and the `keccak256(utf8(cid))` the vote tally is keyed on. Returning it
+      // is what lets the caller select what was just written instead of inferring it.
+      const { cid, confirmed } = await publisher.publish({
         registry: FORUM_REGISTRY,
         cache,
         label: "thread",
@@ -388,7 +470,14 @@ export function useForumThread({
           }),
       });
 
-      await loadThreads();
+      // BACKGROUND: the board is already on screen behind the composer, and the point of this read
+      // is to add one row to it. A cold load here would empty the list the author just posted into.
+      //
+      // ⚠️ THIS RUNS BEFORE WE RESOLVE, so a caller reading `threads` after the `await` may ALREADY
+      // see the new row. That ordering is why identifying the new thread by diffing the board was
+      // fragile; selecting by the returned `cid` is immune to it, since the CID is the same whether
+      // the row has landed yet or not.
+      await loadThreads("background");
       if (!confirmed) {
         // The write went through — the head move returned a transaction hash — but the read RPC had
         // not caught up. Saying so beats a silent list that has not changed yet.
@@ -397,7 +486,7 @@ export function useForumThread({
             "within a minute; the list refreshes on its own."
         );
       }
-      return 0;
+      return cid;
     },
     [publisher, cache, loadThreads]
   );
@@ -423,10 +512,11 @@ export function useForumThread({
 
   useEffect(() => {
     if (forumThreadAddress && provider) {
-      loadThreads();
+      // COLD, and the only cold entry point: the address or the provider just changed, so whatever
+      // is on screen belongs to a different chain and there is genuinely nothing to preserve.
+      void loadThreads("cold");
     } else {
-      setThreads([]);
-      setThreadCount(0);
+      commitThreads([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [forumThreadAddress, provider]);
@@ -444,19 +534,23 @@ export function useForumThread({
    */
   const threadCidKey = useMemo(() => threads.map((t) => t.cid).join(","), [threads]);
   useEffect(() => {
-    if (!forumThreadAddress || !provider || threads.length === 0) {
+    // No consumer asked for counts — do not spend 25 chain walks producing a number nobody renders.
+    if (!countReplies || !forumThreadAddress || !provider || threads.length === 0) {
       setReplyCounts({});
       return;
     }
     let cancelled = false;
     void loadReplyCounts(threads).then((counts) => {
-      if (!cancelled) setReplyCounts(counts);
+      // Same rule as the list: an unchanged map is not handed to React. This loader was never on
+      // the blanking path (it replaces on resolve and never clears first), but a fresh object with
+      // identical contents still re-renders every consumer.
+      if (!cancelled) setReplyCounts((prev) => (deepEqual(prev, counts) ? prev : counts));
     });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [forumThreadAddress, provider, threadCidKey]);
+  }, [forumThreadAddress, provider, threadCidKey, countReplies]);
 
   useEffect(() => {
     if (!forumThreadAddress || !provider || !getDisplayName) return;
@@ -464,24 +558,43 @@ export function useForumThread({
     if (hasAttemptedDisplayNameFetch.current) return;
     if (threads.some((t) => !t.displayName) && userRegistryAddress) {
       hasAttemptedDisplayNameFetch.current = true;
-      loadThreads();
+      // BACKGROUND: the list is already painted and this pass only decorates it with names. A cold
+      // re-entry here blanked the board a second time immediately after the first paint.
+      void loadThreads("background");
     }
   }, [forumThreadAddress, provider, getDisplayName, userRegistryAddress, threads, loadThreads]);
+
+  /**
+   * Always call the LATEST loader through a ref.
+   *
+   * `loadThreads` changes identity whenever `getDisplayName` does, and an interval effect that
+   * depends on it is torn down and restarted on every such render — which on an unstable
+   * `getDisplayName` means the 30 seconds never elapse and the poll silently never fires. The ref
+   * keeps the effect's dependencies down to the two things that should actually restart a poll.
+   */
+  const loadThreadsRef = useRef(loadThreads);
+  useEffect(() => {
+    loadThreadsRef.current = loadThreads;
+  }, [loadThreads]);
 
   // Polling, NOT log subscriptions. `eth_getLogs` cannot see events from host-submitted contract
   // calls — the host submits native `Revive` extrinsics, which emit `Revive.ContractEmitted` in
   // `System.Events` and nothing in the ETH log index. Do not "modernise" this.
+  //
+  // ⛔ THE TICK IS ALWAYS `"background"`. Passing "cold" here — or, as this did until the flicker
+  // was traced, calling a loader that only had the cold behaviour — empties the list and raises the
+  // spinner twice a minute, for data that is almost always identical.
   useEffect(() => {
     if (!forumThreadAddress || !provider) return;
-    pollIntervalRef.current = window.setInterval(() => void loadThreads(), 30000);
-    return () => {
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    };
-  }, [forumThreadAddress, provider, loadThreads]);
+    return startPolling(() => void loadThreadsRef.current("background"), {
+      intervalMs: POLL_INTERVAL_MS,
+    });
+  }, [forumThreadAddress, provider]);
 
   return {
     threads,
     isLoading,
+    isRefreshing,
     error,
     threadCount,
     replyCounts,

@@ -67,6 +67,14 @@ export function summarise(error: unknown): string {
 
   const e = error as Record<string, unknown>;
 
+  // ⭐ FIRST, AHEAD OF EVERY ETHERS BRANCH. A `WriteFailure` (`lib/host/errors.ts`) has already been
+  // interpreted by the one layer that knows which half of the two-signature write failed and whether
+  // the body survived, so its `message` is the best sentence anyone will produce for this error.
+  // Letting an ethers heuristic run first would replace it — `e.reason` on a wrapped host error is
+  // whatever the SDK happened to put there, which is how the raw
+  // "Submit failed, no allowance set for account" reached a user's screen in the first place.
+  if (e.name === 'WriteFailure' && typeof e.message === 'string' && e.message) return e.message;
+
   // Ethers v6 puts the human part here and buries it in `.message`.
   const short = e.shortMessage;
   if (typeof short === 'string' && short) return short;
@@ -97,7 +105,11 @@ export function detailOf(error: unknown): string {
   while (current && depth < 5) {
     const e = current as Record<string, unknown>;
     if (typeof e.message === 'string') parts.push(e.message);
-    for (const key of ['code', 'reason', 'shortMessage', 'data', 'to', 'action'] as const) {
+    // `steps` / `stored` / `confidence` come from a `WriteFailure`. They belong in the COPYABLE
+    // detail and never in the toast: the remedy is several lines long, and the durable log is where
+    // someone re-reads it after the toast has gone. `cause` below then appends the raw host string,
+    // so a bug report carries the readable version AND the original.
+    for (const key of ['code', 'stored', 'confidence', 'reason', 'shortMessage', 'data', 'to', 'action', 'steps'] as const) {
       if (e[key] !== undefined) parts.push(`${key}: ${String(e[key])}`);
     }
     current = e.cause;

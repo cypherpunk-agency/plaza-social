@@ -15,7 +15,16 @@
 
 export type WriteFailureCode =
   | 'validation'
-  | 'stale_session'
+  /**
+   * ⭐ RENAMED FROM `stale_session` ON 2026-07-31, BECAUSE THAT NAME WAS THE WRONG DIAGNOSIS AND THE
+   * WRONG DIAGNOSIS WAS ON A USER'S SCREEN.
+   *
+   * "Stale" says *it used to work and time broke it*, which implies re-establishing the session
+   * fixes it. Neither half survived contact with the chain (see the matcher below). The channel is
+   * not stale; the account was never allowed to use it, and a fresh sign-in produces a fresh account
+   * that is equally not allowed.
+   */
+  | 'no_statement_allowance'
   | 'no_contract_allowance'
   | 'permission_denied'
   | 'not_mapped'
@@ -59,21 +68,57 @@ const isValidationError = (error: unknown): error is Error =>
 
 const MATCHERS: Array<{ code: WriteFailureCode; test: RegExp; title: string; confidence: 'high' | 'medium' | 'low' }> = [
   {
-    // ⚠️ NOT a smart-contract or gas problem, despite how it reads. Traced to the exact byte in the
-    // deployed host bundle: the string is constructed in `submitStatement`, mapping a
-    // STATEMENT-STORE rejection, in a family alongside "data too large" / "expiry too low" /
-    // "account full". Nothing in that family concerns gas, PGAS, deposits or pallet-revive.
+    // ⚠️ NOT a smart-contract or gas problem, despite how it reads. Two layers, both **[V]**:
     //
-    // The web host talks to the phone over an SSO channel WHOSE TRANSPORT IS THE STATEMENT STORE. So
-    // a contract call fails here because the request could not be shipped to the phone to be signed
-    // — the transaction never reached the chain. The browser session's own statement allowance,
-    // granted by the phone at pairing time, has lapsed.
+    // ── layer 1, the host bundle (`https://browse.dev-dot.li/assets/auth-BuYgQyky.js`, 2026-07-31)
+    //   · The string is one of a family of STATEMENT-STORE submit rejections. The bundle maps
+    //     `{tag:'rejected', reason:'noAllowance'}` to `Submit failed, no allowance set for account`,
+    //     beside `noProof` / `badProof` / `encodingTooLarge` / `accountFull` / `storeFull`.
+    //     Nothing in that family concerns gas, PGAS, deposits or pallet-revive.
+    //   · When Plaza runs in a BROWSER, the page reaches the paired phone over an SSO-v2 channel
+    //     WHOSE TRANSPORT IS THE STATEMENT STORE: `createTransaction`, `signRaw`, `getRingVrfAlias`
+    //     and `requestResourceAllocation` all go through one `c.request(...)` →
+    //     `prover.generateMessageProof(...).andThen(statementStore.submitStatement)`, signed by a
+    //     RANDOM sr25519 account the browser generates locally (`DeviceIdentity.statementAccountSeed`
+    //     = `crypto.getRandomValues(32)`).
     //
-    // Consequence: `requestResourceAllocation` travels the SAME dead channel, so "we'll ask the host
-    // for the allowance and retry" cannot work and must never be promised for this code.
-    code: 'stale_session',
+    // ── layer 2, the chain — ⭐ THIS IS THE PART THE FIRST INVESTIGATION MISSED, and it inverts the
+    //    remedy. `statement_submit` is served by the Individuality/People chain node
+    //    (`wss://people-paseo.rotko.net` answers it; **[V]** `rpc_methods`, 2026-07-31), and on that
+    //    chain a statement-store allowance has exactly ONE source: `Resources`.
+    //
+    //      Resources.set_statement_store_account(period, seq, target_account)
+    //        "The origin must be `Origin::StmtStoreAlias`, produced by the `AsResources`
+    //         (`RegisterStatementStoreAllowance(..)`) transaction extension AFTER PROOF VALIDATION."
+    //
+    //    `RegisterStatementStoreAllowance` carries an anonymous **ring-VRF membership proof** over
+    //    `MembershipCollection::{People | LitePeople}` — i.e. PERSONHOOD. The only other
+    //    allowance-raising call, `set_friend_request_statement_account_for_sequence`, is gated the
+    //    same way. There is no `Statement` pallet and no balance-derived route.
+    //    Reproduce: `node contracts/scripts/probe-statement-allowance.mjs`.
+    //
+    // ⛔ THREE CONSEQUENCES, and the old copy got all three wrong:
+    //
+    //   1. **Signing in again cannot help.** Pairing is READ-ONLY on the browser side — `Bl(...)` in
+    //      the host bundle only `subscribeStatements` + polls `queryStatements`; the PHONE writes the
+    //      handshake statement. So login never touches the allowance and never tests it, and a new
+    //      pairing mints a *new* random statement account that needs its own on-chain authorization.
+    //      That is why sign-in looks fine and then EVERY action fails identically.
+    //   2. **`requestResourceAllocation` travels the same dead channel**, so "we'll ask the host and
+    //      retry" cannot work and must never be promised here.
+    //   3. **A delegate key is not an escape route** — the pointer write is host-signed, and the
+    //      derived delegate H160 is unfunded with nonce 0.
+    //
+    // The only paths that can work are: run inside the Polkadot app itself (no SSO channel), or hold
+    // personhood so the phone can claim a slot. Slots are per-DAY — 20/period for a full person,
+    // 10 for a lite person, swept after a 2-day grace window — so even a working browser session
+    // needs re-authorizing regularly.
+    //
+    // The body of the post survives all of this because the Bulletin write does not use that channel
+    // at all (the SSO chunk contains no preimage handler). Hence `stored: true` — say so first.
+    code: 'no_statement_allowance',
     test: /no allowance set for account/i,
-    title: 'Your post is saved, but not yet visible to others',
+    title: 'Your post is saved, but this browser cannot announce it',
     confidence: 'high',
   },
   {
@@ -153,21 +198,22 @@ export function explainWriteFailure({ code }: { code: WriteFailureCode }): Write
         retryLabel: 'Try again',
       }
 
-    case 'stale_session':
+    case 'no_statement_allowance':
       return {
         body: [
           stored,
           'What failed is announcing it so other people can find it — and it failed before anything reached the chain.',
-          'Your connection to the Polkadot app has gone stale, so this page could not reach your phone to sign. Signing in again refreshes it.',
+          // ⚠️ NO "signing in again fixes it". It does not, and we said so for a day. See the matcher.
+          'When Plaza runs in a browser tab, every signing request has to travel to your phone through the Polkadot statement store, and using that store needs a permission granted on chain — one that only a verified person can be given, one day at a time. Without it this browser cannot reach your phone at all, so nothing it asks you to sign ever arrives.',
         ],
-        // UI strings below are taken verbatim from the deployed host bundle, not invented.
         steps: [
-          'Tap the person icon in the top bar, then "Log out".',
-          'Tap the person icon again and choose "Login With Polkadot App" — or scan the QR code with Polkadot Mobile.',
-          'Approve the request in the Polkadot app, then try announcing again.',
+          // Listed first because it is the only step that removes the channel rather than repairing it.
+          'Open Plaza from inside the Polkadot app itself — find plaza-social.dot there — instead of in a browser paired to your phone. That path signs on the device and does not use this channel.',
+          'If you want the browser to work, finish the "prove you are a person" step in the Polkadot app first, then sign in again here.',
+          'Signing in again on its own will not help — it hands this browser a new identity that needs the very same permission.',
         ],
         stepsCaveat:
-          'If it still fails after signing in again, the allowance your session needs could not be re-issued — send us the diagnostics report rather than repeating this.',
+          'We traced this on chain rather than on a device: the mechanism is confirmed, the two remedies are not. If the in-app route fails the same way, that is genuinely new information — please send the diagnostics report.',
         retryLabel,
       }
 
@@ -271,7 +317,95 @@ export function plainWriteFailure(error: unknown): string {
     return 'Saved, but not yet visible to other people.'
   }
   const { code } = classifyWriteFailure(error ?? '')
-  if (code === 'stale_session') return 'Could not reach your wallet to sign. Signing in again should fix it.'
+  // ⚠️ This line used to end "Signing in again should fix it." It does not — see the matcher. It is
+  // the sentence most likely to be the ONLY thing a user reads, so it must not carry a false remedy.
+  if (code === 'no_statement_allowance') {
+    return 'This browser could not reach your phone to sign. Open Plaza inside the Polkadot app instead.'
+  }
   if (code === 'no_container') return 'Posting needs the Polkadot app. Reading works anywhere.'
   return 'Could not be posted. Nothing was stored, so trying again is safe.'
+}
+
+/**
+ * ⭐ THE THING THAT WAS MISSING. Everything above this line existed and was correct on 2026-07-31 —
+ * and **nothing in the app called any of it**. `classifyWriteFailure` had exactly three importers,
+ * all of them the re-export list in `lib/host/index.ts`. So when a real reply failed on a real phone
+ * the user was shown, verbatim:
+ *
+ *     TxError: createTransaction failed: HostFailure: Submit failed, no allowance set for account
+ *
+ * A classifier that no failure path routes through is decoration. `WriteFailure` is what makes it
+ * structural: `lib/publish.ts` wraps every write failure in one of these, so the interpretation
+ * happens at the ONE place that knows whether the body was already stored, and every consumer —
+ * toast, error log, composer, a component nobody has written yet — gets the readable version without
+ * having to remember to ask for it.
+ *
+ * ⚠️ `message` IS THE USER-FACING SENTENCE and must stay ONE line under 200 characters, because
+ * `lib/errors.ts` `summarise()` puts it straight into a toast. The long form lives in `steps`.
+ */
+export class WriteFailure extends Error {
+  override readonly name = 'WriteFailure'
+  readonly code: WriteFailureCode
+  readonly confidence: 'high' | 'medium' | 'low'
+  readonly title: string
+  /**
+   * Whether the body reached Bulletin before the failure.
+   *
+   * ⭐ The single most important bit on the screen. Someone who thinks they lost what they wrote will
+   * not read anything else, and for the failure that prompted this file the words HAD survived —
+   * only the pointer write failed.
+   */
+  readonly stored: boolean
+  /** The remedy, newline-joined and pre-numbered. Goes in the copyable detail, never in the toast. */
+  readonly steps: string
+
+  constructor(cause: unknown, options: { stored: boolean }) {
+    const classification = classifyWriteFailure(cause)
+    const explanation = explainWriteFailure(classification)
+    // `stored` is what the CALLER observed, and it outranks the classifier's assumption: the
+    // matchers' titles all read "your post is saved", which is a lie when the Bulletin write is the
+    // thing that failed. Body failures must not tell someone their words are safe.
+    const headline = options.stored ? classification.title : 'That post could not be sent'
+    super(`${headline} — ${plainWriteFailure(cause)}`, { cause })
+    this.code = classification.code
+    this.confidence = classification.confidence
+    this.title = headline
+    this.stored = options.stored
+    this.steps = [
+      ...(options.stored ? explanation.body : []),
+      ...explanation.steps.map((step, index) => `${index + 1}. ${step}`),
+      ...(explanation.stepsCaveat ? [`(${explanation.stepsCaveat})`] : []),
+    ].join('\n')
+  }
+}
+
+/**
+ * Wrap anything thrown by a write, unless it is already wrapped or is the user's own input problem.
+ *
+ * Validation errors pass through UNTOUCHED, and that is load-bearing rather than an optimisation:
+ * "that message is 341 characters, 21 over the limit" is the most actionable message in the app, and
+ * it is about content that was never sent. Laundering it into "your post is saved, but…" would be
+ * both less useful and false.
+ */
+export function asWriteFailure(error: unknown, options: { stored: boolean }): unknown {
+  if (error instanceof WriteFailure) return error
+  if (isValidationError(error)) return error
+  return new WriteFailure(error, options)
+}
+
+/**
+ * Is this failure one that a cached allowance claim could be responsible for?
+ *
+ * The caller is `lib/host/session.ts`, which uses it to decide whether to `invalidate()` the
+ * persisted claim. Deliberately narrow: invalidating on every write failure would throw away a
+ * perfectly good grant every time an RPC hiccuped, and put an allowance dialog in front of a user
+ * whose actual problem was a dropped connection.
+ *
+ * ⚠️ For `no_statement_allowance` this is BOOKKEEPING ONLY and will not fix anything. The claim we
+ * cached is a record that we once asked; the thing actually missing is an on-chain statement-store
+ * slot that only a personhood proof can create. Dropping the claim just stops us lying in the
+ * diagnostics panel about having a grant.
+ */
+export function isAllowanceFailure(code: WriteFailureCode): boolean {
+  return code === 'no_statement_allowance' || code === 'no_contract_allowance'
 }

@@ -1,7 +1,46 @@
 # STATUS — read this first
 
 Short by design. The long reasoning is in [`architecture.md`](architecture.md); the traps are in
-[`gotchas.md`](gotchas.md). **Last updated 2026-07-30.**
+[`gotchas.md`](gotchas.md). **Last updated 2026-07-31.**
+
+## ⛔⛔ READ THIS BEFORE BELIEVING ANY "VERIFIED ON A REAL DEVICE" CLAIM BELOW
+
+**[V] 2026-07-31 — a statement-store allowance is a PERSONHOOD-GATED DAILY SLOT, and on a browser
+host paired to a phone over SSO, every host-signed contract write needs one.**
+
+On the Individuality/People chain there is no `Statement` pallet and no balance-derived route to an
+allowance. `Resources` has exactly two calls that mint one, and both require an anonymous **ring-VRF
+membership proof** over `People | LitePeople`. Measured: `StmtStoreSlotsPerPeriod 20`,
+`LiteStmtStoreSlotsPerPeriod 10`, allowances keyed by *period* with nothing older than two days alive.
+Reproduce with `node contracts/scripts/probe-statement-allowance.mjs`.
+
+That matters here because on the **browser** host the SSO channel to the phone *is* the statement
+store, so `createTransaction`, `signRaw` and `requestResourceAllocation` all ride it.
+
+⚠️ **And the browser half of the pairing handshake is READ-ONLY** — it generates a random
+`statementAccountSeed`, builds the QR payload, then only subscribes and polls. The **phone** writes the
+handshake statement. Three consequences, which together explain a whole morning of confusing reports:
+
+1. **Sign-in always looks successful**, because it submits no statement and so never tests the gate.
+2. **The first browser→phone request is the browser's first-ever statement submit** — so *every*
+   action fails identically, immediately after an apparently clean login.
+3. ⛔ **Re-pairing is strictly worse than doing nothing.** It mints a *new* random statement account
+   needing its own slot, discarding the account any existing grant was attached to. The
+   "sign in again" advice we shipped on 2026-07-31 was wrong on both counts and has been removed.
+
+**[?] THE TOP DEVICE TEST IN THIS REPO: native container vs browser-over-SSO.** Writes worked on
+2026-07-30 and the identical paths failed on 2026-07-31. The most likely reading is that 07-30 ran in
+the **native Polkadot app** (the host *is* the device — local signing, no SSO channel, no statement
+store) and 07-31 in a **browser paired over SSO**, the only surface this failure can occur on. If that
+is right, **"Arm 1 — host-signed contract writes work" is a claim about the native container and has
+never been demonstrated in the browser host**, and much of the write column below is scoped far more
+narrowly than it reads. Nobody has settled this; it needs one device and it changes everything.
+
+**[?] Not proof about the user.** The product account for the failing session resolves via
+`Revive.OriginalAccount` to `5EJ3VTQLFVGHh2nrwpD9VyAFhYhhKnHxRTfGsGifFS4sx2rz`, which is neither a
+`LitePerson` nor a `Person`. But a product account is derived per-product from root entropy while
+personhood is registered against the identity account the phone holds, and **there is no on-chain
+reverse map** — so this is evidence, not a verdict on whether the human has personhood.
 
 ## Live right now
 
@@ -175,6 +214,16 @@ Bulletin authorization error. Cost an hour. See gotchas.
   cannot serve a tip: the payee must be present to mint a receivable, delivery rides the
   personhood-gated statement store, and no host implements it (zero handlers in the reference bundle,
   none wrapped by `product-sdk-host`). pUSD (asset **50000413**, 6dp) is only the denomination.
+  **[V] 2026-07-31, confirmed by Parity's own docs** — <https://docs.polkadotcommunity.foundation/architecture/money/>:
+  *"CASH is the app-facing name for a devnet digital-dollar asset"*, implemented as a **local pUSD
+  asset (id `1`) on the People chain, held and transferred through Coinage**, and mirrored on Asset
+  Hub as asset **50000413 with gated transfers**. CASH and PAS are separate: CASH is the spendable
+  app balance, PAS is the native token for fees and existential deposits — which is why a tip shown
+  in PAS was wrong on its face. The page also directs apps to *"use the platform services exposed by
+  the host and SDK"* rather than reimplementing payment logic, i.e. `payment.*`, not raw transfers.
+  ⚠️ Note this retires the idea that pUSD was ever an *alternative* to CASH — it is the asset CASH
+  is made of. What was genuinely wrong earlier was reaching for pUSD's asset-transfer layer directly
+  instead of the host's payment service.
 - **Two money units, and mixing them is a 10⁴ error.** RFC-0006 `Balance` is `u128` **plancks**;
   RFC-0017 `CoinPaymentBalance` is `u32` **cents**. Confirmed against Parity's own `w3spay` on a real
   host: `plancks = cents × 10^(6−2)`. And `pallet-coinage` sets `UnderlyingAssetUnit = 10⁴`, so
@@ -202,6 +251,12 @@ Bulletin authorization error. Cost an hour. See gotchas.
    USDC and PGAS controls answer fine. It is not the `from` address, and the phrase appears nowhere
    in any `@parity` package. Whether `requestPayment` bypasses or wraps it is unproven. **If a real
    tip fails on a device, this is the first suspect, not a malformed call.**
+   **[V] 2026-07-31 — Parity's money page calls this out in plain language**: on Asset Hub CASH is
+   *"asset id 50000413 with gated transfers"* (<https://docs.polkadotcommunity.foundation/architecture/money/>).
+   So the gate is **intended design, not a misconfiguration**, and no amount of fixing our call shape
+   will open it. The page does not say what lifts the gate, so the question stands — but it also
+   tells apps to go through the host's payment service rather than the asset directly, which is the
+   strongest hint yet that `payment.request` is meant to be the thing that passes it.
 10. **Does the host settle `requestPayment` as a Coinage transfer or a plain pUSD transfer?** Parity's
     own two references contradict each other.
 11. **Does the production Polkadot app implement RFC-0006 at all?** The reference test host ships

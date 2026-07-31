@@ -106,11 +106,26 @@ describe("createPublisher", () => {
         return { txHash: "0x" };
       },
     });
-    await assert.rejects(
-      () => publisher!.publish({ registry: REGISTRY, build: () => draft("hi") }),
-      /Bulletin rejected/,
+    const error = await publisher!.publish({ registry: REGISTRY, build: () => draft("hi") }).then(
+      () => null,
+      (e: unknown) => e,
     );
+
+    // ⭐ THE INVARIANT THIS TEST EXISTS FOR, and it is the assertion below, not the message. The
+    // reverse ordering moves a head to a CID no gateway can serve — a permanent hole every later
+    // reader walks into.
     assert.deepEqual(rec, [], "a failed body must never leave a dangling pointer");
+
+    // `publish()` now wraps write failures for the user (`lib/host/errors.ts`), so the raw text is no
+    // longer the message. It is WRAPPED, NOT REPLACED — assert on both halves, because a wrapper that
+    // loses the cause is how a debuggable failure becomes an unactionable one.
+    assert.equal((error as { name?: string })?.name, "WriteFailure");
+    assert.match(String((error as { cause?: unknown })?.cause), /Bulletin rejected/);
+
+    // And the half that matters to the person: nothing was stored, so retrying is safe. A body
+    // failure must never inherit the "your post is saved" copy the pointer failures use.
+    assert.equal((error as { stored?: boolean })?.stored, false);
+    assert.doesNotMatch(String((error as { message?: string })?.message), /saved|not lost/i);
   });
 
   it("links a new object to the current head, and passes that head as `prev` on chain", async () => {

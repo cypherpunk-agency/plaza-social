@@ -3,11 +3,12 @@ import { useForumThread } from '../hooks/useForumThread';
 import { usePublisher } from '../hooks/usePublisher';
 import { useVoting } from '../hooks/useVoting';
 import { ThreadCard } from './ThreadCard';
+import { ThreadComposer } from './ThreadComposer';
 import { ThreadDetailView } from './ThreadDetailView';
+import { PANE_HEADER } from './paneChrome';
 import type { Provider, Signer } from '../utils/contracts';
 import type { Profile } from '../types/contracts';
 import toast from 'react-hot-toast';
-import { reportError } from '../lib/reportError';
 
 interface ForumViewProps {
   forumThreadAddress: string | null;
@@ -64,12 +65,14 @@ export function ForumView({
   onTip,
   canTip = false,
 }: ForumViewProps) {
-  const [showCreateForm, setShowCreateForm] = useState(false);
-  const [newTitle, setNewTitle] = useState('');
-  const [newContent, setNewContent] = useState('');
-  const [newTags, setNewTags] = useState<string[]>([]);
-  const [tagInput, setTagInput] = useState('');
-  const [isCreating, setIsCreating] = useState(false);
+  /**
+   * Is the composer open? The DRAFT is not here — it lives inside `ThreadComposer` and dies with it.
+   *
+   * ⚠️ This flag is a PANE STATE, not a strip toggle. It feeds `paneOpen` below, which is what makes
+   * the list column narrow at `xl` and disappear on a phone. See `ThreadComposer` for the rule about
+   * what happens to an open thread while the composer has the pane.
+   */
+  const [showComposer, setShowComposer] = useState(false);
 
   /**
    * ⚠️ SEPARATE FROM `disabled`. `disabled` covers the read-only session and also gates the per-card
@@ -79,11 +82,19 @@ export function ForumView({
    */
   const canCreateThread = !!usePublisher();
 
+  /**
+   * ⚠️ `replyCounts` IS NOT READ HERE ANY MORE, AND THAT IS WHY `countReplies` IS NOT PASSED.
+   *
+   * The list card used to carry a `[+] REPLIES (n)` expander; replies are the detail pane's job now,
+   * so the count has no consumer. The count is not a cheap read — `getHeadsPaged` on a thread's reply
+   * registry returns one head per REPLIER, so an accurate number means walking 25 chains and fetching
+   * their bodies. Leaving that switched on would be 25 chain walks per board load feeding nothing.
+   * If a count ever comes back to the list, pass `countReplies: true` and read `replyCounts`.
+   */
   const {
     threads,
     isLoading,
     error,
-    replyCounts,
     refresh,
     createThread,
     editThread,
@@ -110,38 +121,38 @@ export function ForumView({
     userAddress: currentAddress,
   });
 
-  const handleAddTag = () => {
-    const tag = tagInput.trim().toLowerCase();
-    if (tag && !newTags.includes(tag) && newTags.length < 5 && tag.length <= 32) {
-      setNewTags([...newTags, tag]);
-      setTagInput('');
-    }
+  /**
+   * The CID we just published, held only until it shows up on the board.
+   *
+   * ⚠️ THIS IS NOT AN IDENTITY MECHANISM — `createThread` returns the CID and we select it
+   * directly. This exists for ONE thing: `selectionMissing` below renders "THREAD NOT IN THIS PAGE"
+   * for a `?cid=` the loaded page does not contain, and a thread published a moment ago is exactly
+   * that until the board read lands. Telling an author their own brand-new thread is missing is the
+   * worst possible moment to be pessimistic, so while this matches the selection we render the
+   * LOADING branch instead. Cleared the instant the row appears — see the effect below.
+   */
+  const [justPublishedCid, setJustPublishedCid] = useState<string | null>(null);
+
+  /**
+   * Publish, then hand the pane over to the new thread — BY ITS CID, which `createThread` returns.
+   *
+   * ⚠️ MUST REJECT on failure — `ThreadComposer` keeps the draft on screen and calls `reportError`
+   * off the rejection. Swallowing the error here would close the composer over a thread that was
+   * never written. Note that an unconfirmed publish rejects too, so reaching the lines below means
+   * the head move is on chain and visible to the read RPC.
+   */
+  const handleCreateThread = async (title: string, content: string, tags: string[]) => {
+    const cid = await createThread(title, content, tags);
+    // Order matters only in that all of this happens after the await: closing first would unmount
+    // the composer while its submit handler is still running.
+    setJustPublishedCid(cid);
+    onThreadChange?.(cid);
+    setShowComposer(false);
+    toast.success('Thread created');
   };
 
-  const handleRemoveTag = (tagToRemove: string) => {
-    setNewTags(newTags.filter(t => t !== tagToRemove));
-  };
-
-  const handleCreateThread = async () => {
-    if (!newTitle.trim() || !newContent.trim() || isCreating) return;
-
-    setIsCreating(true);
-    try {
-      await createThread(newTitle, newContent, newTags);
-      setNewTitle('');
-      setNewContent('');
-      setNewTags([]);
-      setTagInput('');
-      setShowCreateForm(false);
-      toast.success('Thread created');
-    } catch (error) {
-      // ⚠️ NOT `toast.error('Failed to create thread')`. That sentence was the end of the trail: the
-      // real cause lived only in a console nobody can open on a phone. `reportError` keeps the toast
-      // short, makes it tap-to-copy, and files the detail in Settings → RECENT ERRORS.
-      reportError('create thread', error);
-    } finally {
-      setIsCreating(false);
-    }
+  const handleCancelComposer = () => {
+    setShowComposer(false);
   };
 
   const handleEditThread = async (threadIndex: number, newContent: string) => {
@@ -176,12 +187,35 @@ export function ForumView({
   }, [selectedThreadCid, legacyThreadIndex, threads, isLoading, onThreadChange]);
 
   /**
+   * Retire the just-published marker as soon as it has served its purpose.
+   *
+   * Two ways out, and both must be here or the marker outlives the publish: the row lands on the
+   * board (the normal case — `createThread` refreshes before it resolves, so this is usually true on
+   * the very first render after the selection), or the reader navigates somewhere else, in which
+   * case a stale marker would suppress a genuine "not in this page" for an unrelated link.
+   */
+  useEffect(() => {
+    if (!justPublishedCid) return;
+    if (selectedThreadCid !== justPublishedCid || selectedThread) setJustPublishedCid(null);
+  }, [justPublishedCid, selectedThreadCid, selectedThread]);
+
+  /**
    * A `?cid=` that is not in the loaded page. Real and expected: the page is capped at 50 chains,
    * and a body that has not resolved yet has no CID to match. Saying "not in this page" beats
    * silently dropping the selection, which would make a correct shared link look broken.
+   *
+   * ⚠️ EXCEPT FOR THE THREAD THAT WAS JUST PUBLISHED. `isLoading` is the COLD flag and stays false
+   * through a background refresh, so between selecting a new thread and the board committing the
+   * row, this predicate is otherwise true — and it would tell the author that what they just wrote
+   * is not here. The publish is already confirmed on chain at that point, so "loading" is the
+   * accurate word and the 30-second poll settles it.
    */
   const selectionMissing =
-    !!selectedThreadCid && !selectedThread && !isLoading && threads.length > 0;
+    !!selectedThreadCid &&
+    !selectedThread &&
+    !isLoading &&
+    threads.length > 0 &&
+    selectedThreadCid !== justPublishedCid;
 
   // Notify parent of thread title for page title
   useEffect(() => {
@@ -225,10 +259,21 @@ export function ForumView({
    * `hidden` / `flex` do the switching so that the detail pane is MOUNTED ONCE and only once: the
    * alternative (a JS media query picking between two subtrees) remounts `ReplyThread` on every
    * resize across the breakpoint, throwing away its loaded replies.
+   *
+   * ⚠️ `paneOpen` IS NOT "A THREAD IS SELECTED" ANY MORE. It is "the right-hand pane has something in
+   * it", and the COMPOSER counts. It drives BOTH columns' visibility, so leaving the composer out of
+   * it would mean the list column never narrows at `xl` and — much worse — stays full-width on a
+   * phone, covering the composer the user just opened. `threadPaneOpen` is the narrower question,
+   * and only the "LOADING THREAD..." branch below still wants it.
    */
-  const paneOpen = !!selectedThreadCid;
+  const threadPaneOpen = !!selectedThreadCid;
+  const paneOpen = threadPaneOpen || showComposer;
 
-  const detailPane = selectedThread ? (
+  const detailPane = showComposer ? (
+    // The composer WINS the pane. It does not clear `selectedThreadCid`, so cancelling drops
+    // straight back onto the thread below. See the header comment in `ThreadComposer`.
+    <ThreadComposer onCreate={handleCreateThread} onCancel={handleCancelComposer} />
+  ) : selectedThread ? (
     <ThreadDetailView
       thread={selectedThread}
       repliesAddress={repliesAddress}
@@ -268,7 +313,7 @@ export function ForumView({
         BACK TO FORUM
       </button>
     </div>
-  ) : paneOpen ? (
+  ) : threadPaneOpen ? (
     <div className="flex items-center justify-center h-full text-primary-600 font-mono text-sm">
       LOADING THREAD...
     </div>
@@ -285,9 +330,10 @@ export function ForumView({
       <div
         className={`${paneOpen ? 'hidden xl:flex' : 'flex'} flex-col h-full min-w-0 flex-1 xl:flex-none xl:w-[24rem] 2xl:w-[28rem] xl:border-r xl:border-primary-800`}
       >
-      {/* Header */}
-      <div className="px-4 py-3 border-b border-primary-700">
-        <div className="flex items-center justify-between">
+      {/* Header. Height comes from `PANE_HEADER`, not from content — its border and the detail
+          pane's are one continuous rule and must not drift. See `paneChrome.ts`. */}
+      <div className={PANE_HEADER}>
+        <div className="flex items-center justify-between w-full">
           <div className="font-mono">
             <span className="text-primary-500 text-lg">[FORUM]</span>
           </div>
@@ -299,9 +345,10 @@ export function ForumView({
             >
               {isLoading ? 'LOADING...' : 'REFRESH'}
             </button>
-            {!disabled && canCreateThread && !showCreateForm && (
+            {!disabled && canCreateThread && !showComposer && (
               <button
-                onClick={() => setShowCreateForm(true)}
+                type="button"
+                onClick={() => setShowComposer(true)}
                 className="px-3 py-1 text-xs font-mono text-primary-400 border border-primary-500 hover:bg-primary-900"
               >
                 + NEW THREAD
@@ -311,114 +358,9 @@ export function ForumView({
         </div>
       </div>
 
-      {/* Create Thread Form */}
-      {showCreateForm && (
-        <div className="border-b border-primary-700 p-4 bg-primary-950">
-          <div className="font-mono text-sm text-primary-400 mb-3">CREATE NEW THREAD</div>
-
-          <div className="mb-3">
-            <label className="block text-xs font-mono text-primary-600 mb-1">TITLE (max 200 chars)</label>
-            <input
-              type="text"
-              value={newTitle}
-              onChange={(e) => setNewTitle(e.target.value)}
-              placeholder="Thread title..."
-              className="w-full px-3 py-2 bg-black border border-primary-600 text-primary-400 font-mono text-sm focus:outline-none focus:border-primary-400"
-              maxLength={200}
-              disabled={isCreating}
-            />
-          </div>
-
-          <div className="mb-3">
-            <label className="block text-xs font-mono text-primary-600 mb-1">CONTENT (max 40,000 chars)</label>
-            <textarea
-              value={newContent}
-              onChange={(e) => setNewContent(e.target.value)}
-              placeholder="Thread content..."
-              className="w-full min-h-[120px] px-3 py-2 bg-black border border-primary-600 text-primary-400 font-mono text-sm focus:outline-none focus:border-primary-400 resize-y"
-              maxLength={40000}
-              disabled={isCreating}
-            />
-            <div className="text-xs font-mono text-primary-600 mt-1">
-              {newContent.length.toLocaleString()} / 40,000
-            </div>
-          </div>
-
-          <div className="mb-3">
-            <label className="block text-xs font-mono text-primary-600 mb-1">
-              TAGS (max 5, each max 32 chars)
-            </label>
-            <div className="flex gap-2 mb-2">
-              <input
-                type="text"
-                value={tagInput}
-                onChange={(e) => setTagInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    handleAddTag();
-                  }
-                }}
-                placeholder="Add a tag..."
-                className="flex-1 px-3 py-2 bg-black border border-primary-600 text-primary-400 font-mono text-sm focus:outline-none focus:border-primary-400"
-                maxLength={32}
-                disabled={isCreating || newTags.length >= 5}
-              />
-              <button
-                type="button"
-                onClick={handleAddTag}
-                disabled={isCreating || newTags.length >= 5 || !tagInput.trim()}
-                className="px-3 py-2 text-xs font-mono text-primary-500 border border-primary-600 hover:border-primary-400 disabled:opacity-50"
-              >
-                ADD
-              </button>
-            </div>
-            {newTags.length > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {newTags.map((tag) => (
-                  <span
-                    key={tag}
-                    className="inline-flex items-center gap-1 px-2 py-1 text-xs font-mono bg-primary-900 text-primary-400 border border-primary-700"
-                  >
-                    {tag}
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveTag(tag)}
-                      disabled={isCreating}
-                      className="text-primary-600 hover:text-primary-400"
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <div className="flex gap-2">
-            <button
-              onClick={handleCreateThread}
-              disabled={isCreating || !newTitle.trim() || !newContent.trim()}
-              className="px-4 py-2 text-xs font-mono text-primary-400 border border-primary-500 hover:bg-primary-900 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {isCreating ? 'CREATING...' : 'CREATE THREAD'}
-            </button>
-            <button
-              onClick={() => {
-                setShowCreateForm(false);
-                setNewTitle('');
-                setNewContent('');
-                setNewTags([]);
-                setTagInput('');
-              }}
-              disabled={isCreating}
-              className="px-4 py-2 text-xs font-mono text-primary-600 border border-primary-700 hover:border-primary-500"
-            >
-              CANCEL
-            </button>
-          </div>
-        </div>
-      )}
+      {/* ⚠️ THE CREATE FORM IS NOT HERE ANY MORE. It is `ThreadComposer`, rendered into the DETAIL
+          pane below — inline here it pushed the board down on a phone and left the 70ch pane empty
+          at `xl`. Do not re-add a composer to this column. */}
 
       {/* Error State */}
       {error && (
@@ -457,22 +399,14 @@ export function ForumView({
                   key={thread.cid || `idx-${thread.index}`}
                   thread={thread}
                   isSelected={!!thread.cid && thread.cid === selectedThreadCid}
-                  replyCount={thread.cid ? replyCounts[thread.cid] : undefined}
-                  repliesAddress={repliesAddress}
-                  votingAddress={votingAddress}
                   provider={provider}
-                  signer={signer}
-                  currentAddress={currentAddress}
                   getVoteTally={getVoteTally}
                   getUserVote={getUserVote}
                   vote={vote}
                   removeVote={removeVote}
                   isVoting={isVoting}
-                  onEdit={handleEditThread}
-                  onDelete={handleDeleteThread}
                   onSelectUser={onSelectUser}
                   onSelectThread={handleSelectThread}
-                  getDisplayName={getDisplayName}
                   disabled={disabled}
                   getProfile={getProfile}
                   onFollow={onFollow}

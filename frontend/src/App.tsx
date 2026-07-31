@@ -3,10 +3,12 @@ import { Toaster } from 'react-hot-toast';
 import { useUserRegistry } from './hooks/useUserRegistry';
 import { useHostSession } from './hooks/useHostSession';
 import { PublisherProvider } from './hooks/usePublisher';
+import { PaymentsProvider } from './hooks/usePayments';
 import { useDeployments } from './hooks/useDeployments';
 import { useFollowRegistry } from './hooks/useFollowRegistry';
 import { SessionStatus } from './components/SessionStatus';
-import { Sidebar, type ViewMode, type SidebarSection } from './components/Sidebar';
+import { Sidebar, SIDEBAR_DRAWER_ID, type ViewMode, type SidebarSection } from './components/Sidebar';
+import { PANE_HEADER } from './components/paneChrome';
 import { ProfileView } from './components/ProfileView';
 import { HostNotice } from './components/HostNotice';
 import { SettingsView } from './components/SettingsView';
@@ -30,6 +32,51 @@ import { readThreadSelection, writeThreadSelection } from './lib/threadLink';
  * host refuses to sign when the identifier disagrees with the URL it loaded.
  */
 const APP_NAME = 'plaza';
+
+/**
+ * A short name for whatever view a history entry represents. Used only as the *label* on the back
+ * control ("← BACK TO THREAD"); navigation itself is `history.back()`.
+ */
+type ViewLabel = 'FORUM' | 'THREAD' | 'PROFILE' | 'SETTINGS';
+
+/**
+ * What we stash on each history entry we push.
+ *
+ * ⚠️ `plazaDepth` IS HOW WE KNOW THERE IS ANYWHERE TO GO BACK TO, and it lives on the entry rather
+ * than in a React ref on purpose: a ref is reset by a reload, and a reloaded deep entry still has a
+ * real predecessor. A cold load has no state at all, so `undefined → 0` is exactly the "you arrived
+ * here directly" case. Forward navigation is handled for free, because the entry carries its own
+ * depth rather than us trying to count `popstate` events in the right direction.
+ *
+ * `plazaBackLabel` is the label of the entry we were LEAVING when this one was pushed — i.e. what
+ * `history.back()` will land on. Null means we do not honestly know, and the control says `← BACK`.
+ */
+interface PlazaHistoryState {
+  plazaDepth?: number;
+  plazaBackLabel?: ViewLabel | null;
+}
+
+function readHistoryState(): PlazaHistoryState {
+  const state = window.history.state as PlazaHistoryState | null;
+  return state && typeof state === 'object' ? state : {};
+}
+
+/**
+ * The label a URL denotes — the same precedence the `popstate` handler resolves state with (a thread
+ * selection wins over a profile, everything else is the forum), so a label can never promise a
+ * destination different from the one Back actually restores.
+ *
+ * Used to seed the FIRST entry of a session. Without it the first push has no recorded origin and
+ * the control degrades to a bare `← BACK`, which is the common case whenever a persisted
+ * `viewMode: 'profile'` moves the URL on load.
+ */
+function labelOfUrl(search: string): ViewLabel {
+  const params = new URLSearchParams(search);
+  const thread = readThreadSelection(params);
+  if (thread.cid || thread.legacyIndex !== null) return 'THREAD';
+  if (params.get('profile')) return 'PROFILE';
+  return 'FORUM';
+}
 
 function App() {
   // Load deployments from JSON file
@@ -222,6 +269,57 @@ function App() {
   // Track last URL to prevent duplicate history entries
   const lastUrlRef = useRef<string>(window.location.href);
 
+  /**
+   * ─── THE BACK CONTROL ──────────────────────────────────────────────────────────────────────────
+   *
+   * Reported: "when I click on a profile, I don't get a back button — but I was just reading a
+   * thread." The history stack was already correct — the navigation effect below `pushState`s every
+   * view change and the `popstate` handler above re-derives state from the URL — so `history.back()`
+   * genuinely does restore the thread. What was missing is an AFFORDANCE, and inside the host
+   * container it is the only possible one: Plaza runs in an iframe under the dot.li shell, so the
+   * address bar belongs to the shell and there is no browser Back the user can reach.
+   *
+   * ⚠️ SO DO NOT BUILD A PARALLEL NAVIGATION STACK. `previousViewState` does not exist and should
+   * not come back; the browser already holds this.
+   *
+   * The one thing `history.back()` cannot decide for itself is whether there is anything to go back
+   * TO. A cold load straight onto `?profile=0x…` — a shared link, or `viewMode` restored from
+   * localStorage — has the profile as the FIRST entry, and `back()` would leave Plaza entirely.
+   * `plazaDepth` on the history entry answers that: 0 (or absent) means we pushed nothing, so the
+   * control falls back to an explicit "BACK TO FORUM" that navigates by state instead.
+   */
+  const historyDepthRef = useRef<number>(readHistoryState().plazaDepth ?? 0);
+  /** The label of the view the CURRENT entry was pushed FROM. `null` → render a generic `← BACK`. */
+  const lastLabelRef = useRef<ViewLabel | null>(labelOfUrl(window.location.search));
+  const [backTarget, setBackTarget] = useState<{ canGoBack: boolean; label: ViewLabel | null }>(
+    () => {
+      const state = readHistoryState();
+      return {
+        canGoBack: (state.plazaDepth ?? 0) > 0,
+        label: state.plazaBackLabel ?? null,
+      };
+    },
+  );
+
+  /**
+   * ⚠️ SEPARATE FROM `sidebarExpanded` AND IT MUST STAY THAT WAY. `sidebarExpanded` is which
+   * SECTIONS of the nav are unfolded, and it is persisted. This is whether the nav PANEL is on
+   * screen at all below `xl`, and it is deliberately transient — a drawer that remembers being open
+   * across loads is a drawer that covers the app on arrival.
+   */
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+
+  /**
+   * Closing restores focus to the control that opened it. `Sidebar` owns moving focus IN; the
+   * toggle lives up here, so returning it is this side's job. Both `.focus()` calls are no-ops at
+   * `xl`, where the button is `display: none` and nothing was ever "opened".
+   */
+  const closeDrawer = useCallback(() => {
+    setDrawerOpen(false);
+    menuButtonRef.current?.focus();
+  }, []);
+
   // Sidebar expansion state
   const [sidebarExpanded, setSidebarExpanded] = useState(() => {
     const stored = localStorage.getItem('sidebarExpanded');
@@ -282,6 +380,15 @@ function App() {
 
       // Update lastUrlRef to current URL to prevent re-pushing
       lastUrlRef.current = window.location.href;
+
+      // The entry we just landed on carries its own depth and back-label, so Back and Forward are
+      // both handled without counting events or guessing a direction.
+      const historyState = readHistoryState();
+      historyDepthRef.current = historyState.plazaDepth ?? 0;
+      setBackTarget({
+        canGoBack: historyDepthRef.current > 0,
+        label: historyState.plazaBackLabel ?? null,
+      });
 
       // Determine view mode and selections from URL
       if (thread.cid || thread.legacyIndex !== null) {
@@ -391,12 +498,39 @@ function App() {
     // Update page title
     document.title = title;
 
+    /**
+     * The short name of the view this render represents. Recorded so the NEXT push can tell the
+     * back control what it will land on — the entry we are about to leave is described by the label
+     * from the previous run, which is what `lastLabelRef` holds at this point.
+     */
+    const label: ViewLabel =
+      viewMode === 'profile'
+        ? 'PROFILE'
+        : viewMode === 'settings'
+          ? 'SETTINGS'
+          : selectedThreadCid || legacyThreadIndex !== null
+            ? 'THREAD'
+            : 'FORUM';
+
     // Push to history if URL changed (use pushState for history entries)
     const newUrl = url.toString();
     if (newUrl !== lastUrlRef.current) {
-      window.history.pushState({}, title, newUrl);
+      const backLabel = lastLabelRef.current;
+      const depth = historyDepthRef.current + 1;
+      // ⚠️ The state object is no longer `{}`. It is what tells a later render whether Back has
+      // anywhere to go — see `PlazaHistoryState`. Anything else pushing history must carry it too,
+      // or the back control will silently offer to leave the app.
+      window.history.pushState(
+        { plazaDepth: depth, plazaBackLabel: backLabel } satisfies PlazaHistoryState,
+        title,
+        newUrl,
+      );
+      historyDepthRef.current = depth;
+      setBackTarget({ canGoBack: true, label: backLabel });
       lastUrlRef.current = newUrl;
     }
+
+    lastLabelRef.current = label;
   }, [viewMode, selectedProfile, selectedPost, selectedThreadCid, legacyThreadIndex, currentThreadTitle, currentProfileName, showRegistryInUrl, registryAddress]);
 
   // Modals
@@ -411,6 +545,39 @@ function App() {
       setViewMode('profile');
     }
   }, []);
+
+  /**
+   * Leaving a profile.
+   *
+   * ⚠️ TWO DIFFERENT MECHANISMS, AND THE CHOICE IS NOT COSMETIC. When this session pushed the entry
+   * (`plazaDepth > 0`), `history.back()` is the right move: the `popstate` handler re-derives
+   * `viewMode`, `selectedThreadCid` and `legacyThreadIndex` from the URL, so the thread you were
+   * reading comes back with its scroll position and its loaded replies, and Forward still works.
+   * Setting state instead would push a THIRD entry and strand the thread behind two Backs.
+   *
+   * When the profile IS the first entry — a shared `?profile=…` link, or `viewMode` restored from
+   * localStorage — `history.back()` would leave Plaza for whatever the container had open before,
+   * with no way home. So that case navigates by state to the forum, and the label says so.
+   */
+  const handleProfileBack = useCallback(() => {
+    if (backTarget.canGoBack) {
+      window.history.back();
+      return;
+    }
+    setViewMode('forum');
+    selectThread(null);
+    setSelectedPost(null);
+  }, [backTarget.canGoBack, selectThread]);
+
+  /**
+   * Named for where it actually goes, and generic only when we genuinely do not know — a `← BACK`
+   * that lands somewhere unexpected is worse than one that promised nothing.
+   */
+  const backLabel = !backTarget.canGoBack
+    ? 'BACK TO FORUM'
+    : backTarget.label
+      ? `BACK TO ${backTarget.label}`
+      : 'BACK';
 
   /**
    * ⛔ `requireWallet`, `handleSendMessage`, `canPost` and the channel-management permission check all lived
@@ -466,6 +633,12 @@ function App() {
       putBlob={host.backend ? (bytes, opts) => host.backend!.putBlob(bytes, opts) : null}
       hostWrite={host.backend?.writeContract ?? null}
     >
+    {/*
+      The CASH seam, provided once for the same reason the write path is: a hover card four levels
+      down needs it, and `canTip`/`onTip` are already drilled through nine components. `null` means
+      this session cannot pay — the honest state, not an error. See `hooks/usePayments.tsx`.
+    */}
+    <PaymentsProvider payments={host.backend?.payments ?? null}>
     <div className="h-screen bg-black flex flex-col scanline">
       <Toaster
         position="top-right"
@@ -507,7 +680,24 @@ function App() {
 
       {/* Header */}
       <header className="border-b-2 border-primary-500 bg-black">
-        <div className="flex items-center justify-between p-4">
+        <div className="flex items-center justify-between gap-3 p-4">
+          <div className="flex items-center gap-3 min-w-0">
+          {/* The drawer toggle. `xl:hidden` — above the breakpoint the nav is a static column and
+              there is nothing to toggle, which is also why `aria-expanded` is not a lie there: the
+              button does not exist. Only rendered when there IS a sidebar to open. */}
+          {registryAddress && (
+            <button
+              type="button"
+              ref={menuButtonRef}
+              onClick={() => (drawerOpen ? closeDrawer() : setDrawerOpen(true))}
+              aria-expanded={drawerOpen}
+              aria-controls={SIDEBAR_DRAWER_ID}
+              className="xl:hidden shrink-0 px-3 py-2 leading-none font-mono text-lg text-primary-500 border border-primary-700 hover:border-primary-500 transition-colors"
+            >
+              <span aria-hidden="true">&#9776;</span>
+              <span className="sr-only">Navigation menu</span>
+            </button>
+          )}
           <button
             onClick={() => {
               // ⚠️ WAS `setSelectedThread(0)`. The home button selected the FIRST THREAD in the
@@ -516,15 +706,18 @@ function App() {
               setViewMode('forum');
               selectThread(null);
             }}
-            className="flex items-baseline gap-4 hover:opacity-80 transition-opacity"
+            className="flex items-baseline gap-4 min-w-0 hover:opacity-80 transition-opacity"
           >
             <h1 className="text-2xl font-bold text-primary-500 text-shadow-neon">
               PLAZA
             </h1>
-            <span className="text-sm text-accent-400 text-shadow-neon-sm font-mono">
+            {/* `truncate min-w-0` so the added toggle cannot push a 375px header into horizontal
+                scroll — the tagline gives way, the wordmark and the toggle do not. */}
+            <span className="text-sm text-accent-400 text-shadow-neon-sm font-mono truncate min-w-0">
               DECENTRALIZED SOCIAL
             </span>
           </button>
+          </div>
           <SessionStatus
             isInitializing={host.isInitializing}
             canRead={host.canRead}
@@ -553,6 +746,8 @@ function App() {
             currentUserAddress={walletConfig.activeAddress}
             currentUserDisplayName={userRegistry.profile?.displayName || null}
             forumAvailable={!!forumThreadAddress}
+            isDrawerOpen={drawerOpen}
+            onCloseDrawer={closeDrawer}
           />
         )}
 
@@ -643,6 +838,20 @@ function App() {
               member, so nothing can route here. */}
           {viewMode === 'profile' ? (
             // Profile view
+            <>
+            {/* The way back. Inside the host container Plaza is an iframe under the dot.li shell,
+                so there is no address bar and no browser Back within reach — an in-app control is
+                the ONLY exit. Shares `PANE_HEADER` with the forum's two panes so the row is the
+                same height and its border the same rule. */}
+            <div className={PANE_HEADER}>
+              <button
+                type="button"
+                onClick={handleProfileBack}
+                className="text-sm font-mono text-primary-500 hover:text-primary-400 whitespace-nowrap transition-colors"
+              >
+                &larr; {backLabel}
+              </button>
+            </div>
             <ProfileView
               userAddress={selectedProfile}
               currentUserAddress={walletConfig.activeAddress}
@@ -678,6 +887,7 @@ function App() {
               selectedPostFromUrl={selectedPost}
               onPostChange={setSelectedPost}
             />
+            </>
           ) : viewMode === 'forum' ? (
             // Forum view (public threads)
             <ForumView
@@ -719,6 +929,17 @@ function App() {
               onAuthorizeDelegate={host.authorizeDelegate}
               onRevokeDelegate={host.revokeDelegate}
               onRequestAllowanceAgain={host.requestAllowanceAgain}
+              /**
+               * ⚠️ THE ONLY THING THAT LETS SETTINGS SAY "AUTHORISED" TRUTHFULLY.
+               *
+               * Without it the screen can never reach its confirmed outcome and falls back to a
+               * neutral "sent, check the line above" — because the seam resolving is NOT evidence
+               * the chain agrees. `confirmDelegate` polls `delegateExpiry`, which is the same
+               * poll-until-visible rule every host-signed write in this app obeys: the host settles
+               * at best-block, we read through a separate public RPC that trails it, and
+               * `eth_getLogs` cannot see host-submitted calls at all. See gotchas.md.
+               */
+              onConfirmDelegate={(address) => userRegistry.confirmDelegate(address, 'authorised')}
             />
           ) : null}
           </div>
@@ -757,6 +978,7 @@ function App() {
       )}
 
       </div>
+    </PaymentsProvider>
     </PublisherProvider>
   );
 }

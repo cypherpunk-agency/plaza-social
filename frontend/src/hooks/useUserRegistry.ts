@@ -51,9 +51,32 @@ interface UseUserRegistryReturn {
   removeLink: (index: number) => Promise<void>;
   clearLinks: () => Promise<void>;
 
-  // Delegate actions
-  addDelegate: (delegateAddress: string) => Promise<void>;
-  removeDelegate: (delegateAddress: string) => Promise<void>;
+  // Delegate actions.
+  //
+  // ⚠️ `addDelegate` / `removeDelegate` USED TO BE HERE AND CALLED FUNCTIONS THE CONTRACT DOES NOT
+  // HAVE. `UserRegistry` exposes `authorizeDelegate(address,uint64)` and `revokeDelegate(address)`;
+  // there has never been an `addDelegate`. They also went out through `getWriteContract`, i.e. the
+  // delegate arm, for an OWNER-ONLY call. Both are the failure mode `frontend/CLAUDE.md` calls "a
+  // call naming a function the target does not have" — it would have surfaced as `require(false)`
+  // and read as a contract rejecting the user. Nothing imported them, so nothing broke; they are
+  // replaced rather than fixed in place.
+  /**
+   * Authorise `delegateAddress` until `expiryUnixSeconds`, host-signed, then POLL until the chain
+   * agrees. Resolves to the confirmed expiry in epoch **milliseconds**, or `null` when the reader
+   * never saw it — which the caller must treat as "not authorised", never as success.
+   */
+  authorizeDelegate: (delegateAddress: string, expiryUnixSeconds: number) => Promise<number | null>;
+  /** Revoke, host-signed, then poll until the chain shows it gone. `null` means confirmed revoked. */
+  revokeDelegate: (delegateAddress: string) => Promise<number | null>;
+  /** One read. Live expiry in epoch ms, or `null` for absent/expired. */
+  delegateExpiry: (delegateAddress: string) => Promise<number | null>;
+  /** Poll until the chain shows the expected state, or give up. Never throws. */
+  confirmDelegate: (
+    delegateAddress: string,
+    expect: "authorised" | "revoked",
+  ) => Promise<number | null>;
+  /** `MAX_DELEGATION_SECONDS`, read rather than assumed — the contract REVERTS above it. */
+  maxDelegationSeconds: () => Promise<number | null>;
   isDelegate: (delegateAddress: string) => Promise<boolean>;
 
   // Lookup
@@ -301,29 +324,142 @@ export function useUserRegistry({
     await loadProfile();
   }, [enabled, getDelegateWriteContract, loadProfile]);
 
-  const addDelegate = useCallback(
-    async (delegateAddress: string) => {
-      if (!enabled) throw new Error("Wallet not ready");
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
+  /* ------------------------------------------------------------------ delegation - */
 
-      const tx = await contract.addDelegate(delegateAddress);
-      await tx.wait();
+  /**
+   * What the contract records for `(user, delegate)` right now, in epoch **milliseconds**, or `null`
+   * when there is no live authorisation.
+   *
+   * ⚠️ `delegateExpiry`, NOT `isDelegate`. `isDelegate` collapses "never authorised" and "authorised
+   * but expired" into the same `false`, and the posting-key panel says different sentences for those
+   * two ("your next post will set it up" vs "…will renew it"). The contract's own NatSpec says the
+   * same thing: read `delegateExpiry` when you need to know *when*, `isDelegate` for *whether*.
+   *
+   * ⚠️ THE CONTRACT STORES UNIX SECONDS; everything above the hook boundary is milliseconds
+   * (`frontend/CLAUDE.md` § timestamps — the mismatch that once rendered a post as 58548-06-08).
+   * Converted here, once.
+   */
+  const delegateExpiry = useCallback(
+    async (delegateAddress: string): Promise<number | null> => {
+      if (!userAddress) return null;
+      const contract = getReadContract();
+      if (!contract) return null;
+
+      const seconds = await contract.delegateExpiry(userAddress, delegateAddress);
+      const ms = Number(seconds) * 1000;
+      return Number.isFinite(ms) && ms > Date.now() ? ms : null;
     },
-    [enabled, getWriteContract]
+    [getReadContract, userAddress]
   );
 
-  const removeDelegate = useCallback(
-    async (delegateAddress: string) => {
-      if (!enabled) throw new Error("Wallet not ready");
-      const contract = await getWriteContract();
-      if (!contract) throw new Error("Contract not available");
-
-      const tx = await contract.removeDelegate(delegateAddress);
-      await tx.wait();
+  /**
+   * ⚠️ POLL UNTIL THE CHAIN AGREES. Same rule, and the same reason, as `waitForProfile` above: the
+   * host submits at best-block while we read through a SEPARATE public RPC that can trail it, so one
+   * read straight after the write returns the OLD value and the failure is silent. `eth_getLogs`
+   * cannot see host-submitted contract calls at all (architecture §8), so `DelegateAuthorized` is no
+   * help and polling the view function is the correct mechanism rather than a workaround.
+   *
+   * Returns the LAST OBSERVED expiry — so a caller can distinguish "confirmed authorised" (a number)
+   * from "we never saw it" (`null`). Giving up is not an error and this never throws, but ⛔ `null`
+   * must never be reported to the user as success: not seeing it is exactly the case in which the
+   * write silently did nothing.
+   */
+  const confirmDelegate = useCallback(
+    async (
+      delegateAddress: string,
+      expect: "authorised" | "revoked",
+      timeoutMs = 30_000,
+      intervalMs = 1_500
+    ): Promise<number | null> => {
+      const deadline = Date.now() + timeoutMs;
+      let observed: number | null = null;
+      for (;;) {
+        try {
+          observed = await delegateExpiry(delegateAddress);
+          const matches = expect === "authorised" ? observed !== null : observed === null;
+          if (matches) return observed;
+        } catch {
+          /* a transient read failure is not a reason to stop waiting */
+        }
+        if (Date.now() >= deadline) return observed;
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
     },
-    [enabled, getWriteContract]
+    [delegateExpiry]
   );
+
+  /**
+   * ⚠️ OWNER-ONLY — MUST be host-signed, for both of the reasons in `gotchas.md` § "Host-signed
+   * contract writes". The contract keys the delegation on `msg.sender`, so a delegate-signed call
+   * would authorise a delegate *for the delegate*; and the delegate is an H160 nobody funds
+   * (balance 0.0, nonce 0, [V] 2026-07-30), which produces `code 1012 "Transaction is temporarily
+   * banned"` rather than anything legible.
+   *
+   * ⚠️ `expiryUnixSeconds` IS AN ABSOLUTE TIMESTAMP, not a duration. `lib/host/delegate.ts` hands
+   * its injected `authorizeOnChain` a DURATION in seconds, so a caller bridging the two must add
+   * `Math.floor(Date.now() / 1000)`. Passing a duration would be a timestamp in 1970 and revert with
+   * `ExpiryInPast`; passing more than `MAX_DELEGATION_SECONDS` ahead reverts with `ExpiryTooFar`.
+   * `0` is not an error — the contract treats it as a revoke.
+   */
+  const authorizeDelegate = useCallback(
+    async (delegateAddress: string, expiryUnixSeconds: number): Promise<number | null> => {
+      if (!registryAddress) throw new Error("Contract not available");
+      if (!hostWrite) {
+        throw new Error(
+          "Authorising a posting key has to be signed by your Polkadot account, and this session " +
+            "cannot reach it. Open Plaza inside the Polkadot app and try again.",
+        );
+      }
+
+      await hostWrite(
+        registryAddress,
+        UserRegistryABI.abi as unknown as Record<string, unknown>[],
+        "authorizeDelegate",
+        [delegateAddress, BigInt(Math.floor(expiryUnixSeconds))],
+        "authorizeDelegate",
+      );
+
+      return confirmDelegate(delegateAddress, "authorised");
+    },
+    [registryAddress, hostWrite, confirmDelegate]
+  );
+
+  /** Owner-only for the same reasons, and `revokeDelegate` is idempotent on chain. */
+  const revokeDelegate = useCallback(
+    async (delegateAddress: string): Promise<number | null> => {
+      if (!registryAddress) throw new Error("Contract not available");
+      if (!hostWrite) {
+        throw new Error(
+          "Revoking a posting key has to be signed by your Polkadot account, and this session " +
+            "cannot reach it. Open Plaza inside the Polkadot app and try again.",
+        );
+      }
+
+      await hostWrite(
+        registryAddress,
+        UserRegistryABI.abi as unknown as Record<string, unknown>[],
+        "revokeDelegate",
+        [delegateAddress],
+        "revokeDelegate",
+      );
+
+      return confirmDelegate(delegateAddress, "revoked");
+    },
+    [registryAddress, hostWrite, confirmDelegate]
+  );
+
+  /**
+   * Read rather than assume: `authorizeDelegate` REVERTS above the maximum instead of clamping, and
+   * asking for exactly the maximum has already been measured reverting with `ExpiryTooFar` — see
+   * `lib/host/delegate.ts` § CLOCK_SKEW_SLACK_SECONDS, which is what subtracts the slack.
+   */
+  const maxDelegationSeconds = useCallback(async (): Promise<number | null> => {
+    const contract = getReadContract();
+    if (!contract) return null;
+    const value = await contract.MAX_DELEGATION_SECONDS();
+    const seconds = Number(value);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+  }, [getReadContract]);
 
   const isDelegate = useCallback(
     async (delegateAddress: string): Promise<boolean> => {
@@ -399,8 +535,11 @@ export function useUserRegistry({
     addLink,
     removeLink,
     clearLinks,
-    addDelegate,
-    removeDelegate,
+    authorizeDelegate,
+    revokeDelegate,
+    delegateExpiry,
+    confirmDelegate,
+    maxDelegationSeconds,
     isDelegate,
     resolveToOwner,
     getProfile: getProfileFn,

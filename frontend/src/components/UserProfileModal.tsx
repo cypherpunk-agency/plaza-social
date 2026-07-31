@@ -1,9 +1,14 @@
 import { useState, useEffect } from 'react';
-import { AddressDisplay } from './UserAddress';
+import { AddressDisplay, CashBalance, ownCashBalanceState } from './UserAddress';
 import { TipModal } from './TipModal';
-import { formatBalance } from '../utils/formatters';
+import { usePayments, useOwnCashBalance } from '../hooks/usePayments';
 import type { Profile, Link } from '../types/contracts';
 import type { Signer, Provider } from '../utils/contracts';
+
+// ⚠️ THIS COMPONENT HAS ZERO IMPORTERS (checked 2026-07-31). `App.tsx` renders `ProfileView` for the
+// profile surface; this modal is parked, like the chat components. It is kept in step with
+// `ProfileView` anyway — a parked file that has drifted is worse than one that has not, and the two
+// are meant to offer the same TIP affordance if this one is ever revived.
 
 interface UserProfileModalProps {
   isOpen: boolean;
@@ -18,12 +23,15 @@ interface UserProfileModalProps {
   followRegistryAvailable?: boolean;
   // Links
   getLinks?: (address: string) => Promise<Link[]>;
-  // Tipping
+  /** Whether this session can pay at all. Derive it from the payment seam, never from `canWrite`. */
+  canTip?: boolean;
+  /** @deprecated Unused. The delegate key is not a payer; see `TipModal`. */
   sessionWallet?: Signer | null;
+  /** @deprecated Unused. */
   sessionWalletAddress?: string | null;
+  /** @deprecated Unused. */
   sessionWalletBalance?: bigint;
-  // Was `browserProvider` (MetaMask), used only to READ a balance — so it never needed a wallet
-  // at all. Now the anonymous read provider. `browserWalletAddress` is gone with the MetaMask path.
+  /** @deprecated Unused since the balance chip became CASH. See `UserAddress/CashBalance.tsx`. */
   provider?: Provider | null;
 }
 
@@ -38,10 +46,8 @@ export function UserProfileModal({
   onUnfollow,
   followRegistryAvailable = false,
   getLinks,
-  sessionWallet,
-  sessionWalletAddress,
-  sessionWalletBalance,
-  provider,
+  canTip = false,
+  // `sessionWallet*` and `provider` are deliberately NOT destructured — see their @deprecated notes.
 }: UserProfileModalProps) {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [links, setLinks] = useState<Link[]>([]);
@@ -49,9 +55,15 @@ export function UserProfileModal({
   const [error, setError] = useState<string | null>(null);
   const [followActionLoading, setFollowActionLoading] = useState(false);
   const [showTipModal, setShowTipModal] = useState(false);
-  const [profileBalance, setProfileBalance] = useState<bigint>(0n);
 
   const isOwnProfile = userAddress?.toLowerCase() === currentUserAddress?.toLowerCase();
+
+  const payments = usePayments();
+  // CASH, not PAS, and only ever our own — see `UserAddress/CashBalance.tsx`.
+  const ownBalance = useOwnCashBalance(isOpen && isOwnProfile);
+  const balanceState = isOwnProfile
+    ? ownCashBalanceState(ownBalance)
+    : ({ kind: 'private' } as const);
 
   const handleFollow = async () => {
     if (!userAddress || !onFollow) return;
@@ -102,16 +114,10 @@ export function UserProfileModal({
     }
   }, [isOpen, userAddress, getLinks]);
 
-  // Fetch profile balance
+  // A stale tip sheet must not follow you to the next person.
   useEffect(() => {
-    if (isOpen && userAddress && provider) {
-      provider.getBalance(userAddress)
-        .then(setProfileBalance)
-        .catch(() => setProfileBalance(0n));
-    } else {
-      setProfileBalance(0n);
-    }
-  }, [isOpen, userAddress, provider]);
+    setShowTipModal(false);
+  }, [userAddress, isOpen]);
 
   if (!isOpen || !userAddress) return null;
 
@@ -164,9 +170,7 @@ export function UserProfileModal({
                     <span className="text-primary-300 font-mono text-sm">
                       {profile.displayName || '(unnamed)'}
                     </span>
-                    <span className="text-primary-400 font-mono text-xs">
-                      {formatBalance(profileBalance)} PAS
-                    </span>
+                    <CashBalance state={balanceState} className="text-primary-400 text-xs" />
                   </div>
                 </div>
               </div>
@@ -226,10 +230,19 @@ export function UserProfileModal({
           <div className="space-y-2 mt-4">
             {!isOwnProfile && (
               <>
-                {sessionWallet && userAddress && (
+                {/* ⛔ Gated on `canTip` (the payment seam), NOT on `sessionWallet`. The delegate
+                    key is never funded and is not on the payment path at all. */}
+                {userAddress && (
                   <button
+                    type="button"
                     onClick={() => setShowTipModal(true)}
-                    className="w-full py-2 bg-yellow-950 hover:bg-yellow-900 border-2 border-yellow-500 text-yellow-400 font-mono text-sm hover:border-yellow-400 transition-all"
+                    disabled={!canTip}
+                    title={canTip ? undefined : 'Tipping pays in CASH from your Polkadot app balance.'}
+                    className={`w-full py-2 border-2 font-mono text-sm transition-all ${
+                      canTip
+                        ? 'bg-yellow-950 hover:bg-yellow-900 border-yellow-500 text-yellow-400 hover:border-yellow-400'
+                        : 'bg-gray-900 border-gray-700 text-gray-600 cursor-not-allowed'
+                    }`}
                   >
                     SEND TIP
                   </button>
@@ -274,9 +287,7 @@ export function UserProfileModal({
           onClose={() => setShowTipModal(false)}
           recipientAddress={userAddress}
           recipientName={profile?.displayName}
-          sessionWallet={sessionWallet}
-          sessionWalletAddress={sessionWalletAddress}
-          sessionWalletBalance={sessionWalletBalance}
+          payments={payments}
         />
       )}
     </div>

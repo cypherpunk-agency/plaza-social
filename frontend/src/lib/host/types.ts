@@ -124,14 +124,20 @@ export type AllocationOutcome = 'Allocated' | 'Rejected' | 'NotAvailable'
  * are to argue with:
  *
  *  1. **The host does not implement it.** Every `coin_payment_*` handler is absent from the
- *     reference host bundle (`@parity/host-api-test-sdk`: zero occurrences of `coinPayment`,
- *     `receivable`, `cheque`, `Purse`) and from the public iOS host's product bridge, which
- *     carries only the four RFC-0006 handlers. In the RFC's own Rust trait every method defaults
- *     to `Err(unavailable())`. `@parity/product-sdk-host` wraps NONE of it.
- *  2. **A tip cannot be addressed in that model.** RFC-0017 pays to a `CoinPaymentReceivable` — an
- *     ephemeral public key that only the PAYEE's own running product can mint, bound to a
- *     product-scoped purse. There is no way to derive one from an address, a username or a
- *     profile. The recipient of a tip is, by definition, not here.
+ *     reference host bundle (`@parity/host-api-test-sdk`: the bundle's wire table declares exactly
+ *     four `host_payment_*` methods — `balance_subscribe`, `request`, `status_subscribe`,
+ *     `top_up` — and NO `host_coin_payment_*` at all) and from the public iOS host's product
+ *     bridge. In the RFC's own Rust trait every method defaults to `Err(unavailable())`.
+ *     `@parity/product-sdk-host` wraps NONE of it — `getPaymentManager()` is the only money
+ *     wrapper it ships, and `testing.ts` lists `coinPayment` under `notModeled`.
+ *  2. **A tip cannot be addressed in that model.** ⭐ THIS IS THE ONE THAT SETTLES IT. Read the
+ *     signatures: `createReceivable({ into: CoinPaymentPurseId }) → { receivable }` and
+ *     `createCheque({ from: CoinPaymentPurseId, to: CoinPaymentReceivable, amount })`. A
+ *     `CoinPaymentReceivable` is "public key identifying a CoinPayment receivable", minted by the
+ *     PAYEE's own host against the PAYEE's own purse. **There is no account, address, handle or
+ *     name anywhere in the `coinPayment` domain** — the only recipient-shaped value it has, it
+ *     cannot construct for somebody who is not present. So `coinPayment` does not remove the need
+ *     to resolve an account; it replaces it with a strictly harder requirement.
  *  3. **Delivery rides the statement store.** `CoinPaymentTransmissionChannel` has exactly one
  *     variant, `Standard { sssTopic }`. Our own `canPushLive` is false for most accounts, so the
  *     handoff channel is unavailable precisely when we would need it.
@@ -159,6 +165,30 @@ export type TipBlocker =
   /** No `Revive.OriginalAccount` entry — this H160 cannot be resolved to a payable account. */
   | 'unrecipient'
 
+/**
+ * What `resolveRecipient` found. THREE outcomes, not two.
+ *
+ * ⭐ THE SPLIT BETWEEN `unmapped` AND `unavailable` IS THE WHOLE POINT OF THIS TYPE, and collapsing
+ * it is the bug this replaced. The old seam returned `string | null`, so "the chain says this person
+ * has no account mapping" and "we never managed to ask the chain" arrived as the same `null` — and
+ * the modal turned both into the confident sentence *"they have never made a transaction"*. That
+ * sentence was, in every real session, a statement about OUR failure dressed up as a fact about the
+ * user being tipped.
+ *
+ * It was not hypothetical: the lookup used `state_getStorage` through the host's PAPI provider, and
+ * that provider is a fixed switch over `chainHead_v1_*` / `chainSpec_v1_*` / `transaction_v1_*`
+ * whose default branch answers `-32601 Method "…" is not supported by the host`
+ * (`@parity/product-sdk-host/src/papi-provider.ts`). So inside a real container the lookup could
+ * never succeed for ANYONE, and every recipient read as unpayable.
+ */
+export type RecipientResolution =
+  /** Payable. `destination` is 32 raw bytes as `0x…`, exactly what `payment.request` takes. */
+  | { status: 'ready'; destination: string }
+  /** Asked, and the chain has no `Revive.OriginalAccount` row. A fact about the recipient. */
+  | { status: 'unmapped' }
+  /** Could not ask. A fact about US. Never phrase this as something the recipient did or didn't do. */
+  | { status: 'unavailable'; reason: string }
+
 export type TipOutcome =
   | { status: 'sent' }
   /** The user declined the host's confirmation sheet. Not an error; do not shout about it. */
@@ -180,15 +210,24 @@ export interface PaymentsSeam {
   subscribeBalance: (listener: (available: bigint | null) => void) => () => void
 
   /**
-   * Resolve an H160 to the 32-byte account `requestPayment` needs, via `Revive.OriginalAccount`.
+   * Resolve an H160 to the 32-byte account `payment.request` needs, via `Revive.OriginalAccount`.
    *
-   * ⛔ RETURNS `null` WHEN THERE IS NO MAPPING, AND THE CALLER MUST REFUSE. Never fall back to
-   * `h160ToSs58()` or any other derivation: those build the 0xEE-suffixed *fallback* account, which
-   * is a DIFFERENT account that nobody holds a key for. Verified on chain — for the one real Plaza
-   * writer, `OriginalAccount` gives `5EJ3VTQ…` while the derivation gives `5CcnRhQ…`. Paying the
-   * second destroys the money. The mapping is a lookup, never a computation.
+   * ⛔ NEVER FALL BACK TO A DERIVATION when the lookup comes up empty. `h160ToSs58()` and friends
+   * build the 0xEE-suffixed *fallback* account, which is a DIFFERENT account that nobody holds a
+   * key for. Verified on chain — for the one real Plaza writer, `OriginalAccount` gives `5EJ3VTQ…`
+   * while the derivation gives `5CcnRhQ…`. Paying the second destroys the money. The mapping is a
+   * lookup, never a computation.
+   *
+   * ⚠️ THE READ MUST GO THROUGH THE TYPED PAPI QUERY, i.e. `chainHead_v1_storage`. A raw
+   * `_request('state_getStorage', …)` is answered `-32601 not supported by the host` by the
+   * container's PAPI bridge — see `RecipientResolution`.
+   *
+   * The typed descriptor is `OriginalAccount: StorageDescriptor<[SizedHex<20>], SS58String, true>`,
+   * so it hands back SS58 and the seam decodes it to bytes. That decode (`ss58Decode`) is lossless
+   * and is NOT the forbidden derivation: verified locally, `5EJ3VTQ…` decodes to exactly the
+   * `0x62a4c082…903d2f` the raw storage read used to return.
    */
-  resolveRecipient: (h160Address: string) => Promise<string | null>
+  resolveRecipient: (h160Address: string) => Promise<RecipientResolution>
 
   /** Ask the host to debit the USER and pay `destination`. Prompts; never silent. */
   sendTip: (destination: string, amount: bigint) => Promise<TipOutcome>

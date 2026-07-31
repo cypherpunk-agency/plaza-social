@@ -1,8 +1,25 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { Message, FormattedMessage, ChannelInfo, PostingMode } from "../types/contracts";
 import ChatChannelABI from "../contracts/ChatChannel.json";
 import { formatTimestamp } from "../utils/formatters";
 import { createReadContract, createWriteContract, type Provider, type Signer } from "../utils/contracts";
+import { createRefreshGate, refresh, startPolling, type RefreshMode } from "../lib/poll";
+
+/**
+ * ⛔ THIS HOOK IS PARKED. It still calls the DELETED `ChatChannel` contract, has zero importers, and
+ * every call it makes reverts. It is on disk as the starting point for the chat migration.
+ *
+ * It is nevertheless on `lib/poll.ts` like the other three list hooks, because the flicker bug it
+ * shares with them — a 30-second interval re-entering the cold loader, which announces loading and
+ * empties the array before it fetches — must not survive anywhere in the codebase to be copied out
+ * of. When chat is migrated to `PostRegistry` + `walkChain`, the polling half is already correct.
+ */
+
+/**
+ * Chat polls faster than the boards do — a conversation is a worse experience 30 seconds stale than
+ * a forum list is. Deliberately NOT `POLL_INTERVAL_MS`; the divergence is the point.
+ */
+const CHAT_POLL_INTERVAL_MS = 15_000;
 
 interface UseChannelProps {
   channelAddress: string | null;
@@ -16,7 +33,14 @@ interface UseChannelReturn {
   // State
   messages: FormattedMessage[];
   channelInfo: ChannelInfo | null;
+  /** True only for a COLD load — nothing on screen yet. */
   isLoading: boolean;
+  /**
+   * True while a BACKGROUND poll is in flight, with the previous messages still on screen.
+   *
+   * ⚠️ NEVER unmount the message list on this — see `lib/poll.ts`.
+   */
+  isRefreshing: boolean;
   error: string | null;
 
   // Actions
@@ -45,12 +69,32 @@ export function useChannel({
   const [messages, setMessages] = useState<FormattedMessage[]>([]);
   const [channelInfo, setChannelInfo] = useState<ChannelInfo | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const pollIntervalRef = useRef<number | null>(null);
   const hasAttemptedDisplayNameFetch = useRef(false);
   // Ref to always have the latest loadMessages function for polling
-  const loadMessagesRef = useRef<(() => Promise<void>) | null>(null);
+  const loadMessagesRef = useRef<((mode?: RefreshMode) => Promise<void>) | null>(null);
+
+  /**
+   * The last committed message list, mirrored into a ref.
+   *
+   * ⚠️ THE EQUALITY SKIP MUST READ THIS, NOT `messages` — a `useCallback` closes over the `messages`
+   * of the render that created it. Everything that writes `messages` goes through `commitMessages`.
+   */
+  const messagesRef = useRef<FormattedMessage[]>([]);
+  const commitMessages = useCallback((next: FormattedMessage[]) => {
+    messagesRef.current = next;
+    setMessages(next);
+  }, []);
+
+  /**
+   * Orders concurrent refreshes so a slow one cannot overwrite a newer one. Without it: the poll
+   * starts fetching, the user sends a message, the post-write reload commits it — and then the
+   * poll's PRE-WRITE snapshot resolves and rolls the room back, silently.
+   * See `lib/poll.ts` § RefreshGate.
+   */
+  const gate = useMemo(() => createRefreshGate(), []);
 
   const getReadContract = useCallback(() => {
     return createReadContract(channelAddress, ChatChannelABI.abi, provider);
@@ -79,59 +123,76 @@ export function useChannel({
     }
   }, [getReadContract]);
 
-  const loadMessages = useCallback(async () => {
+  /** The FETCH half: reads and returns a list. It touches no state and announces nothing. */
+  const fetchMessages = useCallback(async (): Promise<FormattedMessage[]> => {
     const contract = getReadContract();
-    if (!contract) {
-      setMessages([]);
-      return;
-    }
+    if (!contract) return [];
 
-    try {
-      setIsLoading(true);
-      setError(null);
+    const count = await contract.getMessageCount();
+    // An empty room is a RESULT, not a failure — returned and diffed like any other.
+    if (count === 0n) return [];
 
-      const count = await contract.getMessageCount();
-      if (count === 0n) {
-        setMessages([]);
+    // Load latest 50 messages
+    const limit = count > 50n ? 50n : count;
+    const rawMessages = await contract.getLatestMessages(limit);
+
+    // Format messages and optionally resolve display names
+    return Promise.all(
+      rawMessages.map(async (msg: Message) => {
+        let displayName: string | undefined;
+        if (getDisplayName) {
+          try {
+            displayName = await getDisplayName(msg.profileOwner);
+          } catch {
+            displayName = undefined;
+          }
+        }
+
+        return {
+          profileOwner: msg.profileOwner,
+          sender: msg.sender,
+          content: msg.content,
+          timestamp: Number(msg.timestamp),
+          // `* 1000` because this is a Solidity `block.timestamp`, in SECONDS, while
+          // `formatTimestamp` takes epoch ms like the rest of the migrated data layer.
+          formattedTime: formatTimestamp(Number(msg.timestamp) * 1000),
+          displayName,
+        };
+      })
+    );
+  }, [getReadContract, getDisplayName]);
+
+  /**
+   * The ANNOUNCE half. `mode` decides whether this load may blank the screen.
+   *
+   * - `"cold"` — nothing on screen yet, or the channel changed.
+   * - `"background"` — the poll. Keeps the current messages up, raises `isRefreshing`, commits only
+   *   on a real change, and on failure keeps the last good list.
+   *
+   * ⛔ Never infer the mode from `messages.length === 0`; see `lib/poll.ts`.
+   */
+  const loadMessages = useCallback(
+    async (mode: RefreshMode = "cold"): Promise<void> => {
+      if (!getReadContract()) {
+        if (mode === "cold") commitMessages([]);
         return;
       }
-
-      // Load latest 50 messages
-      const limit = count > 50n ? 50n : count;
-      const rawMessages = await contract.getLatestMessages(limit);
-
-      // Format messages and optionally resolve display names
-      const formatted: FormattedMessage[] = await Promise.all(
-        rawMessages.map(async (msg: Message) => {
-          let displayName: string | undefined;
-          if (getDisplayName) {
-            try {
-              displayName = await getDisplayName(msg.profileOwner);
-            } catch {
-              displayName = undefined;
-            }
-          }
-
-          return {
-            profileOwner: msg.profileOwner,
-            sender: msg.sender,
-            content: msg.content,
-            timestamp: Number(msg.timestamp),
-            // `* 1000` because this is a Solidity `block.timestamp`, in SECONDS, while
-            // `formatTimestamp` takes epoch ms like the rest of the migrated data layer.
-            formattedTime: formatTimestamp(Number(msg.timestamp) * 1000),
-            displayName,
-          };
-        })
-      );
-
-      setMessages(formatted);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load messages");
-    } finally {
-      setIsLoading(false);
-    }
-  }, [getReadContract, getDisplayName]);
+      await refresh<FormattedMessage[]>({
+        mode,
+        gate,
+        sinks: {
+          setData: commitMessages,
+          setLoading: setIsLoading,
+          setRefreshing: setIsRefreshing,
+          setError,
+        },
+        load: fetchMessages,
+        previous: () => messagesRef.current,
+        message: (err) => (err instanceof Error ? err.message : "Failed to load messages"),
+      });
+    },
+    [getReadContract, fetchMessages, commitMessages]
+  );
 
   // Keep the ref updated with the latest loadMessages function
   useEffect(() => {
@@ -153,7 +214,8 @@ export function useChannel({
       try {
         const tx = await contract.postMessage(content);
         await tx.wait();
-        await loadMessages();
+        // BACKGROUND: the room is already on screen and this read adds one line to it.
+        await loadMessages("background");
       } catch (err) {
         throw err instanceof Error ? err : new Error("Failed to post message");
       }
@@ -258,10 +320,11 @@ export function useChannel({
   // Load messages and channel info when channel changes
   useEffect(() => {
     if (channelAddress && provider) {
-      loadMessages();
+      // COLD, and the only cold entry point: a different room's messages must not be preserved.
+      void loadMessages("cold");
       loadChannelInfo();
     } else {
-      setMessages([]);
+      commitMessages([]);
       setChannelInfo(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -278,30 +341,27 @@ export function useChannel({
 
     if (hasMissingNames) {
       hasAttemptedDisplayNameFetch.current = true;
-      loadMessages();
+      // BACKGROUND: the list is already painted and this pass only decorates it with names.
+      void loadMessages("background");
     }
   }, [channelAddress, provider, getDisplayName, enabled, messages, loadMessages]);
 
-  // Poll for new messages every 15 seconds
-  // Uses ref to always call the latest version of loadMessages
+  // Poll for new messages every 15 seconds — chat wants a shorter period than the 30s boards.
+  // Uses ref to always call the latest version of loadMessages.
+  //
+  // ⛔ THE TICK IS ALWAYS `"background"`. A cold tick empties the room four times a minute.
   useEffect(() => {
     if (!channelAddress || !provider) return;
-
-    pollIntervalRef.current = window.setInterval(() => {
-      loadMessagesRef.current?.();
-    }, 15000);
-
-    return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-      }
-    };
+    return startPolling(() => void loadMessagesRef.current?.("background"), {
+      intervalMs: CHAT_POLL_INTERVAL_MS,
+    });
   }, [channelAddress, provider]);
 
   return {
     messages,
     channelInfo,
     isLoading,
+    isRefreshing,
     error,
     postMessage,
     loadMessages,

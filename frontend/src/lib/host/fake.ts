@@ -37,7 +37,8 @@ import { ethers } from 'ethers'
 import { createCapabilityStore } from './capabilities'
 import { createDelegate } from './delegate'
 import { createDiagnostics } from './diagnostics'
-import type { HostBackend, PutBlobOptions } from './types'
+import { normaliseH160 } from '../recipient'
+import type { HostBackend, PutBlobOptions, RecipientResolution } from './types'
 import { sleep } from './util'
 
 const MINUTE = 60_000
@@ -48,6 +49,17 @@ const DAY = 24 * HOUR
 export const FAKE_SELF_SS58 = '5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty'
 /** …and like an 0x address, because the contract layer reads `msg.sender`, not an SS58 string. */
 export const FAKE_SELF_H160 = '0x9e2a3f4b5c6d7e8f90a1b2c3d4e5f60718293a4b'
+
+/**
+ * Tipping THIS address makes `resolveRecipient` report `unavailable` — "we could not ask the chain"
+ * — as opposed to `unmapped`, "the chain says there is no mapping". Lowercase because the seam
+ * lowercases before comparing.
+ *
+ * It is a fixture, not a user: no other fake data references it, so the only way to reach it is to
+ * type it into a tip. That is deliberate — the branch it exercises is the one that spent weeks
+ * masquerading as a statement about the recipient.
+ */
+export const FAKE_LOOKUP_BROKEN_H160 = '0x000000000000000000000000000000000000dead'
 
 /**
  * The fake delegate's entropy. A FIXED, OBVIOUSLY-FAKE seed rather than a random one, for two
@@ -273,8 +285,9 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
      * unavailable state, and each reports a DIFFERENT one, so all three UI branches can be seen:
      *
      *   · balance      → `null`, i.e. "unknown" (NOT `0n` — see `PaymentsSeam.subscribeBalance`)
-     *   · recipient    → resolves for a stable pretend subset, `null` otherwise, so the
-     *                    "cannot be paid" copy is reachable without a real unmapped account
+     *   · recipient    → `ready` for one real measured mapping, `unmapped` for anything else, and
+     *                    `unavailable` for one reserved address, so ALL THREE branches of
+     *                    `RecipientResolution` can be seen without a host
      *   · sendTip      → `failed`, naming the fake backend
      */
     payments: {
@@ -290,10 +303,29 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
         }
       },
 
-      async resolveRecipient(h160Address) {
+      async resolveRecipient(h160Address): Promise<RecipientResolution> {
         await sleep(jitter(latencyMs))
-        const h160 = h160Address?.trim().toLowerCase()
-        if (!h160 || !/^0x[0-9a-f]{40}$/.test(h160)) return null
+        // Same normaliser the real seam uses, so a shape the fake accepts is one the host would.
+        const h160 = normaliseH160(h160Address)
+        if (!h160) {
+          return { status: 'unavailable', reason: `"${h160Address}" is not a 20-byte address.` }
+        }
+        /**
+         * ⭐ ONE ADDRESS IS RESERVED FOR THE `unavailable` BRANCH, and it exists because that branch
+         * is the one that was invisible for weeks. The real lookup could not run inside a host at
+         * all (`state_getStorage` is not a method the container's PAPI bridge serves) and the UI
+         * rendered that failure as "this person has never transacted". A scenario that can only
+         * produce `ready` and `unmapped` cannot catch that class of bug again.
+         */
+        if (h160 === FAKE_LOOKUP_BROKEN_H160) {
+          return {
+            status: 'unavailable',
+            reason:
+              'The fake backend has no chain, so `Revive.OriginalAccount` cannot be read for this ' +
+              'address. This is the "we could not ask" branch — note that it says nothing about ' +
+              'the recipient.',
+          }
+        }
         /**
          * ⭐ THE FAKE MIRRORS THE REAL CHAIN RATHER THAN INVENTING A RULE.
          *
@@ -312,7 +344,8 @@ export function createFakeBackend(options: FakeOptions = {}): HostBackend {
           '0x18773c30d65de35027ac8cd19e98c0ddb9c44ef9':
             '0x62a4c0821686da4fe20ba29ceaf2a21aa404f0deddbafbb79dcd1c0b09903d2f',
         }
-        return REAL_MAPPING[h160] ?? null
+        const destination = REAL_MAPPING[h160]
+        return destination ? { status: 'ready', destination } : { status: 'unmapped' }
       },
 
       async sendTip(_destination, amount) {

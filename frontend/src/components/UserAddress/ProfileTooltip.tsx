@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { truncateAddress, formatBalance } from '../../utils/formatters';
+import { truncateAddress } from '../../utils/formatters';
+import { CashBalance, ownCashBalanceState } from './CashBalance';
+import { useOwnCashBalance } from '../../hooks/usePayments';
 import type { Profile } from '../../types/contracts';
 import type { Provider } from '../../utils/contracts';
 
@@ -20,6 +22,13 @@ export interface ProfileTooltipProps {
   isFollowing?: boolean;
   canTip?: boolean;
   isOwnProfile?: boolean;
+  /**
+   * @deprecated Unused since the balance chip became CASH.
+   *
+   * It existed for `provider.getBalance(address)` — the PAS gas balance — which is not the currency
+   * anything in Plaza is denominated in. Kept so the several call sites that pass it still compile;
+   * see `CashBalance.tsx`.
+   */
   provider?: Provider | null;
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
@@ -36,12 +45,11 @@ export function ProfileTooltip({
   isFollowing = false,
   canTip = false,
   isOwnProfile = false,
-  provider,
+  // `provider` is deliberately NOT destructured — see its @deprecated note above.
   onMouseEnter,
   onMouseLeave,
 }: ProfileTooltipProps) {
   const [profile, setProfile] = useState<Profile | null>(null);
-  const [balance, setBalance] = useState<bigint>(0n);
   const [isLoading, setIsLoading] = useState(true);
   const [followLoading, setFollowLoading] = useState(false);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -56,14 +64,16 @@ export function ProfileTooltip({
       .finally(() => setIsLoading(false));
   }, [address, getProfile]);
 
-  // Load balance
-  useEffect(() => {
-    if (provider) {
-      provider.getBalance(address)
-        .then(setBalance)
-        .catch(() => setBalance(0n));
-    }
-  }, [address, provider]);
+  /**
+   * The balance chip is CASH now, and only ever OUR OWN.
+   *
+   * The subscription is skipped entirely for anyone else's card, because there is nothing to ask
+   * for — `truApi.payment.balanceSubscribe` has no account parameter. See `CashBalance.tsx`.
+   */
+  const ownBalance = useOwnCashBalance(isOwnProfile);
+  const balanceState = isOwnProfile
+    ? ownCashBalanceState(ownBalance)
+    : ({ kind: 'private' } as const);
 
   // Calculate position after render
   useEffect(() => {
@@ -178,9 +188,7 @@ export function ProfileTooltip({
                 >
                   {displayName}
                 </button>
-                <span className="text-primary-600 font-mono text-xs whitespace-nowrap">
-                  {formatBalance(balance)} PAS
-                </span>
+                <CashBalance state={balanceState} className="text-primary-600 text-xs" />
               </div>
               <div className="text-primary-700 font-mono text-xs">
                 {truncateAddress(address)}
