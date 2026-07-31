@@ -36,11 +36,42 @@ is right, **"Arm 1 — host-signed contract writes work" is a claim about the na
 never been demonstrated in the browser host**, and much of the write column below is scoped far more
 narrowly than it reads. Nobody has settled this; it needs one device and it changes everything.
 
-**[?] Not proof about the user.** The product account for the failing session resolves via
-`Revive.OriginalAccount` to `5EJ3VTQLFVGHh2nrwpD9VyAFhYhhKnHxRTfGsGifFS4sx2rz`, which is neither a
-`LitePerson` nor a `Person`. But a product account is derived per-product from root entropy while
-personhood is registered against the identity account the phone holds, and **there is no on-chain
-reverse map** — so this is evidence, not a verdict on whether the human has personhood.
+**[V] 2026-07-31 — NOT evidence about the user, and it never can be.** The product account for the
+failing session resolves via `Revive.OriginalAccount` to
+`5EJ3VTQLFVGHh2nrwpD9VyAFhYhhKnHxRTfGsGifFS4sx2rz`, which is neither a `LitePerson` nor a `Person`
+— but **no product account ever could be**. See the next block.
+
+## ⛔ THE ACCOUNT MODEL, settled 2026-07-31 — read before designing anything identity-shaped
+
+The user saw **two different profiles at two different addresses**, desktop vs phone. Diagnosis in
+gotchas.md § *THE ACCOUNT IS PER-WALLET-ROOT, NOT PER-DEVICE AND NOT PER-PERSON*; reproduce with
+`node contracts/scripts/probe-product-account.mjs [--link]`.
+
+- **[V] The product account is NOT per-device.** It is
+  `publicSoft(rootPublicKey, ["product", productId, derivationIndex])` — three inputs, none of them
+  a device (`@parity/product-sdk-keys` `dist/index.js`, read verbatim). Two devices agree iff they
+  present the same **root account**. Parity's own docs: *"the desktop app holds no keys of its
+  own—it is a companion that pairs with your phone."* So **[I] the user's desktop is presenting a
+  different root** — most likely not paired to that phone. **Diagnostic: compare the two
+  USERNAMES, not the addresses.** Same username → one identity, a pairing problem. Different
+  usernames → two identities, and the platform cannot merge them.
+- **[V] A product account can never be linked back to a personhood identity.** `rootAccountId` and
+  `identityAccountId` are separate fields in the SSO handshake and no on-chain storage relates them.
+  An exhaustive parent search over all 4260 revive-mapped accounts (superset of all 159
+  `LitePeople`) × 6 product ids × 2 indices: **51120 derivations, zero hits.**
+- **[?] There is no platform account-linking, merging or migration call.** The platform does not
+  solve this; it assumes one root on the phone and every other surface a paired companion.
+  `UserRegistry.authorizeDelegate`/`transferProfileOwnership` are the only in-repo tools and they
+  merge the future, not the past. **Undecided — do not implement either.**
+- ⚠️ **[V] OUR OWN LANDMINE: we ask the host for `plaza.dot`, we are deployed as `plaza-social.dot`.**
+  `App.tsx`'s `APP_NAME = 'plaza'` becomes `plaza.dot` via `productIdentifierFromDappName`.
+  `productId` is a derivation junction, so those are two different accounts.
+  ⛔ **Do not just rename it** — that orphans the profile and the two threads already on chain.
+  Migration, not rename.
+- **[V] Lite personhood IS per-device** (all 159 entries are `method: UniqueDevice`), so a human who
+  registers twice gets two identity accounts and two numbered usernames — five stems on chain
+  already have duplicates (`kiuber.01/.02/.03`, …). A username is therefore **not** a unique-human
+  key either.
 
 ## Live right now
 
@@ -191,9 +222,14 @@ Bulletin authorization error. Cost an hour. See gotchas.
    `FEED_REGISTRY` pointing at a `post` body, which needs no wire-format change and gives
    cross-posting for free (N announcements, one body).
 7. **Adopt the app-side personhood check** — `PeopleLite.LitePeople[account]` on the Individuality
-   chain. Real one-human-one-account, and much stronger than `hasProfile`, which gates nothing.
-   ⚠️ It was **151** entries when first measured and **157** on 2026-07-30 — it drifts; re-read it,
-   never quote the number.
+   chain. Stronger than `hasProfile`, which gates nothing.
+   ⚠️ It was **151** entries when first measured, **157** on 2026-07-30 and **159** on 2026-07-31 —
+   it drifts; re-read it, never quote the number.
+   ⛔ **[V] But NOT on the product account** — a product account is structurally never a
+   `LitePeople` entry, so that gate would reject everybody. The account to check is the *identity*
+   account, reached only as `getUserId().primaryUsername` → `Resources.UsernameOwnerOf[username]`.
+   ⚠️ And it is **not** one-human-one-account: Lite personhood is device-attested and five username
+   stems on chain are already registered two or three times over. See the account-model block above.
 8. Delete the dead ABIs (`ChatChannel`, `ChannelRegistry`, `ForumThread`, `Replies`, `UserPosts`) once
    their consumers are gone.
 

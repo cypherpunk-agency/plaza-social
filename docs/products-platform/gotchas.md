@@ -159,6 +159,186 @@ as it. Every ETH derivation path of the mnemonic holds **zero**. Verified 2026-0
 
 ---
 
+## ⛔⛔ THE ACCOUNT IS PER-WALLET-ROOT, NOT PER-DEVICE AND NOT PER-PERSON
+
+Asked on **2026-07-31**, after the user opened Plaza on a desktop and on a phone, signed in as
+themselves both times, and saw **two different profiles at two different addresses**.
+
+Reproduce with `node contracts/scripts/probe-product-account.mjs` (add `--link` for the exhaustive
+parent search, ~110 s).
+
+### The one-line answer
+
+**[V] No, the product account is not per-device. The derivation takes three inputs and none of them
+is a device.** It also is *not* per-person: nothing in it touches personhood. It is a pure function
+of the **root account the wallet presents**, so two devices agree if and only if they present the
+same root account.
+
+From `@parity/product-sdk-keys@0.3.16` `dist/index.js`, read verbatim:
+
+```js
+function deriveProductAccountPublicKey(parentPublicKey, productId, derivationIndex) {
+  const junctions = ["product", productId, String(derivationIndex)];
+  return junctions.reduce(
+    (pubkey, junction) => HDKD.publicSoft(pubkey, createChainCode(junction)),
+    parentPublicKey
+  );
+}
+```
+
+sr25519 **public** soft derivation. No device id, no install id, no session key, no salt, no
+randomness, no clock. Its own doc comment says it is "mirrored byte-for-byte by polkadot-desktop"
+and "conceptually by polkadot-app-android-v2", and that it works on the parent *public* key alone
+precisely so that a host, a CLI or any external client computes the same address the phone computes
+privately. **A platform that intended per-device accounts would not have shipped that function.**
+
+The wallet side is a host call, not something the app can influence:
+`SignerManager.connect()` → `HostProvider.tryConnect()` → `accountsProvider.getProductAccount(dotNsIdentifier, derivationIndex)`
+(`ACCOUNT_GET_ACCOUNT`, opcode 22/23; request is `{ productAccountId: { dotNsIdentifier, derivationIndex } }`,
+response is `{ account: { publicKey } }`). The host holds the parent key and returns the derived
+public key.
+
+**[V] Parity documents the intended multi-device behaviour and it agrees**
+(<https://docs.polkadotcommunity.foundation/guides/create-account/>): account creation "generates a
+fresh key pair on the device", and for desktop — *"the desktop app holds no keys of its own—it is a
+companion that pairs with your phone, and signing stays on the phone."* A correctly paired desktop
+therefore derives from the **phone's** root and must produce the **same** address.
+
+### So what did the user actually hit?
+
+**[I] Two different root accounts.** Given the same bundle (same `dappName`, so the same
+`dotNsIdentifier`), the only free variable left is the parent public key. Ranked:
+
+1. **The desktop is not paired to that phone** — it is running its own locally created account, or a
+   pairing to a different account/phone. This is the boring, likely one and it is user-checkable.
+2. **The phone holds more than one account** and a different one was selected/paired.
+3. **[?] The two hosts disagree about `dotNsIdentifier`** — see the next subsection. This one is
+   ours, not theirs, and it is the only candidate that is *our* bug.
+
+**The diagnostic to run on the devices, in this order:**
+
+- **Compare the usernames, not the addresses.** The Polkadot app shows a username
+  (`Resources.UsernameOwnerOf`, e.g. `name.01`). *Same username on both* → one identity, two roots →
+  a pairing problem, fixable by re-pairing desktop to the phone. *Different usernames* → genuinely
+  two identities and two Lite-personhood registrations; the platform cannot merge them.
+- Then check whether the desktop app was ever paired by QR at all, or was set up standalone.
+
+### ⚠️ OUR OWN LANDMINE: we ask for `plaza.dot`, we are deployed as `plaza-social.dot`
+
+`App.tsx` passes `APP_NAME = 'plaza'` as `dappName`. `product-sdk-signer`'s
+`productIdentifierFromDappName` appends `.dot` to anything that is not already `.dot` and is not a
+localhost form, so **the wire carries `plaza.dot`** — a name Plaza does not own. The product is
+published as `plaza-social.dot`.
+
+`productId` is the second junction, so it *is* the identity. Alice's two accounts, from the probe:
+
+```
+plaza.dot        idx 0 → 5FeyyzMgN5jYYnFnXZWerDmPSdqbnMBrv1EKAFMyKRVZvvaS
+plaza-social.dot idx 0 → 5DfG1Ev9dgWTnjuxtD8SekDTvo4uin8DWjeEk8CMbYA7bgUp
+```
+
+Two accounts, one human, one wallet — from a six-character difference in a string nobody looks at.
+
+**[?] It has not been demonstrated that this caused the reported split**, and it should not have: the
+same bundle runs on both devices, so both ask for `plaza.dot`. But it becomes a cause the moment any
+host stops honouring the requested identifier and substitutes the one it actually loaded — and the
+protocol has a `DomainNotValid` error variant on `HostAccountGetError` ("Domain identifier is
+invalid"), so hosts are *expected* to validate this. ⛔ **Do not "fix" this by changing `APP_NAME`
+to `plaza-social`.** That silently moves every user to a new address and orphans the one profile and
+the two threads already on chain. It is a migration, not a rename, and it needs deciding, not doing.
+
+### ⭐ [I] The browser host and the phone agreed — which is the positive evidence
+
+The only writer on `keccak("forum")` is `0x18773c30d65de35027ac8cd19e98c0ddb9c44ef9` →
+`5EJ3VTQLFVGHh2nrwpD9VyAFhYhhKnHxRTfGsGifFS4sx2rz`, i.e. the account that published the two threads
+from the **phone** on 2026-07-30. That is the same account this file already records as the product
+account of the **failing browser-over-SSO session** on 2026-07-31. If both readings are right, one
+human on two surfaces got **one** account, and per-device is falsified empirically as well as by
+construction. Tagged `[I]` only because the browser-session reading and the forum-writer reading may
+share a source; a diagnostics screenshot from the browser session would make it `[V]`.
+
+The mechanism is visible in the live host bundle. `browse.dev-dot.li/assets/auth-BuYgQyky.js`
+(2026-07-31) stores an SSO session as:
+
+```
+{ id, localAccount, remoteAccount, rootAccountId, identityAccountId,
+  identityChatPublicKey, ssoEncPubKey, rootEntropySource, deviceEncPubKey }
+```
+
+The phone sends `rootAccountId` **and** `rootEntropySource` across at pairing, so the browser derives
+product accounts — and RFC-0007 `deriveEntropy` — from the *phone's* root, not from anything local.
+`localAccount` is only the browser's random statement-store account. Note also
+`AutoSigning` resource allocation returns `{ productDerivationSecret, productRootPrivateKey }`: the
+phone hands the *private* root over for prompt-free signing. Nothing here is device-scoped.
+
+### ⛔ A product account CANNOT be linked back to a personhood identity
+
+**[V] The root account does not appear on chain, so the link cannot be recovered.** The probe takes
+the product account `5EJ3VTQ…` and searches for a parent among **every** AccountId32 that has ever
+touched revive on this chain — 4260 of them, a superset that contains all 159
+`PeopleLite.LitePeople` accounts — across 6 candidate product ids × 2 indices. **51120 derivations,
+zero hits.** sr25519 soft derivation is one-way per parent, so an exhaustive search over every
+plausible parent is the only attack available and it fails.
+
+Concretely, the account model has three layers and only the middle one is on chain:
+
+| | Where it lives | On chain? | Stable across devices? |
+|---|---|---|---|
+| **root account** | wallet (phone) | **no** | yes, if the same wallet/pairing |
+| **identity account** | wallet, registered on the People chain | yes — `PeopleLite.LitePeople`, `Resources.UsernameOwnerOf` | one per *registration*, see below |
+| **product account** | derived per `(root, productId, index)` | yes — `Revive.OriginalAccount` | yes, if the same root |
+
+`rootAccountId` and `identityAccountId` are **separate fields** in the SSO handshake. They are not
+the same account, and no on-chain storage relates them. This settles the `[?]` that STATUS.md
+carried: *"the product account is neither a `LitePerson` nor a `Person`"* is **not** evidence about
+the user's personhood, and it never can be — a product account is structurally incapable of being a
+personhood entry.
+
+### The one identity route that DOES work — and its limit
+
+**[V]** `getUserId()` → `{ primaryUsername }` (a host call, `HostGetUserIdResponse`, triggers an
+identity-permission prompt) → `Resources.UsernameOwnerOf[username]` on the People chain → the
+identity AccountId32 → `PeopleLite.LitePeople[account]`. Measured 2026-07-31: **159 usernames, 159
+distinct owners, 159/159 owners are LitePeople.** All read-only and host-independent.
+
+⚠️ **[V] But a username is not a unique human.** Five stems are registered more than once, each to a
+different account and a different Lite-personhood entry: `kiuber.01/.02/.03`, `claudebot.02/.03/.17`,
+`florentina.01/.02`, `wuyuxi.01/.02`, `itsianagain.01/.02`. Lite personhood is device-attested —
+every one of the 159 `LitePeople` entries has `method: { type: "UniqueDevice" }` — so **a human who
+registers on a second device becomes a second "person" with a second identity account and a second
+numbered username.** Per-device identity is real on this platform; it just lives one layer *above*
+the product account, in personhood, not in the derivation.
+
+### What this means for Plaza, concretely
+
+If a user ends up with two roots, they get two of everything and **nothing in the current design
+reconciles them**: `UserRegistry.createProfile` records `msg.sender`; `PostRegistry` keys heads on
+`(registry, writer)`; `FollowRegistry` keys the graph on the writer; `Voting` tallies per voter;
+a CASH tip pays a resolved address. Two profiles, two post histories, two follow graphs, two vote
+weights, and a tip that reaches only one of them.
+
+**[?] There is no platform account-linking call.** Nothing in `@parity/truapi`'s account domain
+(`ACCOUNT_GET_ACCOUNT`, `ACCOUNT_GET_ACCOUNT_ALIAS`, `ACCOUNT_CREATE_ACCOUNT_PROOF`,
+`ACCOUNT_GET_LEGACY_ACCOUNTS`) merges, links or migrates accounts. **The honest answer is that the
+platform does not solve this**, because it does not consider it a problem: the intended topology is
+one root on the phone and every other surface a paired companion.
+
+Two things we *could* do, neither of them yet decided:
+
+- **`UserRegistry.transferProfileOwnership` / `authorizeDelegate` / `canActAs` already exist** and
+  are the only in-repo tool for "these two addresses are the same person". `authorizeDelegate` lets
+  root B write as root A, which merges the *future*. It does not merge the past, and it costs a
+  signature from the losing account — which the user may no longer be able to produce.
+- **Anchor the profile on the identity, not the product account.** `getUserId().primaryUsername` is
+  device-independent per registration and resolvable to an account. That is a content-model change,
+  not a patch — and the username-stem collisions above mean it is *not* a one-human key either.
+
+⛔ **Do not implement either without deciding first.** And ⛔ **do not paper over it by deriving an
+AccountId32 from an H160** — `Revive.OriginalAccount` is the only sound reverse route, `h160ToSs58()`
+yields a different real account, and tipping it destroys funds.
+
+---
+
 ## Personhood — an APP can check it; a CONTRACT cannot
 
 Reproduce everything below with `node contracts/scripts/probe-personhood.mjs`.
@@ -622,11 +802,16 @@ The product account `0x18773c30d65de35027ac8cd19e98c0ddb9c44ef9` → `5EJ3VTQ…
 `Revive.OriginalAccount`, **never derived**) is **neither a `LitePerson` nor a full `Person`** —
 checked 2026-07-31 against 158 `LitePeople` entries.
 
-⚠️ **[?] That is evidence, not proof of the user's status.** A product account is derived per product
-from the user's root entropy; personhood would be registered against the *identity* account the
-Polkadot app holds, and there is no on-chain reverse map from one to the other. **Do not write "the
-user has no personhood" as `[V]` on the strength of this read.** What is `[V]` is that *this* account
-is in neither collection and that personhood is the only route to an allowance.
+⚠️ **[V] 2026-07-31 — that is not evidence about the user's status AT ALL, and it never can be.**
+Upgraded from `[?]`: see § *THE ACCOUNT IS PER-WALLET-ROOT*. A product account is
+`publicSoft(rootPublicKey, ["product", productId, index])`; personhood is registered against the
+*identity* account, a different key that the SSO handshake carries in a different field
+(`rootAccountId` vs `identityAccountId`), and there is no on-chain map between them. An exhaustive
+search for a parent of `5EJ3VTQ…` over all 4260 revive-mapped accounts (which include all 159
+`LitePeople`) × 6 product ids × 2 indices found **nothing** — `node contracts/scripts/probe-product-account.mjs --link`.
+**Never write "the user has no personhood" on the strength of this read.** What is `[V]` is that
+*this* account is in neither collection — which is expected of every product account — and that
+personhood is the only route to an allowance.
 
 ### ⭐ The split that matters most, and it is still `[?]`
 
