@@ -222,9 +222,25 @@ function App() {
     // URL params imply view mode
     if (directProfileAddress) return 'profile';
     if (initialThreadSelection.cid || initialThreadSelection.legacyIndex !== null) return 'forum';
-    const stored = localStorage.getItem('viewMode');
-    if (stored === 'profile' || stored === 'forum') return stored;
-    // Default to forum for new visitors, and for anyone arriving with a chat view persisted.
+    /**
+     * ⛔ A STORED `'profile'` IS DELIBERATELY IGNORED. A COLD LOAD ALWAYS LANDS ON THE FORUM.
+     *
+     * Seen on a phone 2026-07-31: the app opened on the user's own profile, which had no profile
+     * record, so the entire screen was a banner, a back link and *"This user hasn't created a
+     * profile yet."* Their report was simply **"I can't [do] anything when I open the app"** — and
+     * they were right; the forum was two taps away behind ☰ or BACK TO FORUM, with nothing on
+     * screen suggesting it.
+     *
+     * The mistake was treating a profile like a TAB. `'forum'` is a mode you can sensibly resume;
+     * a profile is a DESTINATION, and one whose content depends on an address that may hold
+     * nothing. Restoring a destination across a cold start is how you strand someone on a dead end
+     * they did not choose. Deep links still work — `?profile=` above is the shareable way in, and
+     * it is checked first — so nothing is lost by refusing to guess.
+     *
+     * ⚠️ `selectedProfile` is still restored below, on purpose: it is what the back control and the
+     * URL projection need once you DO navigate to a profile. It just no longer decides where the
+     * app opens.
+     */
     return 'forum';
   });
 
@@ -371,7 +387,13 @@ function App() {
     }
   }, [selectedProfile, userRegistry.getProfile]);
 
-  // Persist view mode
+  /**
+   * Persist view mode.
+   *
+   * ⚠️ STILL WRITTEN, BUT NO LONGER READ FOR `'profile'` — see the initialiser above, which always
+   * cold-starts on the forum. Kept as a write so the key stays truthful for anything that inspects
+   * it, and so re-enabling a resume for a *mode* (not a destination) needs no new plumbing.
+   */
   useEffect(() => {
     localStorage.setItem('viewMode', viewMode);
   }, [viewMode]);
