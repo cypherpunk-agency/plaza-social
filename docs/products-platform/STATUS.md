@@ -86,7 +86,7 @@ gotchas.md § *THE ACCOUNT IS PER-WALLET-ROOT, NOT PER-DEVICE AND NOT PER-PERSON
 | What | Where |
 |---|---|
 | App | **https://plaza-social.dev-dot.li** — `plaza-social.dot` (`.dot.li` serves it too) |
-| Bundle CID | `bafybeif7ubw4gymby46h2po4s6oqc4mclfijywhko3xpp7u4sqdnlpya24` (2026-07-31, commit `92eb367`) — a **CAR file**, fetchable whole, NOT pathable. |
+| Bundle CID | `bafybeidgw72blregcl22olsjj2x44xc7ztyvtab5ynymewapgvpqo5sqim` (2026-08-01, commit `cdb0a84`) — a **CAR file**, fetchable whole, NOT pathable. |
 | Simulated host | `cd frontend && npm run test:host:plaza` — the real `dist` bundle in a Parity test container, **against the live chain**. Screenshots: `npm run test:host:screens`. See [`simulated-host.md`](simulated-host.md). |
 | Source | `github.com/Tomen/plaza`, branch `claude/polkadot-products-sdk-review-b2cff4` |
 | Deploy | `npx @polkadot-community-foundation/polkadot-app-deploy@latest frontend/dist plaza-social.dot --env devnet --mnemonic "$MNEMONIC"` |
