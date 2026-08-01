@@ -9,6 +9,14 @@ import { usePayments, useOwnCashBalance } from '../hooks/usePayments';
 import type { Provider, Signer } from '../utils/contracts';
 import toast from 'react-hot-toast';
 
+/**
+ * ⛔ THE DEFAULT FOR `links`, AND IT MUST STAY A MODULE CONSTANT.
+ *
+ * Written inline as `links = []` it is a new array identity on every render, which is what put the
+ * profile screen into an unbreakable render loop. See the long note on the links effect below.
+ */
+const NO_LINKS: Link[] = [];
+
 interface ProfileViewProps {
   userAddress: string | null;
   currentUserAddress?: string | null;
@@ -75,7 +83,8 @@ export function ProfileView({
   signer,
   getDisplayName,
   onSelectUser,
-  links: propLinks = [],
+  // ⛔ `NO_LINKS`, never `[]`. A literal here is a fresh identity every render — see the note on it.
+  links: propLinks = NO_LINKS,
   getLinks,
   onUpdateDisplayName,
   onUpdateBio,
@@ -173,15 +182,50 @@ export function ProfileView({
     }
   }, [userAddress, getProfile]);
 
-  // Load links
+  /**
+   * ⛔ THE PROFILE SCREEN FROZE THE PHONE, AND THIS EFFECT IS WHY. Read before touching the deps.
+   *
+   * `links: propLinks = []` (the default in the signature above) builds a NEW ARRAY ON EVERY RENDER,
+   * and `propLinks` was in this dep array. So the deps differed every single render, the effect ran
+   * every single render, and `setLinks` — always a fresh array from `.map`, never `Object.is`-equal
+   * to the last one — scheduled the next render. A closed loop with no exit.
+   *
+   * Measured 2026-08-01 in the dev server, on the profile screen:
+   *
+   * | State | Effect runs |
+   * |---|---|
+   * | Chain reader present (`getLinks` does real I/O) | ~10/s, forever — a permanent chain-read stream |
+   * | **No chain reader yet** (`getReadContract()` → null, so `getLinks` resolves with NO I/O) | **~5,300/s** |
+   *
+   * The second row is the phone. A cold host start spends its first seconds without a reader, so
+   * landing on a profile put the app into a render loop that nothing throttled — which is exactly
+   * what "I cannot click on anything" is. There was no overlay and no stuck modal; the main thread
+   * was simply never free.
+   *
+   * ⚠️ THE FIX IS THE STABLE `NO_LINKS` DEFAULT, NOT A SHORTER DEP ARRAY. Dropping `propLinks` from
+   * the deps would silence the loop and quietly break the prop — and the next person to restore it
+   * for the lint rule re-creates the freeze. A default that is a literal is the bug; a default that
+   * is a constant cannot be.
+   *
+   * The `live` flag is the second half: switching profiles fast could otherwise land an earlier
+   * request's links on a later person's page.
+   */
   useEffect(() => {
+    let live = true;
     if (userAddress && getLinks) {
       getLinks(userAddress)
-        .then(setLinks)
-        .catch(() => setLinks([]));
+        .then((loaded) => {
+          if (live) setLinks(loaded);
+        })
+        .catch(() => {
+          if (live) setLinks(NO_LINKS);
+        });
     } else {
       setLinks(propLinks);
     }
+    return () => {
+      live = false;
+    };
   }, [userAddress, getLinks, propLinks]);
 
   // Reset edit mode when switching profiles

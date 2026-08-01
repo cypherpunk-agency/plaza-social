@@ -854,6 +854,51 @@ pointer write is host-signed, and the derived delegate H160 is unfunded with non
 
 ## Frontend / SDK traps
 
+**⛔⛔ A PROP DEFAULT WRITTEN AS `= []` IS A RENDER LOOP IF IT REACHES A DEP ARRAY.** [V] 2026-08-01.
+This froze the whole app on the phone, and it presented as *"when I open the profile screen I cannot
+click on anything"* — which reads like a stuck modal or an invisible overlay. It was neither. There
+was nothing on top of the page; the main thread was simply never free.
+
+```tsx
+function ProfileView({ links: propLinks = [] }) {        // ⛔ new array EVERY render
+  useEffect(() => {
+    getLinks(addr).then(setLinks)                        // ⛔ .map() → new array → new state
+  }, [addr, getLinks, propLinks])                        // ⛔ deps differ every render
+}
+```
+
+Three ordinary-looking lines close the circle: the default is a fresh identity per render, so the
+deps always differ, so the effect always runs, so `setLinks` schedules the next render. `App.tsx`
+never passed `links`, so the default fired every time and nobody noticed for months.
+
+**The rate depends on whether the read does I/O, and the dangerous case is the one that does not:**
+
+| State | Effect runs | What it is |
+|---|---|---|
+| Chain reader present | ~10/s, forever | a permanent chain-read stream at the host bridge |
+| **No chain reader yet** — `getReadContract()` → `null`, so the read resolves with **no I/O** | **~5,300/s** (44,862 in the first seconds, measured on a desktop) | the freeze |
+
+**A cold host start spends its first seconds without a reader**, which is exactly when the user lands
+on a screen. And hooks run before early returns, so `ProfileView`'s `if (!provider) return <Connecting/>`
+does not stop it — the "connecting" placeholder was looping underneath.
+
+Rules:
+- **Hoist the default to a module constant** (`const NO_LINKS: Link[] = []`). A default that is a
+  literal is the bug; a default that is a constant cannot be.
+- ⛔ **Do NOT fix it by shortening the dep array.** That silences the loop and quietly breaks the
+  prop, and the next person to restore the dep for `react-hooks/exhaustive-deps` re-creates the freeze.
+- **`react-hooks/exhaustive-deps` will never warn about this** — the deps are exhaustive. It is
+  *stability*, not completeness, and no lint rule in this repo checks it.
+- **The DOM tells you nothing.** A re-render producing identical output commits zero mutations, so a
+  `MutationObserver` sees a still page. A `setTimeout(0)` lag probe also stayed at 6 ms, because the
+  loop yields through microtasks. **Count the effect runs** — a two-line `window.__x = (window.__x ?? 0) + 1`
+  instrument, then reload, is what actually distinguishes 3 from 44,862.
+
+Swept 2026-08-01: `ProfileView` was the only instance. `Sidebar`'s `following = []` looks identical
+and is safe — `App` always passes it and it is `useState` (stable), and `getDisplayName` is
+`useCallback(…, [])`. That is the check to repeat: **does anything ever leave the prop undefined, and
+is what gets passed stable?**
+
 **`contract.getAddress()` is an ethers v6 built-in** that silently shadows a same-named ABI function and
 returns the contract's *own* address. Use `contract.getFunction("getAddress(string)")`. Same family as
 the `HeadRef.movedAt` trap: a decoded struct is a `Result` (an Array subclass), so `ref.at` resolves to
