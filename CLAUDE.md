@@ -96,6 +96,20 @@ recompile, redeploy — and keep `deployments.json` in agreement.
 **Deleted:** `ChatChannel`, `ChannelRegistry`, `DMConversation`, `DMRegistry`, `OnChainChat`,
 `lib/Moderation`, `posts/{ForumThread,UserPosts,Replies}`.
 
+## You can run Plaza without a phone, and you can look at it
+
+`cd frontend && npm run test:host:plaza` boots the **real `dist` bundle** inside Parity's simulated
+container (`@parity/host-api-test-sdk`) over the real truapi wire protocol — and **chain traffic is
+real**, so it reads our deployed contracts on devnet. `npm run test:host:screens` writes 24 captures
+to `frontend/tests/.artifacts/screens/` at 375px and 1280px. Capability table, the account
+experiment and the limits: [`docs/products-platform/simulated-host.md`](docs/products-platform/simulated-host.md).
+
+⚠️ **What it cannot do:** serve Bulletin bodies (in-memory `Map`, so posts render as unavailable),
+model the personhood-gated statement-store allowance, or derive product accounts the real way
+(keyring URI, not `publicSoft`). It auto-approves every permission and allocates every resource, so
+**a green run is not evidence about a phone** — least of all about native-container vs
+browser-over-SSO, the top open question in this repo.
+
 ## ⛔ The SDK path is the only path
 
 **If the platform provides a capability, use it and build nothing beside it.** No second

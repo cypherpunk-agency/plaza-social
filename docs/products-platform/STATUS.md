@@ -86,7 +86,8 @@ gotchas.md § *THE ACCOUNT IS PER-WALLET-ROOT, NOT PER-DEVICE AND NOT PER-PERSON
 | What | Where |
 |---|---|
 | App | **https://plaza-social.dev-dot.li** — `plaza-social.dot` (`.dot.li` serves it too) |
-| Bundle CID | `bafybeibnvl7qnwv7r3q4skp4pru7q3ztcnc6evng3cib3syc6qfeqkfe2q` — a **CAR file**, fetchable whole, NOT pathable (2026-07-31). |
+| Bundle CID | `bafybeif7ubw4gymby46h2po4s6oqc4mclfijywhko3xpp7u4sqdnlpya24` (2026-07-31, commit `92eb367`) — a **CAR file**, fetchable whole, NOT pathable. |
+| Simulated host | `cd frontend && npm run test:host:plaza` — the real `dist` bundle in a Parity test container, **against the live chain**. Screenshots: `npm run test:host:screens`. See [`simulated-host.md`](simulated-host.md). |
 | Source | `github.com/Tomen/plaza`, branch `claude/polkadot-products-sdk-review-b2cff4` |
 | Deploy | `npx @polkadot-community-foundation/polkadot-app-deploy@latest frontend/dist plaza-social.dot --env devnet --mnemonic "$MNEMONIC"` |
 | `UserRegistry` | `0xfD00289e765414C0281EFC35335b6453F055FBD7` = `@plaza-social/user-registry` v0 |
@@ -102,6 +103,17 @@ Bulletin authorization error. Cost an hour. See gotchas.
 
 ## What works, verified on a real device
 
+- ⭐ **[V] 2026-07-31, on a phone: NO IPFS PERMISSION PROMPT.** The SDK Bulletin read path
+  (`lib/bulletin.ts` → host preimage subscription) works on a real device. This was the previous
+  release's main risk and it is retired. Note reads do **not** need `CloudStorageClient` at all —
+  `fetchBytes` is `resolveQueryStrategy()` + `executeQuery()`, i.e. `getPreimageManager()` and
+  nothing else — so they work on exactly the `rpc-gateway` hosts where that client can never open.
+- ⭐ **[V] 2026-07-31, on a phone: CASH renders.** `5.00 CASH`, the user's own balance, on the
+  profile screen. The balance path works; `payment.request` has still never run.
+- **[V] 2026-07-31: the app has been SEEN, at 375px and 1280px** — 24 Playwright captures through the
+  simulated host (`tests/.artifacts/screens/`, gitignored). It renders correctly and legibly at both
+  widths, the phone drawer works, and the cyan `:focus-visible` ring genuinely renders. ⚠️ Every
+  *other* visual claim in this repo predates this and is still numeric inference.
 - **Anonymous reading — inside the host, needing no wallet and no sign-in.**
   ⚠️ **This line used to read *"everywhere, needing nothing — contracts via `eth_call`, bodies via
   gateways"*, and that phrasing directly caused a design error on 2026-07-31.** It was read as a
@@ -170,76 +182,100 @@ Bulletin authorization error. Cost an hour. See gotchas.
 
 ## Next actions, in order
 
-1. ~~**Forum deep links are POSITIONAL and therefore wrong.**~~ **[V] Done for THREADS, 2026-07-31.**
-   `?cid=<threadCid>` is the thread deep link; `?thread=N` is still parsed so published links keep
-   working but is **never written** — `ForumView` resolves the position against the loaded page and
-   the URL rewrites itself to `?cid=`. `cid` wins when both are present; a malformed `?thread=`
-   selects nothing rather than what `parseInt` would guess. Parse/project pair and its tests:
-   `frontend/src/lib/threadLink.ts`. Verified in the fake backend at 375px and 1280px+: `?cid=`
-   round-trips, `?thread=1` upgrades itself, browser Back re-derives from the URL.
-   Shipped with it: the forum is now **master–detail** (list only below `xl`, two panes at/above it)
-   with body text capped at `max-w-[70ch]`, and a **COPY LINK** control that emits
-   `https://plaza-social.dot/?cid=…` — `.dot`, so the link routes *inside* the container.
-   ⚠️ **[?] Never exercised inside a real host.** `Clipboard` is a host device permission and a
-   missing one fails silently, so `lib/clipboard.ts` writes and reads back and can report
-   `copied` / `unverified` / `failed`. On a desktop browser the write **[V]** resolves under a real
-   click but the read-back is skipped (querying it would prompt the user), so the honest outcome
-   there is `unverified`. **Nobody has yet pressed COPY LINK on a phone.**
-   ⛔ **`?post=N` on the profile feed is STILL POSITIONAL.** Same bug, same fix, not done —
-   `UserPost` already carries `cid`, but `PostDetailView`/`useUserPosts` belong to another change.
-2. ⭐ **Take the app to a phone and exercise the four things only a device can settle.** Everything
-   below this line in the write column is `[I]`, and one session with the app open converts most of
-   it. In priority order:
-   - **Send one CASH tip.** The whole path above the host boundary is tested; the host call has never
-     run. If it fails, suspect the unexplained *"Protected asset access requires value-transfer
-     authorization"* on pUSD **before** suspecting a malformed call — that is written into the code.
-   - **Publish one reply.** The last `[I]` in the write column; identical to the thread write that is
-     `[V]`, but never actually on chain.
-   - **Press COPY LINK.** `Clipboard` is a host device permission and a missing one fails silently.
-     `lib/clipboard.ts` reports `copied`/`unverified`/`failed`; find out which one a phone gives.
-   - **Look at the app.** No agent has ever *seen* it — the Browser pane does not composite frames, so
-     every layout and colour claim in this repo is numeric inference. Contrast, spacing and the new
-     focus ring are unreviewed by eyes.
+**Last rewritten 2026-07-31 (evening).** Everything the previous list called next has either landed
+or been superseded — see the git log from `796b56a` to `92eb367`. What remains is ordered by what
+unblocks the most.
 
-3. **Move the remaining owner-only calls to `writeContract`** — start with `authorizeDelegate`, since
-   "SET UP POSTING KEY" is offered in the UI and would fail today. That is also what removes the
-   per-post signing prompt: with a live delegation, `usePublisher`'s `writeHead` switches to
-   `setHeadFor(author, …)` and nothing else changes.
+1. ⭐⭐ **Read `Settings → DEBUG / IDENTITY → COPY ALL` on BOTH devices and compare.** Highest-value
+   action available, and it takes a minute.
+   The user sees two accounts for one identity — phone (native app) `0xda46…712e`, desktop (browser
+   paired by QR) `0x18773c30…4ef9`. **The decisive field is `account.primaryUsername`**: same
+   username ⇒ one identity and a pairing problem; different usernames ⇒ two identities, and the
+   platform has no merge call. The SDK already fetches it inside `connect()` and we had been
+   discarding it, so it costs nothing and prompts nobody.
+   ⚠️ **Two explanations were proposed and BOTH are dead.** "Different root / paired to another
+   wallet" — rejected by the user. "The browser loads `…dev-dot.li` so the origin differs" — rejected
+   by the user *and* disproved by experiment (`tests/12-product-account.spec.ts`: origin and hostname
+   take no part; only the root moves the address). ⛔ **Do not propose a third theory from SDK
+   source. Read the instrument.**
+   ⚠️ **[V] The host reports back NO product identifier or domain** — `ACCOUNT_GET_ACCOUNT` takes
+   `{dotNsIdentifier, derivationIndex}` and answers `{account:{publicKey}}`. A host that silently
+   substituted an identifier would be **invisible from inside the app**, which is exactly why this
+   cannot be settled by reading our own code.
+   **[V] The phone account has no profile and no posts.** It is not a drifted copy of an identity —
+   it has never written. Everything on chain belongs to the browser account.
 
-4. **Two accessibility/layout defects that undo work already done.** Both are small and both hit the
-   primary surface:
-   - ⛔ **The sidebar is a fixed `w-64` with no responsive behaviour.** Measured at 375×812 it takes
-     **176px of 375** — 47% of a phone screen, leaving thread titles 196px. The forum was just capped
-     to a readable measure and this undoes it. A drawer behind the existing `☰` is the fix.
-   - ⛔ **Thread titles are `<h3 onClick>`** (`ThreadCard.tsx:122`, `:145`) — no tab stop, no
-     Enter/Space, announced as static text. This is the app's primary navigation affordance and it is
-     unreachable by keyboard. Make it a `<button type="button" className="text-left …">`.
-   - Minor, same class: `App.tsx:564` and `:585` settings buttons have no hover class at all.
-5. **Migrate `useChannelRegistry` / `useChannel`** the way `useForumThread`, `useUserPosts` and
-   `useReplies` were: heads from `PostRegistry` for a `bytes32` registry id, then `walkChain`.
-   A room id is `openRegistryId("room:<name>")` from `frontend/src/lib/registry.ts` — do not compute
-   one anywhere else. **This is now a re-wiring job, not a repair**: the hooks and components are
-   intact but no longer imported anywhere, so restoring chat means migrating them and putting the
-   nav entry back in `Sidebar.tsx` plus a `'channels'` member back on `ViewMode`. Note there is no
-   "create a room" step to restore — an open room needs no transaction.
-   ⭐ **Publish one reply from a phone** while you are in there: the reply write path is wired and
-   fake-tested but has never touched the chain, so it is the last **[I]** in the write column.
-6. **`?post=N` on the profile feed is still POSITIONAL** — the same bug `?thread=N` had, unfixed.
-   `UserPost` already carries `cid`, and `lib/threadLink.ts` is the pattern to copy. Pairs naturally
-   with **optional titles on profile posts**: a titled post is a `thread` announcement written into
-   `FEED_REGISTRY` pointing at a `post` body, which needs no wire-format change and gives
-   cross-posting for free (N announcements, one body).
-7. **Adopt the app-side personhood check** — `PeopleLite.LitePeople[account]` on the Individuality
-   chain. Stronger than `hasProfile`, which gates nothing.
-   ⚠️ It was **151** entries when first measured, **157** on 2026-07-30 and **159** on 2026-07-31 —
-   it drifts; re-read it, never quote the number.
-   ⛔ **[V] But NOT on the product account** — a product account is structurally never a
-   `LitePeople` entry, so that gate would reject everybody. The account to check is the *identity*
-   account, reached only as `getUserId().primaryUsername` → `Resources.UsernameOwnerOf[username]`.
-   ⚠️ And it is **not** one-human-one-account: Lite personhood is device-attested and five username
-   stems on chain are already registered two or three times over. See the account-model block above.
-8. Delete the dead ABIs (`ChatChannel`, `ChannelRegistry`, `ForumThread`, `Replies`, `UserPosts`) once
-   their consumers are gone.
+2. ⭐ **The device tests that remain.**
+   **[V] 2026-07-31 on a real phone: the IPFS permission prompt is GONE** — the SDK Bulletin read
+   path works. That was the previous release's main risk and it is retired.
+   Still device-only:
+   - **Publish one reply, and one profile post.** Both still `[I]`. ⚠️ Expect
+     `no_statement_allowance` on the **browser** surface — see the block at the top of this file;
+     that is a personhood-gated daily slot, not a bug to fix in the app.
+   - ⭐ **Native container vs browser-over-SSO**, still the top unknown in this repo. Publishing from
+     the *native app* is the experiment. No simulator can answer it.
+   - **Send one CASH tip.** `5.00 CASH` renders on the phone **[V]**, so the balance path works; the
+     `payment.request` call has still never run. If it fails, suspect the gated asset (Q9) before
+     suspecting a malformed call.
+   - **Press COPY LINK.** Still never pressed on a phone.
+
+3. **`session.ts` `authorizeDelegate` is a STUB wired to a live button.** "SET UP POSTING KEY" writes
+   nothing. Settings now degrades honestly rather than claiming success, but the control is still
+   offered. Either wire the seam to `useUserRegistry.authorizeDelegate` (correct, host-signed,
+   confirm-polled) or make the stub reject.
+   ⚠️ Not a one-liner: the clock-skew clamp and `MAX_DELEGATION_SECONDS` read live inside
+   `delegate.authorize({ authorizeOnChain })`, so a caller must inject the on-chain half rather than
+   replace the method. And `UserRegistry.authorizeDelegate(delegate, expiry)` takes an **ABSOLUTE
+   unix-seconds timestamp** while `delegate.ts` passes a **duration** — add
+   `Math.floor(Date.now()/1000) +` or it reverts with `ExpiryInPast`.
+   ⛔ **A delegate is not an escape route from the allowance failure** — the pointer write is
+   host-signed and the derived delegate H160 is unfunded. Do not re-propose it as one.
+
+4. **⛔ OUR OWN LANDMINE: we ask the host for `plaza.dot`; we are deployed as `plaza-social.dot`.**
+   **[V] at runtime** (`tests/12-product-account.spec.ts`): `dappName` moves the derived account, and
+   the name we are deployed under is **never requested**. `App.tsx` `APP_NAME = 'plaza'` becomes
+   `plaza.dot` via `productIdentifierFromDappName`, and `productId` is a derivation junction.
+   ⛔ **Do not just rename it** — that derives a different account and orphans the profile and both
+   threads already on chain. Migration, not rename. Undecided; needs the user.
+
+5. **Live-data and visual defects seen in the first-ever screenshots** (`npm run test:host:screens`):
+   - ⛔ **The second real thread on the board has no author and a `1970-01-01` timestamp.** On chain,
+     not a simulator artefact — almost certainly an announcement whose body did not decode. Start at
+     `lib/wire.ts` and `walkChain`'s hole handling.
+   - The detail-pane CID chip is very dim against black; Settings on desktop is a centred column with
+     wide empty gutters.
+   ⚠️ **Unverified: the drawer scrim fix.** `bg-black/70` → `/90`, because a black wash over a black
+   page did not read as an overlay at all. CSS emission confirmed; the re-capture timed out, so
+   nobody has seen the result.
+   ⚠️ **Flake to watch:** `host-phone-6-thread` timed out on `locator.click` in a re-run having
+   passed minutes earlier. That spec takes ~9 min against the live chain, so slowness is likely — but
+   a phone click-target problem is not ruled out.
+
+6. **`?post=N` on the profile feed is still POSITIONAL** — the same bug `?thread=N` had. `UserPost`
+   already carries `cid` and `lib/threadLink.ts` is the pattern. Pairs naturally with **optional
+   titles on profile posts**: a titled post is a `thread` announcement written into `FEED_REGISTRY`
+   pointing at a `post` body — no wire-format change, and cross-posting comes free.
+
+7. **Migrate `useChannelRegistry` / `useChannel`.** A re-wiring job, not a repair: the hooks and
+   components are intact but unimported. A room id is `openRegistryId("room:<name>")` from
+   `lib/registry.ts` — never computed anywhere else. Restore the nav entry in `Sidebar.tsx` and a
+   `'channels'` member on `ViewMode`. No "create a room" step: an open room needs no transaction.
+   ⚠️ **[?] FIRST check whether the platform already provides this.** `@parity/product-sdk-host`
+   exports `getChatManager()` (`registerRoom`, `sendMessage`, `subscribeChatList`, …) backed by
+   `truApi.chat.*`, and the simulated host implements all six methods — while root `CLAUDE.md` still
+   asserts "the platform offers no 1:1 messaging primitive". Building rooms on `PostRegistry` while
+   the host ships a chat primitive is exactly the pattern the SDK-only rule exists to stop.
+
+8. **Personhood, if it is ever gated.** `PeopleLite.LitePeople` drifts (151 → 157 → 159 across three
+   days) — re-read it, never quote the number.
+   ⛔ **[V] NOT on the product account** — structurally never a `LitePeople` entry, so that gate
+   rejects everybody. The identity account is reachable only as `getUserId().primaryUsername` →
+   `Resources.UsernameOwnerOf[username]`.
+   ⚠️ And it is not one-human-one-account: Lite personhood is device-attested, and five username
+   stems on chain are already registered two or three times over.
+
+9. Delete the dead ABIs (`ChatChannel`, `ChannelRegistry`, `ForumThread`, `Replies`, `UserPosts`)
+   once their consumers are gone. `useFeed` still reads the deleted `UserPosts` contract.
 
 ## Settled — do not re-litigate
 
